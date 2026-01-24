@@ -56,6 +56,7 @@ def _build_component_config(model_path: str, model_type: str):
     num_experts_env = os.environ.get("MEGATRON_SINGLE_NUM_EXPERTS")
     load_weights_env = os.environ.get("MEGATRON_SINGLE_LOAD_WEIGHTS", "true").lower()
     load_weights = load_weights_env not in {"0", "false", "no"}
+    bridge_load_path = os.environ.get("MEGATRON_SINGLE_BRIDGE_LOAD_PATH")
 
     config = {
         "model_name": model_path,
@@ -79,6 +80,8 @@ def _build_component_config(model_path: str, model_type: str):
         "parallel_size": 1,
         "text_seq_len": 4,
     }
+    if bridge_load_path:
+        config["engine_config"]["bridge_load_path"] = bridge_load_path
     if num_experts_env is not None:
         config["engine_config"]["num_experts"] = int(num_experts_env)
     return config
@@ -146,6 +149,14 @@ def test_megatron_single_trainer_init(tp_size: int, ep_size: int):
         group = ActorGroup(config, trainer_cls, num_actors=num_actors, num_cpus=2, num_gpus=1)
 
         group.execute_all("build_model")
+        verify_weights = os.environ.get("MEGATRON_SINGLE_VERIFY_WEIGHTS", "0").lower() in {"1", "true", "yes"}
+        if verify_weights:
+            status_list = group.execute_all("get_weight_load_status")
+            for status in status_list:
+                if not status["path_exists"]:
+                    pytest.skip("MEGATRON_SINGLE_BRIDGE_LOAD_PATH not found; skipping weight-load verification.")
+                assert status["requested"], "Weight loading was not requested."
+                assert status["loaded"], "Weight loading did not complete successfully."
         group.execute_all("initialize_trainer")
 
         pg = group.execute_all("is_process_group_initialized")

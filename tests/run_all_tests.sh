@@ -214,10 +214,21 @@ else
         echo ""
 
         MEGATRON_SINGLE_TEST="tests/megatron/test_single_trainer.py"
+        MEGATRON_PREPP_TEST="tests/megatron/test_engine_megatron_prepp.py"
         MEGATRON_MODEL="${MEGATRON_SINGLE_MODEL:-Qwen/Qwen1.5-MoE-A2.7B-Chat}"
         MEGATRON_MODEL_TYPE="${MEGATRON_SINGLE_MODEL_TYPE:-qwen2_moe}"
         MEGATRON_MATRIX="${MEGATRON_SINGLE_MATRIX:-1}"
         MEGATRON_LOAD_WEIGHTS="${MEGATRON_SINGLE_LOAD_WEIGHTS:-0}"
+
+        if [ -f "$MEGATRON_PREPP_TEST" ]; then
+            if [ "$GPU_COUNT" -lt 4 ]; then
+                echo -e "${YELLOW}Skipping $MEGATRON_PREPP_TEST (requires 4+ GPUs, found $GPU_COUNT)${NC}"
+                echo ""
+            else
+                run_test "GPU tests ($MEGATRON_PREPP_TEST pre-PP readiness)" \
+                    "HF_HOME=${HF_HOME:-/mnt/local_storage/hf-cache} PYTHONPATH=\"${REPO_DIR}\" pytest $MEGATRON_PREPP_TEST -k test_megatron_engine_prepp -m gpu -v"
+            fi
+        fi
 
         if [ -f "$MEGATRON_SINGLE_TEST" ]; then
             if [ "$GPU_COUNT" -ge 4 ]; then

@@ -15,7 +15,8 @@ vision:
     sequence_parallel_size: 1
     expert_model_parallel_size: 8
     attention_backend: "unfused"
-    load_weights: false
+    load_weights: true
+    use_cpu_initialization: true
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
 text:
@@ -33,7 +34,8 @@ text:
     sequence_parallel_size: 1
     expert_model_parallel_size: 8
     attention_backend: "unfused"
-    load_weights: false
+    load_weights: true
+    use_cpu_initialization: true
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
 training:

@@ -1,17 +1,13 @@
 """Pre-PP readiness test for Megatron engine initialization."""
 
+import math
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 import ray
 import torch
-
-from python.ray.actor_group import ActorGroup  # noqa: E402
-from python.ray.megatron_trainer import (  # noqa: E402
-    MegatronTextTrainer,
-    MegatronVisionTrainer,
-)
 
 pytestmark = [pytest.mark.gpu]
 
@@ -23,17 +19,58 @@ sys.path.insert(0, str(PROJECT_ROOT / "multimodal-training"))
 sys.path.insert(0, str(MEGATRON_ROOT))
 sys.path.insert(0, str(MS_SWIFT_ROOT))
 
+from python.ray.actor_group import ActorGroup  # noqa: E402
+from python.ray.megatron_trainer import (  # noqa: E402
+    MegatronTextTrainer,
+    MegatronVisionTrainer,
+)
 
-def _build_component_config(model_path: str, engine_overrides: dict | None = None):
+
+def _parse_sizes(raw_value: str | None, default_sizes: list[int]) -> list[int]:
+    if not raw_value:
+        return default_sizes
+    sizes: list[int] = []
+    for value in raw_value.split(","):
+        value = value.strip()
+        if value:
+            sizes.append(int(value))
+    return sizes or default_sizes
+
+
+def _resolve_actor_count(env_key: str, expected: int) -> int:
+    import os
+
+    raw_value = os.environ.get(env_key)
+    if raw_value is None:
+        return expected
+    count = int(raw_value)
+    if count != expected:
+        raise ValueError(f"{env_key} must match the expected world size ({expected}).")
+    return count
+
+
+def _build_component_config(model_path: str, component: str, engine_overrides: dict | None = None):
     import os
 
     expert_model_parallel_size = int(os.environ.get("MEGATRON_TEST_EP_SIZE", "1"))
     num_experts_env = os.environ.get("MEGATRON_TEST_NUM_EXPERTS")
+    num_layers_env = os.environ.get("MEGATRON_TEST_NUM_LAYERS")
     load_weights_env = os.environ.get("MEGATRON_TEST_LOAD_WEIGHTS", "true").lower()
+    if component:
+        scoped = os.environ.get(f"MEGATRON_TEST_LOAD_WEIGHTS_{component.upper()}")
+        if scoped is not None:
+            load_weights_env = scoped.lower()
     load_weights = load_weights_env not in {"0", "false", "no"}
+    bridge_load_path = os.environ.get("MEGATRON_TEST_BRIDGE_LOAD_PATH")
+    model_type = os.environ.get("MEGATRON_TEST_MODEL_TYPE")
+    if not model_type:
+        if any(tag in model_path for tag in ("A3B", "A22B")):
+            model_type = "qwen3_moe_vl"
+        else:
+            model_type = "qwen3_vl"
     config = {
         "model_name": model_path,
-        "model_type": "qwen2_5_vl",
+        "model_type": model_type,
         "engine": "megatron",
         "engine_config": {
             "tensor_parallel_size": 1,
@@ -53,15 +90,30 @@ def _build_component_config(model_path: str, engine_overrides: dict | None = Non
         "parallel_size": 1,
         "text_seq_len": 4,
     }
+    if bridge_load_path:
+        config["engine_config"]["bridge_load_path"] = bridge_load_path
     if num_experts_env is not None:
         config["engine_config"]["num_experts"] = int(num_experts_env)
+    if num_layers_env is not None:
+        config["engine_config"]["megatron_num_layers"] = int(num_layers_env)
     if engine_overrides:
         config["engine_config"].update(engine_overrides)
     return config
 
 
-def test_megatron_engine_prepp():
+@pytest.mark.parametrize("verify_weights", [False, True])
+@pytest.mark.parametrize("parallel_case", ["tp_tp", "tp_ep"])
+def test_megatron_engine_prepp(verify_weights: bool, parallel_case: str):
     import os
+
+    os.environ.setdefault("MEGATRON_TEST_MODEL", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+    os.environ.setdefault(
+        "MEGATRON_TEST_BRIDGE_LOAD_PATH",
+        "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_4l_split",
+    )
+    full_scale = os.environ.get("MEGATRON_TEST_FULL_SCALE", "0").lower() in {"1", "true", "yes"}
+    if not full_scale:
+        os.environ.setdefault("MEGATRON_TEST_NUM_LAYERS", "4")
 
     arch_list = None
     if torch.cuda.is_available():
@@ -77,52 +129,125 @@ def test_megatron_engine_prepp():
     if not model_path:
         pytest.skip("Set MEGATRON_TEST_MODEL to a HF model path for Megatron pre-PP readiness test.")
 
-    ray.init(
-        address="auto",
-        ignore_reinit_error=True,
-        include_dashboard=False,
-        runtime_env={
-            "working_dir": str(PROJECT_ROOT / "multimodal-training"),
-            "py_modules": [str(MEGATRON_ROOT), str(MS_SWIFT_ROOT)],
-            "excludes": [".git/**", "**/.git/**", "**/__pycache__/**"],
-            "env_vars": {
-                "PYTHONPATH": ":".join(
-                    [
-                        str(PROJECT_ROOT / "multimodal-training"),
-                        str(MEGATRON_ROOT),
-                        str(MS_SWIFT_ROOT),
-                    ]
-                ),
-                "USE_HF": "1",
-                "HF_HOME": os.environ.get("HF_HOME", "/mnt/local_storage/hf-cache"),
-                **({"TORCH_CUDA_ARCH_LIST": arch_list} if arch_list else {}),
+    bridge_load_path = os.environ.get("MEGATRON_TEST_BRIDGE_LOAD_PATH")
+    if bridge_load_path and not Path(bridge_load_path).exists() and not full_scale:
+        split_script = PROJECT_ROOT / "multimodal-training" / "scripts" / "split_checkpoint.py"
+        split_cmd = [
+            sys.executable,
+            str(split_script),
+            "--model-name",
+            model_path,
+            "--model-type",
+            "qwen3_vl",
+            "--num-text-layers",
+            "4",
+            "--save-hf-safetensors",
+            "--output-dir",
+            bridge_load_path,
+        ]
+        env = os.environ.copy()
+        env.setdefault("HF_HOME", "/mnt/local_storage/hf-cache")
+        subprocess.check_call(split_cmd, env=env, cwd=str(PROJECT_ROOT / "multimodal-training"))
+
+    default_size = 8 if full_scale else 4
+    if parallel_case == "tp_tp":
+        sizes = _parse_sizes(os.environ.get("MEGATRON_TEST_TP_SIZES"), [default_size])
+    elif parallel_case == "tp_ep":
+        sizes = _parse_sizes(os.environ.get("MEGATRON_TEST_EP_SIZES"), [default_size])
+    else:
+        raise ValueError(f"Unknown parallel_case: {parallel_case}")
+
+    for size in sizes:
+        ray.init(
+            address="auto",
+            ignore_reinit_error=True,
+            include_dashboard=False,
+            runtime_env={
+                "working_dir": str(PROJECT_ROOT / "multimodal-training"),
+                "py_modules": [str(MEGATRON_ROOT), str(MS_SWIFT_ROOT)],
+                "excludes": [".git/**", "**/.git/**", "**/__pycache__/**"],
+                "env_vars": {
+                    "PYTHONPATH": ":".join(
+                        [
+                            str(PROJECT_ROOT / "multimodal-training"),
+                            str(MEGATRON_ROOT),
+                            str(MS_SWIFT_ROOT),
+                        ]
+                    ),
+                    "USE_HF": "1",
+                    "HF_HOME": os.environ.get("HF_HOME", "/mnt/local_storage/hf-cache"),
+                    **({"TORCH_CUDA_ARCH_LIST": arch_list} if arch_list else {}),
+                },
             },
-        },
-    )
-    try:
-        vision_config = _build_component_config(model_path)
-        text_config = _build_component_config(model_path)
+        )
+        try:
+            vision_overrides = {"tensor_parallel_size": size}
+            if parallel_case == "tp_tp":
+                text_overrides = {"tensor_parallel_size": size, "expert_model_parallel_size": 1}
+            elif parallel_case == "tp_ep":
+                text_overrides = {"tensor_parallel_size": 1, "expert_model_parallel_size": size}
+            else:
+                raise ValueError(f"Unknown parallel_case: {parallel_case}")
 
-        vision_group = ActorGroup(vision_config, MegatronVisionTrainer, num_actors=1, num_cpus=2, num_gpus=1)
-        text_group = ActorGroup(text_config, MegatronTextTrainer, num_actors=1, num_cpus=2, num_gpus=1)
+            vision_config = _build_component_config(model_path, "vision", engine_overrides=vision_overrides)
+            text_config = _build_component_config(model_path, "text", engine_overrides=text_overrides)
 
-        vision_group.execute_all("build_model")
-        text_group.execute_all("build_model")
-        vision_group.execute_all("initialize_trainer")
-        text_group.execute_all("initialize_trainer")
+            expected_vision_actors = vision_overrides["tensor_parallel_size"]
+            expected_text_actors = (
+                text_overrides["tensor_parallel_size"] * text_overrides["expert_model_parallel_size"]
+            )
+            vision_actors = _resolve_actor_count("MEGATRON_TEST_VISION_ACTORS", expected_vision_actors)
+            text_actors = _resolve_actor_count("MEGATRON_TEST_TEXT_ACTORS", expected_text_actors)
 
-        vision_pg = vision_group.execute_all("is_process_group_initialized")
-        text_pg = text_group.execute_all("is_process_group_initialized")
-        assert all(vision_pg), "Vision process group was not initialized"
-        assert all(text_pg), "Text process group was not initialized"
+            vision_group = ActorGroup(
+                vision_config,
+                MegatronVisionTrainer,
+                num_actors=vision_actors,
+                num_cpus=2,
+                num_gpus=1,
+            )
+            text_group = ActorGroup(
+                text_config,
+                MegatronTextTrainer,
+                num_actors=text_actors,
+                num_cpus=2,
+                num_gpus=1,
+            )
 
-        vision_outputs = vision_group.execute_all("forward_step", 0)
-        text_group.execute_all("forward_step", vision_outputs, 0)
+            vision_group.execute_all("build_model")
+            text_group.execute_all("build_model")
+            vision_group.execute_all("initialize_trainer")
+            text_group.execute_all("initialize_trainer")
 
-        text_backward = text_group.execute_all("backward_step")
-        vision_group.execute_all("backward_step", text_backward)
-    finally:
-        ray.shutdown()
+            vision_pg = vision_group.execute_all("is_process_group_initialized")
+            text_pg = text_group.execute_all("is_process_group_initialized")
+            assert all(vision_pg), "Vision process group was not initialized"
+            assert all(text_pg), "Text process group was not initialized"
+
+            vision_outputs = vision_group.execute_all("forward_step", 0)
+            if len(vision_outputs) != text_actors:
+                raise RuntimeError(
+                    "Vision outputs must align with text actors "
+                    f"({len(vision_outputs)} != {text_actors})."
+                )
+            text_forward = text_group.execute_all("forward_step", vision_outputs, [0] * text_actors)
+
+            if verify_weights:
+                status_list = text_group.execute_all("get_weight_load_status")
+                for status in status_list:
+                    if not status["path_exists"]:
+                        pytest.skip("MEGATRON_TEST_BRIDGE_LOAD_PATH not found; skipping weight-load verification.")
+                    assert status["requested"], "Weight loading was not requested."
+                    assert status["loaded"], "Weight loading did not complete successfully."
+                for output in text_forward:
+                    loss_value = output.get("loss")
+                    assert loss_value is not None, "Missing loss from text forward output."
+                    assert math.isfinite(loss_value), f"Non-finite loss after weight loading: {loss_value}"
+
+            text_backward = text_group.execute_all("backward_step")
+            vision_group.execute_all("backward_step", text_backward)
+        finally:
+            ray.shutdown()
 
 
 def test_megatron_num_layers_override():

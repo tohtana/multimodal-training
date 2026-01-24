@@ -103,6 +103,35 @@ Override the per-run topology with:
 - `MEGATRON_SINGLE_EP_SIZE`
 - `MEGATRON_SINGLE_NUM_ACTORS` (defaults to TP * EP)
 
+### Megatron pre-PP readiness (Qwen3-VL MoE, 4-layer split)
+
+```bash
+HF_HOME=/mnt/local_storage/hf-cache \
+pytest tests/megatron/test_engine_megatron_prepp.py -k test_megatron_engine_prepp -m gpu -v
+```
+
+Defaults baked into the test:
+
+- `MEGATRON_TEST_MODEL=Qwen/Qwen3-VL-30B-A3B-Instruct`
+- `MEGATRON_TEST_BRIDGE_LOAD_PATH=/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_4l_split`
+- `MEGATRON_TEST_NUM_LAYERS=4`
+
+If the split checkpoint is missing, the test generates it automatically via `scripts/split_checkpoint.py`
+with `--save-hf-safetensors`.
+
+Parallel sweep behavior:
+
+- Vision: TP=4 (small) or TP=8 (full scale)
+- Text: TP=4/8 (tp_tp) and EP=4/8 (tp_ep)
+
+Requires 4 GPUs by default (8 GPUs if `MEGATRON_TEST_FULL_SCALE=1`).
+
+Override sweep sizes and actor counts with:
+
+- `MEGATRON_TEST_TP_SIZES=2,4` (tp_tp vision/text TP sizes)
+- `MEGATRON_TEST_EP_SIZES=2,4` (tp_ep text EP sizes; vision TP uses same list)
+- `MEGATRON_TEST_VISION_ACTORS` and `MEGATRON_TEST_TEXT_ACTORS` (must match world size)
+
 ## Dataset alignment test
 
 `tests/test_dataset_modalities.py::test_real_dataset_alignment` automatically skips if the COCO validation set defined in `DEFAULT_DATA_REGISTRY` is not present. To exercise it fully, download the dataset referenced in the registry before running `pytest -m cpu_only`.

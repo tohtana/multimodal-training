@@ -31,6 +31,9 @@ class MegatronBaseTrainer(Trainer):
         self._megatron_initialized = False
         self.receiver_gpu_ids = None
         self.use_ipc = False
+        self._weights_load_requested = False
+        self._weights_loaded = False
+        self._weights_load_path = None
 
     def _initialize_megatron(self):
         if self._megatron_initialized:
@@ -71,7 +74,7 @@ class MegatronBaseTrainer(Trainer):
 
         torch_dtype = self._get_torch_dtype(self.config["dtype"])
         convert_kwargs = {
-            "use_cpu_initialization": True,
+            "use_cpu_initialization": bool(engine_config.get("use_cpu_initialization", True)),
             "no_save_optim": True,
             "no_save_rng": True,
             "no_load_optim": True,
@@ -114,9 +117,13 @@ class MegatronBaseTrainer(Trainer):
 
         load_path = self._get_engine_config_value("bridge_load_path", self.config["model_name"])
         load_weights = self._get_engine_config_value("load_weights", True)
+        self._weights_load_path = load_path
+        self._weights_load_requested = bool(load_weights)
+        self._weights_loaded = False
         if load_weights:
             logger.info(f"[r{self.rank}] Loading Megatron weights from {load_path}.")
             self.megatron_bridge.load_weights(self.megatron_model, load_path)
+            self._weights_loaded = True
         else:
             logger.warning(f"[r{self.rank}] Skipping Megatron weight load (engine_config.load_weights=false).")
 
@@ -141,6 +148,17 @@ class MegatronBaseTrainer(Trainer):
         """Expose Megatron num_layers for tests."""
         self._initialize_megatron()
         return int(getattr(self.megatron_args, "num_layers", 0))
+
+    def get_weight_load_status(self) -> dict:
+        """Expose weight loading status for tests/verification."""
+        import os
+
+        return {
+            "requested": self._weights_load_requested,
+            "loaded": self._weights_loaded,
+            "path": self._weights_load_path,
+            "path_exists": bool(self._weights_load_path and os.path.exists(self._weights_load_path)),
+        }
 
 
 @ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)

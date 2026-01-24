@@ -18,6 +18,7 @@ import sys
 from typing import Dict, Optional, Tuple
 
 import torch
+from safetensors.torch import save_file
 from transformers import AutoConfig, AutoModelForVision2Seq
 
 logging.basicConfig(
@@ -115,11 +116,51 @@ def _split_with_mapping(
     return vision_state_dict, text_state_dict
 
 
+def _filter_layers_by_prefix(
+    state_dict: Dict[str, torch.Tensor],
+    layer_prefixes: Tuple[str, ...],
+    num_layers: int,
+) -> Dict[str, torch.Tensor]:
+    if num_layers <= 0:
+        raise ValueError("num_layers must be > 0")
+
+    filtered = {}
+    dropped = 0
+    for key, value in state_dict.items():
+        matched = False
+        for prefix in layer_prefixes:
+            if not prefix:
+                continue
+            prefix_with_dot = f"{prefix}."
+            if key.startswith(prefix_with_dot):
+                remainder = key[len(prefix_with_dot) :]
+                layer_id = remainder.split(".", 1)[0]
+                if layer_id.isdigit():
+                    matched = True
+                    if int(layer_id) < num_layers:
+                        filtered[key] = value
+                    else:
+                        dropped += 1
+                    break
+        if not matched:
+            filtered[key] = value
+
+    logger.info(
+        "Filtered layers by prefixes=%s num_layers=%s (dropped=%s tensors).",
+        layer_prefixes,
+        num_layers,
+        dropped,
+    )
+    return filtered
+
+
 def split_checkpoint(
     model_name: str,
     output_dir: str,
     trust_remote_code: bool = True,
     model_type: Optional[str] = None,
+    num_text_layers: Optional[int] = None,
+    save_hf_safetensors: bool = False,
 ):
     """
     Load a Qwen-VL checkpoint from HuggingFace and split it into vision and text components.
@@ -153,6 +194,9 @@ def split_checkpoint(
     state_dict = model.state_dict()
     logger.info(f"Total parameters in model: {len(state_dict)} tensors")
 
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
     # Split state dict using ms-swift canonical mapping
     resolved_model_type = None
     try:
@@ -161,6 +205,17 @@ def split_checkpoint(
         )
         text_prefix = _get_text_prefix(bridge_cls)
         normalized_state_dict = _normalize_hf_state_dict(state_dict, hf_state_dict_mapping)
+        if num_text_layers is not None:
+            hf_layers_prefix = getattr(bridge_cls, "hf_layers_prefix", None) or "model.layers"
+            normalized_state_dict = _filter_layers_by_prefix(
+                normalized_state_dict,
+                (hf_layers_prefix,),
+                num_text_layers,
+            )
+        if save_hf_safetensors:
+            hf_path = os.path.join(output_dir, "model.safetensors")
+            logger.info(f"Saving filtered HF safetensors to {hf_path}")
+            save_file(normalized_state_dict, hf_path)
         vision_state_dict, text_state_dict = _split_with_mapping(normalized_state_dict, module_mapping, text_prefix)
         logger.info(f"ms-swift model_type: {resolved_model_type}")
         logger.info(f"ms-swift visual mapping: {module_mapping}")
@@ -191,12 +246,22 @@ def split_checkpoint(
                 text_state_dict[new_key] = value
             else:
                 text_state_dict[key] = value
+        if num_text_layers is not None:
+            text_state_dict = _filter_layers_by_prefix(text_state_dict, ("layers",), num_text_layers)
+        if save_hf_safetensors:
+            fallback_state_dict = state_dict
+            if num_text_layers is not None:
+                fallback_state_dict = _filter_layers_by_prefix(
+                    fallback_state_dict,
+                    ("model.language_model.layers", "model.layers"),
+                    num_text_layers,
+                )
+            hf_path = os.path.join(output_dir, "model.safetensors")
+            logger.info(f"Saving filtered HF safetensors to {hf_path}")
+            save_file(fallback_state_dict, hf_path)
 
     logger.info(f"Vision model: {len(vision_state_dict)} tensors")
     logger.info(f"Text model: {len(text_state_dict)} tensors")
-
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
 
     # Save vision checkpoint
     vision_path = os.path.join(output_dir, "vision_model.pt")
@@ -233,6 +298,7 @@ def split_checkpoint(
         "vision_num_params": len(vision_state_dict),
         "text_num_params": len(text_state_dict),
         "model_type": resolved_model_type or getattr(config, "model_type", None),
+        "num_text_layers": num_text_layers,
     }
 
     metadata_path = os.path.join(output_dir, "split_metadata.json")
@@ -276,6 +342,17 @@ def main():
         default=None,
         help="Optional ms-swift model_type override (e.g., 'qwen2_5_vl')",
     )
+    parser.add_argument(
+        "--num-text-layers",
+        type=int,
+        default=None,
+        help="Optional number of text layers to keep in the split checkpoint (e.g., 4).",
+    )
+    parser.add_argument(
+        "--save-hf-safetensors",
+        action="store_true",
+        help="Save a filtered HF-style model.safetensors alongside the split checkpoints.",
+    )
 
     args = parser.parse_args()
 
@@ -284,6 +361,8 @@ def main():
         output_dir=args.output_dir,
         trust_remote_code=not args.no_trust_remote_code,
         model_type=args.model_type,
+        num_text_layers=args.num_text_layers,
+        save_hf_safetensors=args.save_hf_safetensors,
     )
 
 
