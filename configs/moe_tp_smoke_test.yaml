@@ -15,6 +15,7 @@ vision:
     sequence_parallel_size: 8
     expert_model_parallel_size: 1
     attention_backend: "auto"  # unfused doesn't support context parallelism (SP > 1)
+    megatron_num_layers: 2  # Minimum layers for smoke test
     load_weights: false
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
@@ -33,6 +34,7 @@ text:
     sequence_parallel_size: 8
     expert_model_parallel_size: 1
     attention_backend: "auto"  # unfused doesn't support context parallelism (SP > 1)
+    megatron_num_layers: 2  # Minimum layers for smoke test
     load_weights: false
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 

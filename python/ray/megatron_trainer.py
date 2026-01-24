@@ -414,8 +414,12 @@ class MegatronTextTrainer(MegatronBaseTrainer):
         )
         if position_ids.dim() == 2:
             position_ids = position_ids.unsqueeze(0).repeat(3, 1, 1)
+            # mRoPE models (e.g., qwen3_vl) handle context parallelism internally
+            # and expect full position_ids, not sliced ones
+            model_type = self.config.get("model_type", "").lower()
+            uses_mrope = model_type == "qwen3_vl"
             context_parallel_size = int(getattr(self.megatron_args, "context_parallel_size", 1))
-            if context_parallel_size > 1:
+            if context_parallel_size > 1 and not uses_mrope:
                 from megatron.core import parallel_state
 
                 cp_rank = parallel_state.get_context_parallel_rank()
