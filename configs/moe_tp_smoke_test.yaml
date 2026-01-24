@@ -6,16 +6,16 @@ vision:
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
-  attention_backend: "auto"  # Use auto to allow FusedAttention with context parallelism
+  attention_backend: "auto"
   activation_checkpointing: false
   autocast: true
   engine_config:
-    tensor_parallel_size: 8
+    tensor_parallel_size: 4  # Must divide num_query_groups (4)
     pipeline_model_parallel_size: 1
-    sequence_parallel_size: 8
+    sequence_parallel_size: 1  # CP=1, sequence parallelism enabled within TP group
     expert_model_parallel_size: 1
-    attention_backend: "auto"  # unfused doesn't support context parallelism (SP > 1)
-    megatron_num_layers: 2  # Minimum layers for smoke test
+    attention_backend: "auto"
+    megatron_num_layers: 4  # Minimum layers to accommodate deep stack visual injection
     load_weights: false
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
@@ -25,16 +25,16 @@ text:
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
-  attention_backend: "auto"  # Use auto to allow FusedAttention with context parallelism
+  attention_backend: "auto"
   activation_checkpointing: false
   autocast: true
   engine_config:
-    tensor_parallel_size: 8
+    tensor_parallel_size: 4  # Must divide num_query_groups (4)
     pipeline_model_parallel_size: 1
-    sequence_parallel_size: 8
+    sequence_parallel_size: 1  # CP=1, sequence parallelism enabled within TP group
     expert_model_parallel_size: 1
-    attention_backend: "auto"  # unfused doesn't support context parallelism (SP > 1)
-    megatron_num_layers: 2  # Minimum layers for smoke test
+    attention_backend: "auto"
+    megatron_num_layers: 4  # Minimum layers to accommodate deep stack visual injection
     load_weights: false
     bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
 
@@ -49,9 +49,9 @@ training:
   weight_decay: 0.0
   gradient_accumulation_steps: 1
   seed: 42
-  parallel_size: 8
+  parallel_size: 4  # Matches TP size
   dp_size: 1
-  collocate: false
+  collocate: true  # Vision and text actors share the same 4 GPUs
   clip_grad_norm: false
   max_grad_norm: 1.0
   no_checkpoint: false

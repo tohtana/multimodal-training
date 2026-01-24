@@ -80,7 +80,10 @@ class MegatronBaseTrainer(Trainer):
             "attention_backend": engine_config.get("attention_backend", "unfused"),
             "tensor_model_parallel_size": tp_size,
             "pipeline_model_parallel_size": pp_size,
-            "sequence_parallel": sp_size > 1,
+            # sequence_parallel (boolean) enables SP within TP group for activations
+            # Required for MoE + TP. Enable when TP > 1.
+            "sequence_parallel": tp_size > 1,
+            # context_parallel_size controls sequence splitting across devices
             "context_parallel_size": sp_size,
             "expert_model_parallel_size": ep_size,
         }
@@ -414,24 +417,39 @@ class MegatronTextTrainer(MegatronBaseTrainer):
         )
         if position_ids.dim() == 2:
             position_ids = position_ids.unsqueeze(0).repeat(3, 1, 1)
-            # mRoPE models (e.g., qwen3_vl) handle context parallelism internally
-            # and expect full position_ids, not sliced ones
-            model_type = self.config.get("model_type", "").lower()
-            uses_mrope = model_type == "qwen3_vl"
+            # Apply context parallelism slicing for ALL models (including mRoPE).
+            # ms-swift uses split_cp_inputs for proper load balancing with causal attention.
             context_parallel_size = int(getattr(self.megatron_args, "context_parallel_size", 1))
-            if context_parallel_size > 1 and not uses_mrope:
+            if context_parallel_size > 1:
                 from megatron.core import parallel_state
 
+                cp_size = parallel_state.get_context_parallel_world_size()
                 cp_rank = parallel_state.get_context_parallel_rank()
                 seq_len = position_ids.shape[-1]
-                if seq_len % context_parallel_size != 0:
+                # Use interleaved CP slicing pattern matching ms-swift's split_cp_inputs:
+                # Split sequence into 2*cp_size chunks, each rank gets chunk i and chunk (2*cp_size-i-1)
+                # This balances load for causal attention (early tokens attend to fewer, late to more).
+                if seq_len % (2 * cp_size) != 0:
                     raise RuntimeError(
-                        f"Sequence length {seq_len} not divisible by context_parallel_size {context_parallel_size}."
+                        f"Sequence length {seq_len} not divisible by 2*context_parallel_size ({2 * cp_size})."
                     )
-                segment = seq_len // context_parallel_size
-                start = cp_rank * segment
-                end = start + segment
-                position_ids = position_ids[..., start:end]
+                chunk_size = seq_len // (2 * cp_size)
+                indices = torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1], device=position_ids.device)
+
+                # Slice position_ids: [3, bs, seq_len] -> [3, bs, 2*chunk_size]
+                position_ids = position_ids.view(3, position_ids.shape[1], 2 * cp_size, chunk_size)
+                position_ids = position_ids.index_select(2, indices)
+                position_ids = position_ids.view(3, position_ids.shape[1], -1)
+
+                # Slice labels: [bs, seq_len] -> [bs, 2*chunk_size]
+                labels = labels.view(labels.shape[0], 2 * cp_size, chunk_size)
+                labels = labels.index_select(1, indices)
+                labels = labels.view(labels.shape[0], -1)
+
+                # Slice loss_mask: [bs, seq_len] -> [bs, 2*chunk_size]
+                loss_mask = loss_mask.view(loss_mask.shape[0], 2 * cp_size, chunk_size)
+                loss_mask = loss_mask.index_select(1, indices)
+                loss_mask = loss_mask.view(loss_mask.shape[0], -1)
         loss = self.megatron_model(
             input_ids=input_ids,
             position_ids=position_ids,
