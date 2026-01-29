@@ -73,7 +73,7 @@ def _resolve_default_trainer(component_type: str, engine: str, model_type: str) 
             return TrainerRegistration(trainer_cls=QwenTextTrainer)
         return None
 
-    if model_type == "qwen3_vl" and engine == "megatron":
+    if model_type in {"qwen3_vl", "qwen3_moe_vl"} and engine == "megatron":
         if component_type == "vision":
             from .ray.megatron_trainer import MegatronVisionTrainer
 
@@ -119,6 +119,8 @@ def _list_supported_combinations(
         ("text", "megatron", "qwen2_5_vl"),
         ("vision", "megatron", "qwen3_vl"),
         ("text", "megatron", "qwen3_vl"),
+        ("vision", "megatron", "qwen3_moe_vl"),
+        ("text", "megatron", "qwen3_moe_vl"),
     }
     combinations = set(_REGISTRY.keys()) | defaults
 

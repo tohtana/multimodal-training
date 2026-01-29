@@ -1,7 +1,7 @@
 debug: false
 
 vision:
-  model_type: "qwen3_vl"
+  model_type: "qwen3_moe_vl"
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   engine: "megatron"
   parallelism: "tensor"
@@ -18,10 +18,10 @@ vision:
     megatron_num_layers: 4  # Minimum layers to accommodate deep stack visual injection
     load_weights: true
     use_cpu_initialization: true
-    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
+    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_4l_split"
 
 text:
-  model_type: "qwen3_vl"
+  model_type: "qwen3_moe_vl"
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   engine: "megatron"
   parallelism: "tensor"
@@ -38,7 +38,7 @@ text:
     megatron_num_layers: 4  # Minimum layers to accommodate deep stack visual injection
     load_weights: true
     use_cpu_initialization: true
-    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
+    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_4l_split"
 
 training:
   batch_size: 1

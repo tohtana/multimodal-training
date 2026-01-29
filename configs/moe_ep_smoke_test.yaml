@@ -1,12 +1,12 @@
 debug: false
 
 vision:
-  model_type: "qwen3_vl"
+  model_type: "qwen3_moe_vl"
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
-  attention_backend: "flash_attention_2"
+  attention_backend: "auto"
   activation_checkpointing: false
   autocast: true
   engine_config:
@@ -14,18 +14,19 @@ vision:
     pipeline_model_parallel_size: 1
     sequence_parallel_size: 1
     expert_model_parallel_size: 8
-    attention_backend: "unfused"
+    attention_backend: "auto"
+    megatron_num_layers: 4  # Use 4-layer model for faster smoke test
     load_weights: true
     use_cpu_initialization: true
-    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
+    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_4l_split"
 
 text:
-  model_type: "qwen3_vl"
+  model_type: "qwen3_moe_vl"
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   engine: "megatron"
   parallelism: "tensor"
   dtype: "bfloat16"
-  attention_backend: "flash_attention_2"
+  attention_backend: "auto"
   activation_checkpointing: false
   autocast: true
   engine_config:
@@ -33,10 +34,11 @@ text:
     pipeline_model_parallel_size: 1
     sequence_parallel_size: 1
     expert_model_parallel_size: 8
-    attention_backend: "unfused"
+    attention_backend: "auto"
+    megatron_num_layers: 4  # Use 4-layer model for faster smoke test
     load_weights: true
     use_cpu_initialization: true
-    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_split"
+    bridge_load_path: "/mnt/local_storage/checkpoints/qwen3_vl_30b_a3b_4l_split"
 
 training:
   batch_size: 1
@@ -51,7 +53,7 @@ training:
   seed: 42
   parallel_size: 8
   dp_size: 1
-  collocate: false
+  collocate: true  # Must be true: EP=8 requires 8 actors, and with 8 GPUs we must share
   clip_grad_norm: false
   max_grad_norm: 1.0
   no_checkpoint: false

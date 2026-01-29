@@ -129,7 +129,7 @@ Requires 4 GPUs by default (8 GPUs if `MEGATRON_TEST_FULL_SCALE=1`).
 Override sweep sizes and actor counts with:
 
 - `MEGATRON_TEST_TP_SIZES=2,4` (tp_tp vision/text TP sizes)
-- `MEGATRON_TEST_EP_SIZES=2,4` (tp_ep text EP sizes; vision TP uses same list)
+- `MEGATRON_TEST_EP_SIZES=2,4` (tp_ep text EP sizes; vision TP uses `MEGATRON_TEST_TP_SIZES`)
 - `MEGATRON_TEST_VISION_ACTORS` and `MEGATRON_TEST_TEXT_ACTORS` (must match world size)
 
 ## Dataset alignment test
