@@ -114,6 +114,36 @@ def sp_to_tp_adapter(seq_dim: int = 0, hidden_dim: int = -1) -> LayoutAdapter:
     return LayoutAdapter(forward_fn=_forward, backward_fn=_backward, name="sp_to_tp")
 
 
+def tp_to_ep_adapter() -> LayoutAdapter:
+    """TP → EP layout adapter: identity per-actor.
+
+    In a full distributed implementation, this would perform an all-to-all
+    redistribution (gather hidden-dim shards, scatter by expert routing).
+    In the pipeline framework, cross-actor redistribution is handled by
+    M:N routing; the per-actor adapter is identity.
+    """
+
+    def _identity(tensor: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
+        return tensor
+
+    return LayoutAdapter(forward_fn=_identity, backward_fn=_identity, name="tp_to_ep")
+
+
+def ep_to_tp_adapter() -> LayoutAdapter:
+    """EP → TP layout adapter: identity per-actor.
+
+    In a full distributed implementation, this would perform an all-to-all
+    redistribution (gather expert outputs, shard hidden dim).
+    In the pipeline framework, cross-actor redistribution is handled by
+    M:N routing; the per-actor adapter is identity.
+    """
+
+    def _identity(tensor: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
+        return tensor
+
+    return LayoutAdapter(forward_fn=_identity, backward_fn=_identity, name="ep_to_tp")
+
+
 def resolve_layout_adapter(
     src_parallelism: str,
     dst_parallelism: str,
@@ -161,6 +191,11 @@ def resolve_layout_adapter(
             return gather_hidden.backward_fn(t, rank, world_size)
 
         return LayoutAdapter(forward_fn=_forward, backward_fn=_backward, name="tp_to_sp")
+
+    if key == ("tensor", "expert"):
+        return tp_to_ep_adapter()
+    if key == ("expert", "tensor"):
+        return ep_to_tp_adapter()
 
     # Default: identity with a warning
     return identity_adapter()

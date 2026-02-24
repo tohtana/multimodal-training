@@ -35,6 +35,8 @@ class MultiStageActor:
         self.rank = rank
         self.config = config
         self._trainers: dict[str, StageTrainer] = {}
+        self._last_forward_outputs: dict[str, StageOutputs] = {}
+        self._last_backward_grads: dict[str, StageGradients | None] = {}
 
     def build_model_from_state_dict(
         self,
@@ -130,20 +132,39 @@ class MultiStageActor:
         so the returned StageOutputs tensor is delivered via RDT/NCCL.
         """
         trainer = self._get_trainer(stage_name)
-        return trainer.forward_step(inputs, labels=labels)
+        result = trainer.forward_step(inputs, labels=labels)
+        self._last_forward_outputs[stage_name] = result
+        return result
 
     def backward_step(
         self,
         stage_name: str,
-        downstream_grad: StageGradients | None = None,
+        downstream_grad: StageGradients | dict | None = None,
     ) -> StageGradients | None:
         """Run backward for a named stage.
 
         For cross-GPU transport, call with .options(tensor_transport="nccl").remote()
         so the returned StageGradients tensor is delivered via RDT/NCCL.
+
+        Accepts either StageGradients or an IPC metadata dict (from T1 transport).
+        IPC dicts are auto-detected and reconstructed before use.
         """
+        if isinstance(downstream_grad, dict) and downstream_grad.get("__ipc__"):
+            from ..ray.tensor_transfer import reconstruct_tensor_from_ipc
+            from ..ray.utils import get_physical_gpu_id
+
+            tensor = reconstruct_tensor_from_ipc(
+                downstream_grad["ipc_handle"],
+                get_physical_gpu_id(),
+                downstream_grad["gpu_id"],
+                downstream_grad.get("event_handle"),
+            )
+            downstream_grad = StageGradients(grad=tensor, meta=downstream_grad.get("meta"))
+
         trainer = self._get_trainer(stage_name)
-        return trainer.backward_step(downstream_grad)
+        result = trainer.backward_step(downstream_grad)
+        self._last_backward_grads[stage_name] = result
+        return result
 
     def optimizer_step(
         self,
@@ -207,6 +228,27 @@ class MultiStageActor:
 
         return True
 
+    def sum_gradients_ipc(self, grads_or_ipc: list) -> StageGradients:
+        """Sum gradient payloads that may include IPC-wrapped dicts.
+
+        Reconstructs IPC handles before summing. Used when gradient sources
+        include both T1 (IPC) and T2 (RDT) actors.
+        """
+        from ..ray.tensor_transfer import reconstruct_tensor_from_ipc
+        from ..ray.utils import get_physical_gpu_id
+
+        my_gpu = get_physical_gpu_id()
+        resolved = []
+        for g in grads_or_ipc:
+            if isinstance(g, dict) and g.get("__ipc__"):
+                tensor = reconstruct_tensor_from_ipc(
+                    g["ipc_handle"], my_gpu, g["gpu_id"], g.get("event_handle")
+                )
+                resolved.append(StageGradients(grad=tensor, meta=g.get("meta")))
+            else:
+                resolved.append(g)
+        return self.sum_gradients(resolved)
+
     def sum_gradients(self, grads: list[StageGradients]) -> StageGradients:
         """Sum multiple gradient payloads into one (used for M:N backward aggregation).
 
@@ -220,6 +262,99 @@ class MultiStageActor:
         for g in grads[1:]:
             summed = summed + g.grad
         return StageGradients(grad=summed, meta=grads[0].meta)
+
+    def accumulate_gradient(
+        self, current: StageGradients, new_grad: StageGradients,
+    ) -> StageGradients:
+        """Add a gradient to an accumulator (for sequential M:N aggregation).
+
+        Unlike sum_gradients (which takes a list), this takes two top-level
+        arguments that Ray resolves individually — avoiding issues with
+        unresolved ObjectRefs in lists on tensor-transport-enabled actors.
+        """
+        summed = current.grad + new_grad.grad
+        return StageGradients(grad=summed, meta=current.meta)
+
+    def get_physical_gpu_id(self) -> str:
+        """Get the physical GPU UUID for this actor's device."""
+        from ..ray.utils import get_physical_gpu_id
+
+        return get_physical_gpu_id()
+
+    def create_ipc_for_output(self, stage_name: str) -> dict | None:
+        """Create CUDA IPC handle for the last forward output of a stage.
+
+        Returns a dict of IPC metadata (no CUDA tensors — safe for object store).
+        Must be called on the same actor after forward_step.
+        Detaches the tensor (autograd graphs do not cross process boundaries).
+        """
+        result = self._last_forward_outputs.get(stage_name)
+        if result is None or result.activations is None or not result.activations.is_cuda:
+            return None
+        from ..ray.tensor_transfer import create_ipc_handle
+
+        handle, gpu_id, event_handle = create_ipc_handle(result.activations.detach())
+        return {
+            "__ipc__": True,
+            "ipc_handle": handle,
+            "gpu_id": gpu_id,
+            "event_handle": event_handle,
+            "meta": result.meta,
+        }
+
+    def forward_from_ipc(self, stage_name: str, ipc_data: dict, labels: Any = None) -> StageOutputs:
+        """Reconstruct tensor from IPC metadata and run forward.
+
+        Used by T1 (same-GPU, different-process) transport receivers.
+        """
+        from ..ray.tensor_transfer import reconstruct_tensor_from_ipc
+        from ..ray.utils import get_physical_gpu_id
+
+        tensor = reconstruct_tensor_from_ipc(
+            ipc_data["ipc_handle"],
+            get_physical_gpu_id(),
+            ipc_data["gpu_id"],
+            ipc_data.get("event_handle"),
+        )
+        inputs = StageOutputs(activations=tensor, meta=ipc_data.get("meta"))
+        return self.forward_step(stage_name, inputs, labels)
+
+    def create_ipc_for_grad(self, stage_name: str) -> dict | None:
+        """Create CUDA IPC handle for the last backward gradient of a stage.
+
+        Returns a dict of IPC metadata (no CUDA tensors — safe for object store).
+        Must be called on the same actor after backward_step.
+        """
+        result = self._last_backward_grads.get(stage_name)
+        if result is None or result.grad is None or not result.grad.is_cuda:
+            return None
+        from ..ray.tensor_transfer import create_ipc_handle
+
+        handle, gpu_id, event_handle = create_ipc_handle(result.grad)
+        return {
+            "__ipc__": True,
+            "ipc_handle": handle,
+            "gpu_id": gpu_id,
+            "event_handle": event_handle,
+            "meta": result.meta,
+        }
+
+    def backward_from_ipc(self, stage_name: str, ipc_data: dict) -> StageGradients | None:
+        """Reconstruct gradient from IPC metadata and run backward.
+
+        Used by T1 (same-GPU, different-process) transport receivers.
+        """
+        from ..ray.tensor_transfer import reconstruct_tensor_from_ipc
+        from ..ray.utils import get_physical_gpu_id
+
+        tensor = reconstruct_tensor_from_ipc(
+            ipc_data["ipc_handle"],
+            get_physical_gpu_id(),
+            ipc_data["gpu_id"],
+            ipc_data.get("event_handle"),
+        )
+        grad = StageGradients(grad=tensor, meta=ipc_data.get("meta"))
+        return self.backward_step(stage_name, grad)
 
     def _get_trainer(self, stage_name: str) -> StageTrainer:
         if stage_name not in self._trainers:

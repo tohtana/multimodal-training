@@ -168,10 +168,30 @@ class Pipeline:
             if not s.is_source and s.dataloader_fn is not None:
                 errors.append(f"Non-source stage '{s.name}' must not have a dataloader_fn")
 
-        # Check subset_of references
+        # Check subset_of references and device_ids constraints
+        rs_by_name = {rs.name: rs for rs in self.resource_sets}
         for rs in self.resource_sets:
-            if rs.subset_of is not None and rs.subset_of not in rs_names:
-                errors.append(f"ResourceSet '{rs.name}' references unknown parent: '{rs.subset_of}'")
+            if rs.subset_of is not None:
+                if rs.subset_of not in rs_names:
+                    errors.append(f"ResourceSet '{rs.name}' references unknown parent: '{rs.subset_of}'")
+                else:
+                    parent = rs_by_name[rs.subset_of]
+                    # Both must have device_ids
+                    if rs.device_ids is None:
+                        errors.append(
+                            f"ResourceSet '{rs.name}' uses subset_of but has no device_ids"
+                        )
+                    if parent.device_ids is None:
+                        errors.append(
+                            f"ResourceSet '{rs.name}' parent '{rs.subset_of}' has no device_ids"
+                        )
+                    # Child device_ids must be a subset of parent device_ids
+                    if rs.device_ids is not None and parent.device_ids is not None:
+                        if not set(rs.device_ids).issubset(set(parent.device_ids)):
+                            errors.append(
+                                f"ResourceSet '{rs.name}' device_ids {rs.device_ids} "
+                                f"not a subset of parent '{rs.subset_of}' device_ids {parent.device_ids}"
+                            )
 
         return errors
 

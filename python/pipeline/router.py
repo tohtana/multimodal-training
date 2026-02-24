@@ -83,8 +83,11 @@ class CrossStageRouter:
 
     Transport tiers:
     - T0: Same ActorGroup (same process) — pass ObjectRef directly (zero-copy)
+    - T1: Different ActorGroups, same GPU — CUDA IPC (zero-copy via shared memory)
     - T2: Different ActorGroups, different GPUs — use RDT/NCCL
-    - T1: Different ActorGroups, same GPU — CUDA IPC (deferred to Milestone 11)
+
+    Per-actor-pair transport detection: for edges between overlapping resource sets,
+    some actor pairs may be T1 (same physical GPU) while others are T2 (different GPUs).
 
     Supports asymmetric M:N actor counts with broadcast or scatter routing.
     """
@@ -94,14 +97,12 @@ class CrossStageRouter:
         self.plan = plan
         self.edge_transports: dict[tuple[str, str], str] = {}
         self.edge_routing: dict[tuple[str, str], RoutingPlan] = {}
+        # Per-actor-pair transport: (src_stage, dst_stage, src_rank, dst_rank) → tier
+        self.actor_pair_transports: dict[tuple[str, str, int, int], str] = {}
 
         for edge in dag.pipeline.edges:
             src_group = plan.stage_to_actor_group[edge.src]
             dst_group = plan.stage_to_actor_group[edge.dst]
-            if id(src_group) == id(dst_group):
-                self.edge_transports[(edge.src, edge.dst)] = "t0"
-            else:
-                self.edge_transports[(edge.src, edge.dst)] = "t2"
 
             # Build routing plan for this edge
             routing = RoutingPlan.build(
@@ -111,10 +112,59 @@ class CrossStageRouter:
             )
             self.edge_routing[(edge.src, edge.dst)] = routing
 
+            if id(src_group) == id(dst_group):
+                self.edge_transports[(edge.src, edge.dst)] = "t0"
+            else:
+                # Determine per-actor-pair transport using GPU IDs
+                src_rs = self._find_resource_set_for_stage(edge.src)
+                dst_rs = self._find_resource_set_for_stage(edge.dst)
+                src_gpus = plan.actor_gpu_ids.get(src_rs, {})
+                dst_gpus = plan.actor_gpu_ids.get(dst_rs, {})
+
+                has_t1 = False
+                has_t2 = False
+                # Only check pairs that actually transfer data (per routing plan)
+                for src_rank in range(src_group.num_actors):
+                    for dst_rank in routing.src_to_dst.get(src_rank, []):
+                        src_gpu = src_gpus.get(src_rank, "")
+                        dst_gpu = dst_gpus.get(dst_rank, "")
+                        if src_gpu and dst_gpu and src_gpu == dst_gpu:
+                            tier = "t1"
+                            has_t1 = True
+                        else:
+                            tier = "t2"
+                            has_t2 = True
+                        self.actor_pair_transports[(edge.src, edge.dst, src_rank, dst_rank)] = tier
+
+                if has_t1 and has_t2:
+                    self.edge_transports[(edge.src, edge.dst)] = "mixed"
+                elif has_t1:
+                    self.edge_transports[(edge.src, edge.dst)] = "t1"
+                else:
+                    self.edge_transports[(edge.src, edge.dst)] = "t2"
+
         logger.info(f"CrossStageRouter transport tiers: {self.edge_transports}")
+        if self.actor_pair_transports:
+            t1_pairs = [(k, v) for k, v in self.actor_pair_transports.items() if v == "t1"]
+            logger.info(f"CrossStageRouter T1 (CUDA IPC) pairs: {len(t1_pairs)}")
+
+    def _find_resource_set_for_stage(self, stage_name: str) -> str:
+        """Find the resource set name for a given stage."""
+        placement = self.dag.pipeline.get_placement(stage_name)
+        return placement.resource_set
 
     def get_transport(self, src: str, dst: str) -> str:
         return self.edge_transports.get((src, dst), "t2")
+
+    def get_actor_pair_transport(self, src: str, dst: str, src_rank: int, dst_rank: int) -> str:
+        """Get the transport tier for a specific (src_rank, dst_rank) actor pair.
+
+        Returns "t0", "t1", or "t2".
+        """
+        edge_tier = self.edge_transports.get((src, dst), "t2")
+        if edge_tier == "t0":
+            return "t0"
+        return self.actor_pair_transports.get((src, dst, src_rank, dst_rank), "t2")
 
     def get_routing(self, src: str, dst: str) -> RoutingPlan:
         return self.edge_routing[(src, dst)]
@@ -128,7 +178,12 @@ class CrossStageRouter:
         return routing is not None and routing.num_src == routing.num_dst
 
     def has_cross_group_edges(self) -> bool:
-        return any(tier == "t2" for tier in self.edge_transports.values())
+        """True if any edge uses T2 (RDT/NCCL) transport."""
+        return any(tier in ("t2", "mixed") for tier in self.edge_transports.values())
+
+    def has_t1_edges(self) -> bool:
+        """True if any edge uses T1 (CUDA IPC) transport."""
+        return any(tier in ("t1", "mixed") for tier in self.edge_transports.values())
 
     def setup_collective_groups(self) -> None:
         """Set up NCCL collective groups for T2 edges."""
@@ -139,7 +194,7 @@ class CrossStageRouter:
 
         done_pairs: set[tuple[int, int]] = set()
         for (src, dst), tier in self.edge_transports.items():
-            if tier != "t2":
+            if tier not in ("t2", "mixed"):
                 continue
             src_group = self.plan.stage_to_actor_group[src]
             dst_group = self.plan.stage_to_actor_group[dst]
