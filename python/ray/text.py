@@ -102,6 +102,16 @@ class BaseTextTrainer(Trainer):
         logger.debug(f"[r{self.rank}] Loading text model config...")
         model_config = self._load_model_config(model_name)
 
+        # Override num_hidden_layers if specified (useful for smoke testing with reduced model)
+        num_hidden_layers = config.get("num_hidden_layers")
+        if num_hidden_layers is not None:
+            text_config = getattr(model_config, "text_config", model_config)
+            logger.info(
+                f"[r{self.rank}] Overriding text num_hidden_layers: "
+                f"{text_config.num_hidden_layers} -> {num_hidden_layers}"
+            )
+            text_config.num_hidden_layers = int(num_hidden_layers)
+
         # Configure attention backend
         attention_backend = config["attention_backend"]
         self._configure_attention_backend(model_config, attention_backend, "text_config")
@@ -1242,13 +1252,13 @@ class QwenTextMixin:
 
     def _load_model_config(self, model_name):
         """Load Qwen2.5-VL model config."""
-        from ..models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig
+        from transformers import Qwen2_5_VLConfig
 
         return Qwen2_5_VLConfig.from_pretrained(model_name, trust_remote_code=True)
 
     def _create_model_and_lm_head(self, model_config):
         """Create Qwen2.5-VL text model and lm_head."""
-        from ..models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLTextModel
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLTextModel
 
         model = Qwen2_5_VLTextModel._from_config(model_config.text_config)
         lm_head = nn.Linear(model_config.text_config.hidden_size, model_config.text_config.vocab_size, bias=False)

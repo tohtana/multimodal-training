@@ -42,6 +42,21 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+
+# Compatibility: transformers 5.x removed 'default' from ROPE_INIT_FUNCTIONS
+if "default" not in ROPE_INIT_FUNCTIONS:
+
+    def _compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
+        import torch
+
+        base = config.rope_theta
+        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * partial_rotary_factor)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+        return inv_freq, 1.0
+
+    ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from transformers.processing_utils import Unpack
@@ -1116,6 +1131,11 @@ class Qwen2_5_VLRotaryEmbedding(nn.Module):
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
+
+    def compute_default_rope_parameters(self, config=None, device=None, seq_len=None, **kwargs):
+        """Compatibility method for transformers 5.x weight initialization."""
+        cfg = config or self.config
+        return self.rope_init_fn(cfg, device)
 
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)

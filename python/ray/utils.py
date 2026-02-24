@@ -77,8 +77,18 @@ def prepare_runtime_environment() -> dict[str, str]:
     if os.environ.get("WANDB_API_KEY"):
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
-    if os.environ.get("PYTHONPATH"):
-        env_vars["PYTHONPATH"] = os.environ["PYTHONPATH"]
+    # Propagate the current conda env's site-packages to Ray actors so they
+    # pick up the correct package versions (e.g. transformers, deepspeed).
+    import site
+    import sys
+
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    site_packages = site.getsitepackages()
+    extra_paths = [p for p in site_packages if conda_prefix and conda_prefix in p]
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    all_paths = extra_paths + ([existing_pythonpath] if existing_pythonpath else [])
+    if all_paths:
+        env_vars["PYTHONPATH"] = os.pathsep.join(all_paths)
 
     if os.environ.get("MODELSCOPE_CACHE"):
         env_vars["MODELSCOPE_CACHE"] = os.environ["MODELSCOPE_CACHE"]

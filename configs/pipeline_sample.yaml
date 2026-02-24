@@ -1,0 +1,105 @@
+# Pipeline-format config for two-stage VLM training (M6: VLM Migration)
+#
+# Equivalent to sample.yaml but uses the pipeline framework for orchestration.
+# The pipeline section defines the DAG structure; vision/text/training/data/deepspeed
+# sections provide model and training configuration (same as legacy format).
+
+# Pipeline structure
+pipeline:
+  stages:
+    - name: vision
+      component_type: vision
+      is_source: true
+      is_terminal: false
+    - name: text
+      component_type: text
+      is_source: false
+      is_terminal: true
+  edges:
+    - src: vision
+      dst: text
+  resource_sets:
+    - name: shared_gpus
+      num_gpus: 4
+  placements:
+    - stage: vision
+      resource_set: shared_gpus
+    - stage: text
+      resource_set: shared_gpus
+
+# Vision model configuration
+vision:
+  model_type: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"
+  engine: "deepspeed"
+  parallelism: "sequence"
+  dtype: "bfloat16"
+  attention_backend: "sdpa"
+  activation_checkpointing: true
+  autocast: true
+  num_hidden_layers: 4
+  engine_config:
+    zero_stage: 1
+    sequence_parallel_size: 4
+
+# Text model configuration
+text:
+  model_type: "qwen2_5_vl"
+  model_name: "Qwen/Qwen2.5-VL-32B-Instruct"
+  engine: "deepspeed"
+  parallelism: "autotp"
+  dtype: "bfloat16"
+  attention_backend: "sdpa"
+  activation_checkpointing: true
+  autocast: true
+  num_hidden_layers: 4
+  engine_config:
+    zero_stage: 1
+    autotp_size: 4
+    tp_overlap_comm: false
+
+# Training configuration
+training:
+  batch_size: 1
+  learning_rate: 5e-05
+  num_epochs: 1
+  num_iterations: 3
+  warmup_steps: 0
+  warmup_ratio: 0.03
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.01
+  gradient_accumulation_steps: 1
+  seed: 42
+  parallel_size: 4
+  dp_size: 1
+  collocate: true
+  clip_grad_norm: false
+  max_grad_norm: 1.0
+  no_checkpoint: true
+  checkpoint_dir: "/tmp/pipeline_checkpoints"
+  log_interval: 1
+
+# Data configuration
+data:
+  datasets:
+    - laion_pop_train
+  data_registry:
+    mscoco2017_train_captions:
+      annotation_path: "/mnt/local_storage/mscoco2017/annotations/coco2017_train_qwen.json"
+      data_path: "/mnt/local_storage/mscoco2017"
+    laion_pop_train:
+      annotation_path: "/mnt/local_storage/laion/laion_pop_train.jsonl"
+      data_path: "/mnt/local_storage/laion/images"
+    laion_pop_val:
+      annotation_path: "/mnt/local_storage/laion/laion_pop_val.jsonl"
+      data_path: "/mnt/local_storage/laion/images"
+  num_workers: 4
+  pin_memory: true
+  data_flatten: true
+  min_pixels: 802816
+  max_pixels: 802816
+  force_fixed_size: false
+
+# DeepSpeed configuration
+deepspeed:
+  reduce_bucket_size: 500000000
