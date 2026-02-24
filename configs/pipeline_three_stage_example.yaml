@@ -1,0 +1,49 @@
+# Three-stage VLM pipeline config (design §8.2) — for parsing tests
+stages:
+  - name: vision
+    parallelism: sequence
+    engine: deepspeed
+    is_source: true
+    is_terminal: false
+    config:
+      model_type: "qwen2_5_vl"
+      zero_stage: 1
+
+  - name: bridge
+    parallelism: none
+    engine: native
+    is_source: false
+    is_terminal: false
+    config: {}
+
+  - name: text
+    parallelism: autotp
+    engine: deepspeed
+    is_source: false
+    is_terminal: true
+    config:
+      model_type: "qwen2_5_vl"
+      zero_stage: 3
+
+edges:
+  - src: vision
+    dst: bridge
+  - src: bridge
+    dst: text
+
+resource_sets:
+  - name: encoder_gpus
+    num_gpus: 2
+  - name: decoder_gpus
+    num_gpus: 8
+
+placements:
+  - stage: vision
+    resource_set: encoder_gpus
+  - stage: bridge
+    resource_set: encoder_gpus
+  - stage: text
+    resource_set: decoder_gpus
+
+dp_size: 1
+num_microbatches: 1

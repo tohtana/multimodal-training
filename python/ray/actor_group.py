@@ -222,3 +222,27 @@ class ActorGroup:
         """
         refs = self.execute_all_async(method_name, *args, **kwargs)
         return ray.get(refs)
+
+    def shutdown(self, *, terminate_actors: bool = True, remove_placement_group: bool = True) -> None:
+        """Shut down this ActorGroup, terminating actors and releasing placement groups.
+
+        Idempotent: safe to call multiple times.
+
+        Args:
+            terminate_actors: Whether to kill the Ray actors.
+            remove_placement_group: Whether to remove the placement group.
+        """
+        if terminate_actors and hasattr(self, "_actors") and self._actors:
+            for actor in self._actors:
+                try:
+                    ray.kill(actor)
+                except Exception:
+                    pass
+            self._actors = []
+
+        if remove_placement_group and hasattr(self, "placement_group") and self.placement_group is not None:
+            try:
+                ray.util.remove_placement_group(self.placement_group)
+            except Exception:
+                pass
+            self.placement_group = None
