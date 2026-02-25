@@ -89,6 +89,8 @@ def _build_stage_config(cfg: DictConfig, component_type: str) -> dict:
     elif component_type == "text":
         if component_config.get("parallelism") == "autotp" and component_config.get("autotp_size") is None:
             component_config["autotp_size"] = parallel_size
+    elif component_type == "bridge":
+        pass  # Bridge needs no SP/TP params
 
     return component_config
 
@@ -125,8 +127,12 @@ def main(cfg: DictConfig):
     collocate = cfg.training.collocate
     total_actors = dp_size * parallel_size
 
+    # Collocation factor = number of collocated stage groups sharing the same GPUs
+    num_stages = len(pipeline.stages)
+    collocation_factor = num_stages if collocate else 1
+
     logger.info(f"DP size: {dp_size}, Parallel size: {parallel_size}, Total actors: {total_actors}")
-    logger.info(f"Collocation: {collocate}")
+    logger.info(f"Collocation: {collocate}, collocation_factor: {collocation_factor}")
 
     # Create actor groups for each stage
     stage_groups: dict[str, ActorGroup] = {}
@@ -158,6 +164,7 @@ def main(cfg: DictConfig):
             collocate=collocate,
             placement_group_handle=prev_pg if collocate else None,
             actor_init_kwargs=init_kwargs,
+            collocation_factor=collocation_factor,
         )
 
         stage_groups[stage.name] = group
@@ -178,11 +185,20 @@ def main(cfg: DictConfig):
     # Set up cross-stage communication
     if collocate:
         logger.info("Setting up CUDA IPC for collocated actors...")
-        # For collocated stages, set up CUDA IPC between adjacent stages in DAG order
+        # For collocated stages, set up CUDA IPC between adjacent stages in DAG order.
+        # Skip edges involving bridge stages — bridge doesn't use IPC (Ray ObjectRef
+        # passing between same-GPU actors is efficient enough for v1).
         ordered_names = [s.name for s in pipeline.stages]
         for i in range(len(ordered_names) - 1):
             src_name = ordered_names[i]
             dst_name = ordered_names[i + 1]
+
+            src_component = stage_configs[src_name].get("component_type", src_name)
+            dst_component = stage_configs[dst_name].get("component_type", dst_name)
+            if src_component == "bridge" or dst_component == "bridge":
+                logger.info(f"Skipping IPC setup for edge {src_name}->{dst_name} (bridge stage)")
+                continue
+
             src_group = stage_groups[src_name]
             dst_group = stage_groups[dst_name]
 

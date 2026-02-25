@@ -169,31 +169,42 @@ class VLMPipelineRunner:
     def _compute_global_grad_norm(self, dp_size: int, parallel_size: int) -> float:
         """Compute global gradient norm across all stages.
 
-        Uses existing compute_grad_norm_contribution() on each actor and
-        aggregates using the legacy aggregate_grad_norms() logic.
+        Iterates per-stage, dispatching aggregation by parallelism type reported
+        in each actor's norm contribution dict.  Supports arbitrary N-stage
+        pipelines (not limited to vision + text).
         """
-        from ..train_ray import aggregate_grad_norms
+        total_norm_sq = 0.0
 
-        # Collect per-stage norms
-        all_norms: dict[str, list[dict]] = {}
         for name in self.topo_order:
             group = self.stage_groups[name]
             norm_refs = group.execute_all_async("compute_grad_norm_contribution")
-            all_norms[name] = ray.get(norm_refs)
+            norms = ray.get(norm_refs)
 
-        # For two-stage VLM, delegate to legacy aggregation
-        # The legacy function handles different parallelism types (SP, TP, AutoTP, etc.)
-        vision_norms = []
-        text_norms = []
-        for name in self.topo_order:
-            stage = self.pipeline.get_stage(name)
-            is_source = stage.is_source
-            if is_source:
-                vision_norms.extend(all_norms[name])
+            if not norms:
+                continue
+
+            ptype = norms[0]["type"]
+
+            if ptype == "sequence":
+                # SP: all ranks in a DP replica share identical grads after sync.
+                # Sample one actor per DP replica: indices 0, parallel_size, 2*parallel_size, ...
+                for dp_rank in range(dp_size):
+                    idx = dp_rank * parallel_size
+                    if idx < len(norms):
+                        total_norm_sq += norms[idx]["norm_sq"]
+
+            elif ptype == "tensor":
+                # TP: first actor per DP replica provides replicated + sharded norms.
+                for dp_rank in range(dp_size):
+                    idx = dp_rank * parallel_size
+                    if idx < len(norms):
+                        total_norm_sq += norms[idx]["replicated_norm_sq"] + norms[idx]["sharded_norm_sq"]
+
             else:
-                text_norms.extend(all_norms[name])
+                # "deepspeed", "none", or unknown: sum all contributions.
+                total_norm_sq += sum(n["norm_sq"] for n in norms)
 
-        return aggregate_grad_norms(vision_norms, text_norms, dp_size, parallel_size)
+        return math.sqrt(total_norm_sq)
 
     def save_checkpoint(
         self,

@@ -21,6 +21,7 @@ class ActorGroup:
         collocate: bool = False,
         placement_group_handle=None,
         actor_init_kwargs: dict | None = None,
+        collocation_factor: int = 2,
     ):
         """Initialize ActorGroup.
 
@@ -33,14 +34,15 @@ class ActorGroup:
             collocate: Whether actors should be collocated with another group on same GPUs
             placement_group_handle: Existing placement group to use (for collocation)
             actor_init_kwargs: Optional kwargs passed to actor constructor
+            collocation_factor: Number of groups sharing the same GPUs (default 2)
         """
         self.num_actors = num_actors
         self.collocate = collocate
         actor_init_kwargs = actor_init_kwargs or {}
 
         # Calculate GPU allocation per actor
-        # When collocating, use fractional GPUs (e.g., 0.5 per actor)
-        gpus_per_actor = num_gpus / 2 if collocate else num_gpus
+        # When collocating, use fractional GPUs (e.g., 1/N per actor for N collocated groups)
+        gpus_per_actor = num_gpus / collocation_factor if collocate else num_gpus
 
         logger.info(f"Creating ActorGroup with {num_actors} actors")
         logger.info(f"Collocation: {collocate}, GPUs per actor: {gpus_per_actor}")
@@ -72,7 +74,7 @@ class ActorGroup:
             if self.placement_group is not None:
                 # Use placement group scheduling
                 actor = remote_actor_cls.options(
-                    num_cpus=num_cpus / 2,  # Share CPUs too
+                    num_cpus=num_cpus / collocation_factor,  # Share CPUs across collocated groups
                     num_gpus=gpus_per_actor,
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=self.placement_group,

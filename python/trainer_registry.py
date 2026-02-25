@@ -54,6 +54,12 @@ def resolve_trainer(component_type: str, engine: str | None, model_type: str, co
 
 
 def _resolve_default_trainer(component_type: str, engine: str, model_type: str) -> TrainerRegistration | None:
+    # Bridge component: native engine works with any model_type
+    if component_type == "bridge" and engine == "native":
+        from .ray.bridge import BridgeTrainer
+
+        return TrainerRegistration(trainer_cls=BridgeTrainer)
+
     if model_type == "qwen2_5_vl" and engine in {"native", "deepspeed", "megatron"}:
         if component_type == "vision":
             if engine == "megatron":
@@ -89,8 +95,8 @@ def _resolve_default_trainer(component_type: str, engine: str, model_type: str) 
 
 def _normalize_component(component_type: str) -> str:
     component = component_type.strip().lower()
-    if component not in {"vision", "text"}:
-        raise ValueError(f"Unknown component_type '{component_type}'. Expected 'vision' or 'text'.")
+    if component not in {"vision", "text", "bridge"}:
+        raise ValueError(f"Unknown component_type '{component_type}'. Expected 'vision', 'text', or 'bridge'.")
     return component
 
 
@@ -121,6 +127,7 @@ def _list_supported_combinations(
         ("text", "megatron", "qwen3_vl"),
         ("vision", "megatron", "qwen3_moe_vl"),
         ("text", "megatron", "qwen3_moe_vl"),
+        ("bridge", "native", "generic"),
     }
     combinations = set(_REGISTRY.keys()) | defaults
 
