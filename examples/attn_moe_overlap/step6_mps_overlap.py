@@ -157,8 +157,13 @@ def run_variant_a(
     moe_fwd_flops: int,
     peak_tflops: float | None,
 ) -> dict:
-    """Run single-process baseline (both stages in one process)."""
-    print("\n=== Variant A: Single-process baseline ===")
+    """Run single-process baseline with microbatch gradient accumulation.
+
+    Processes NUM_MICROBATCHES microbatches of batch_size=1 per iteration,
+    accumulating gradients before a single optimizer step. This matches
+    the Ray pipeline's execution pattern for fair comparison.
+    """
+    print(f"\n=== Variant A: Single-process baseline ({NUM_MICROBATCHES} microbatches, grad accum) ===")
     device = "cuda:0"
 
     attn_stage = Qwen3AttentionStage(config, dtype=DTYPE).to(device)
@@ -172,6 +177,9 @@ def run_variant_a(
 
     x = data.to(device)
     y = labels.to(device)
+    # Chunk into microbatches (batch_size=1 each)
+    x_mbs = list(x.chunk(NUM_MICROBATCHES, dim=0))
+    y_mbs = list(y.chunk(NUM_MICROBATCHES, dim=0))
 
     losses = []
     times_ms = []
@@ -190,35 +198,40 @@ def run_variant_a(
         moe_end = torch.cuda.Event(enable_timing=True)
 
         start_ev.record()
-
-        attn_start.record()
-        h = attn_stage(x)
-        attn_end.record()
-
-        moe_start.record()
-        logits = moe_stage(h)
-        moe_end.record()
-
-        loss = loss_fn(logits, y)
         optimizer.zero_grad()
-        loss.backward()
+
+        total_loss = 0.0
+        for mb_i in range(NUM_MICROBATCHES):
+            attn_start.record()
+            h = attn_stage(x_mbs[mb_i])
+            attn_end.record()
+
+            moe_start.record()
+            logits = moe_stage(h)
+            moe_end.record()
+
+            loss = loss_fn(logits, y_mbs[mb_i])
+            (loss / NUM_MICROBATCHES).backward()
+            total_loss += loss.item()
+
         optimizer.step()
 
         end_ev.record()
         torch.cuda.synchronize()
 
+        avg_loss = total_loss / NUM_MICROBATCHES
         elapsed = start_ev.elapsed_time(end_ev)
         attn_elapsed = attn_start.elapsed_time(attn_end)
         moe_elapsed = moe_start.elapsed_time(moe_end)
 
-        losses.append(loss.item())
+        losses.append(avg_loss)
         if is_timed:
             times_ms.append(elapsed)
             attn_times_ms.append(attn_elapsed)
             moe_times_ms.append(moe_elapsed)
 
         label = "warmup" if not is_timed else "timed"
-        print(f"  [A] Step {step:3d} ({label}) | Loss: {loss.item():.6f} | Time: {elapsed:.2f} ms")
+        print(f"  [A] Step {step:3d} ({label}) | Loss: {avg_loss:.6f} | Time: {elapsed:.2f} ms")
 
     # Compute per-stage metrics
     attn_train_flops = 3 * attn_fwd_flops
