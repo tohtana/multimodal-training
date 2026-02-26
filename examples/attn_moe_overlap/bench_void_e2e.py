@@ -146,8 +146,8 @@ def main():
     print(f"  Normal:  {arr_normal.mean():.2f} +/- {arr_normal.std():.2f} ms/iter")
     print(f"  Void:    {arr_void.mean():.2f} +/- {arr_void.std():.2f} ms/iter")
     print(f"  Speedup: {arr_normal.mean() / arr_void.mean():.1f}x")
-    print(f"\n  Single-process baseline (A): ~452 ms (batch=1 x8 grad accum)")
-    print(f"  Void vs A overhead: {arr_void.mean() - 452:+.0f} ms ({arr_void.mean() / 452:.1f}x)")
+    print(f"\n  Single-process baseline (A): ~202 ms (batch=1 x8, warm GPU)")
+    print(f"  Void vs A overhead: {arr_void.mean() - 202:+.0f} ms ({arr_void.mean() / 202:.1f}x)")
 
     print(f"\n  Normal final loss: {losses_normal[-1]:.6f}")
     print(f"  Void final loss:   {losses_void[-1]:.6f}")

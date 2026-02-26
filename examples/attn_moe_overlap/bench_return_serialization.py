@@ -249,7 +249,7 @@ def main():
         print(f"  Per-microbatch (void, 6 calls):   {per_mb_void:.1f} ms")
         print(f"  8-microbatch (normal):            {per_mb_normal * 8:.0f} ms")
         print(f"  8-microbatch (void):              {per_mb_void * 8:.0f} ms")
-        print(f"  Single-process baseline (A):      ~452 ms (batch=1 x8 grad accum)")
+        print(f"  Single-process baseline (A):      ~202 ms (batch=1 x8, warm GPU)")
         print(f"\n  Ray base overhead: {results['noop']:.1f} ms/call × 48 calls = {results['noop'] * 48:.0f} ms")
 
         manager.shutdown()

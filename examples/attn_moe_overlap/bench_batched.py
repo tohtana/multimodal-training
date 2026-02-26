@@ -209,8 +209,8 @@ def main():
         print(f"  Mean:           {arr.mean():.2f} +/- {arr.std():.2f} ms/iter")
         print(f"  Min:            {arr.min():.2f} ms")
         print(f"  Ray calls/iter: 8  (was 53)")
-        print(f"  Single-process: ~452 ms (batch=1 x8 grad accum)")
-        print(f"  Overhead:       {arr.mean() - 452:+.0f} ms ({arr.mean()/452:.1f}x)")
+        print(f"  Single-process: ~202 ms (batch=1 x8, warm GPU)")
+        print(f"  Overhead:       {arr.mean() - 202:+.0f} ms ({arr.mean()/202:.1f}x)")
         print(f"  Final loss:     {losses[-1]:.6f}")
 
         manager.shutdown()

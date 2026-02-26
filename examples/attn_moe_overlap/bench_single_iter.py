@@ -193,8 +193,8 @@ def main():
         print(f"  Post-schedule only (5 ray.get):     {post_ms:8.2f} ms")
         print(f"  Schedule-only (full - post):        {full_ms - post_ms:8.2f} ms")
         print(f"")
-        print(f"  Single-process baseline (A):        ~452 ms (batch=1 x8 grad accum)")
-        print(f"  Pipeline overhead:                  {full_ms - 452:+.0f} ms ({full_ms/452:.1f}x)")
+        print(f"  Single-process baseline (A):        ~202 ms (batch=1 x8, warm GPU)")
+        print(f"  Pipeline overhead:                  {full_ms - 202:+.0f} ms ({full_ms/202:.1f}x)")
         print(f"  Cross-iter pipeline effect:         {isolated_ms - pipelined_ms:+.1f} ms")
 
         manager.shutdown()

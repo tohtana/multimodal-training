@@ -205,7 +205,7 @@ def main():
         print(f"  loss + grad_norm + optimizer:        {loss_ms + norm_ms + opt_ms:.1f} ms")
         print(f"  Predicted total (serial):            {total_serial:.1f} ms")
         print(f"  Predicted total (fire-forget):       {total_ff:.1f} ms")
-        print(f"  Variant A (single-process) baseline: ~452 ms (batch=1 x8 grad accum)")
+        print(f"  Variant A (single-process) baseline: ~202 ms (batch=1 x8, warm GPU)")
 
         manager.shutdown()
     finally:

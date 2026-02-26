@@ -207,7 +207,7 @@ def measure_pure_cuda_compute():
     print(f"  moe forward (batch=1):       {moe_fwd_ms:.2f} ms")
     print(f"  full microbatch (fwd+bwd):   {full_mb_ms:.2f} ms")
     print(f"  full iteration (8 mb):       {full_iter_ms:.2f} ms")
-    print(f"  variant A (batch=1 x8 accum):~452 ms")
+    print(f"  variant A (batch=1 x8, warm):~202 ms")
     return full_iter_ms
 
 
@@ -437,7 +437,7 @@ def measure_ray_scheduling_gap():
         print(f"  Per-iteration (8 mb):")
         print(f"    Serial get:                  {iter_serial:.0f} ms")
         print(f"    Fire-forget:                 {iter_ff:.0f} ms")
-        print(f"    Single-process baseline:     ~452 ms (batch=1 x8 grad accum)")
+        print(f"    Single-process baseline:     ~202 ms (batch=1 x8, warm GPU)")
 
         ipc_fresh = results["create_ipc_for_output (fresh)"]
         ipc_cached = results["get_cached_ipc (reuse)"]

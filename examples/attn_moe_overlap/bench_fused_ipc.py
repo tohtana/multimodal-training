@@ -290,8 +290,8 @@ def main():
     print(f"  Separate (6 calls/mb, 48+5=53 total):   {arr_separate.mean():.2f} +/- {arr_separate.std():.2f} ms")
     print(f"  Speedup:                                 {arr_separate.mean() / arr_fused.mean():.2f}x")
     print(f"  Calls eliminated per iter:               {53 - 37} ({(53-37)/53*100:.0f}%)")
-    print(f"\n  Single-process baseline (A):             ~452 ms (batch=1 x8 grad accum)")
-    print(f"  Fused vs A:                              {arr_fused.mean() / 452:.1f}x")
+    print(f"\n  Single-process baseline (A):             ~202 ms (batch=1 x8, warm GPU)")
+    print(f"  Fused vs A:                              {arr_fused.mean() / 202:.1f}x")
 
     print(f"\n  Fused final loss:    {losses_fused[-1]:.6f}")
     print(f"  Separate final loss: {losses_separate[-1]:.6f}")
