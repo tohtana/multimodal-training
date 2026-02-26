@@ -13,14 +13,15 @@ This guide covers the flexible pipeline parallelism framework for training visio
 7. [How to Write a Config File](#7-how-to-write-a-config-file)
 8. [How to Map a Model's Layers to Stages](#8-how-to-map-a-models-layers-to-stages)
 9. [Adding Support for a New Model](#9-adding-support-for-a-new-model)
-10. [Payload Interface](#10-payload-interface)
-11. [Example Commands](#11-example-commands)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Checkpoint Management](#13-checkpoint-management)
-14. [Logging](#14-logging)
-15. [Transport Tiers Deep Dive](#15-transport-tiers-deep-dive)
-16. [Limitations](#16-limitations)
-17. [Future Plans](#17-future-plans)
+10. [Interleaved MoE Pipeline (Python API)](#10-interleaved-moe-pipeline-python-api)
+11. [Payload Interface](#11-payload-interface)
+12. [Example Commands](#12-example-commands)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Checkpoint Management](#14-checkpoint-management)
+15. [Logging](#15-logging)
+16. [Transport Tiers Deep Dive](#16-transport-tiers-deep-dive)
+17. [Limitations](#17-limitations)
+18. [Future Plans](#18-future-plans)
 
 ---
 
@@ -272,6 +273,9 @@ edges:
     dst: decoder
     merge_policy: concat
 ```
+
+> **Note — validation only (not yet implemented at runtime).**
+> `merge_policy` is currently enforced only at config validation time: `Pipeline.validate()` rejects fan-in stages that omit it. However, the runners (`VLMPipelineRunner`, `RayPipelineRunner`) only consume `preds[0]` — the first predecessor — and do not collect or merge outputs from multiple upstream stages. The three policy values (`concat`, `sum`, `dict`) are placeholders for future fan-in support. See [Limitations](#17-limitations) and [Future Plans](#18-future-plans).
 
 ### Placements
 
@@ -665,7 +669,229 @@ Alternatively, add your model to the `_resolve_default_trainer()` function in `p
 
 ---
 
-## 10. Payload Interface
+## 10. Interleaved MoE Pipeline (Python API)
+
+The interleaved MoE use case (UC4) cannot be expressed in YAML because it generates many stages programmatically. Instead, you use the **Python API** to build the `Pipeline` and `StageModelSpec` objects directly, then hand them to `PlacementManager` and `RayPipelineRunner`.
+
+### Concept
+
+In a Mixture-of-Experts transformer, each layer has two sublayer types:
+- **Attention sublayer** — benefits from Tensor Parallelism (TP)
+- **MoE FFN sublayer** — benefits from Expert Parallelism (EP)
+
+The interleaved pattern places these on **overlapping GPU sets**: attention stages run on a subset of GPUs with TP, while MoE stages run on a larger set with EP. The stages alternate every layer:
+
+```
+attn_0 → moe_0 → attn_1 → moe_1 → ... → attn_{N-1} → moe_{N-1}
+  (TP)     (EP)    (TP)     (EP)            (TP)          (EP)
+```
+
+### Key Source Files
+
+| File | Purpose |
+|------|---------|
+| `python/pipeline/moe_config_gen.py` | `generate_moe_pipeline()` and `generate_moe_model_specs()` |
+| `python/pipeline/moe_models.py` | `SimpleAttentionBlock`, `SimpleMoEBlock`, `SimpleMoEBlockWithHead` |
+| `python/pipeline/placement.py` | `StageModelSpec`, `PlacementManager` |
+| `python/pipeline/ray_runner.py` | `RayPipelineRunner` — generic pipeline runner |
+| `python/pipeline/router.py` | `CrossStageRouter` + `RoutingPlan` for M:N actor mapping |
+| `python/pipeline/layout.py` | TP↔EP layout adapters (`tp_to_ep_adapter`, `ep_to_tp_adapter`) |
+
+### Step 1: Define Stage Models
+
+Each stage needs its own `nn.Module`. For MoE, this means separate modules for attention and MoE FFN sublayers. The framework provides simplified test models in `moe_models.py`:
+
+```python
+# python/pipeline/moe_models.py
+
+class SimpleAttentionBlock(nn.Module):
+    """Linear projection + residual (simplified stand-in for multi-head attention)."""
+    def __init__(self, hidden_dim: int):
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+    def forward(self, x):
+        return x + self.proj(x)
+
+class SimpleMoEBlock(nn.Module):
+    """Top-k gated experts + residual."""
+    def __init__(self, hidden_dim: int, num_experts: int = 4, top_k: int = 2):
+        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
+        self.experts = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(num_experts)])
+        self.top_k = top_k
+    def forward(self, x):
+        # Soft top-k gating → weighted expert combination → residual
+        ...
+
+class SimpleMoEBlockWithHead(nn.Module):
+    """Terminal MoE block with a classification head for loss computation."""
+    def __init__(self, hidden_dim, num_classes, num_experts=4, top_k=2):
+        self.moe = SimpleMoEBlock(hidden_dim, num_experts, top_k)
+        self.head = nn.Linear(hidden_dim, num_classes)
+    def forward(self, x):
+        return self.head(self.moe(x))
+```
+
+For a real model, you would replace these with actual transformer attention layers and MoE FFN layers extracted from your model architecture.
+
+### Step 2: Generate the Pipeline
+
+Use `generate_moe_pipeline()` to programmatically create the `Pipeline` object with stages, edges, resource sets, and placements:
+
+```python
+from python.pipeline.moe_config_gen import generate_moe_pipeline, generate_moe_model_specs
+
+pipeline = generate_moe_pipeline(
+    num_layers=2,                       # 2 transformer layers → 4 stages
+    hidden_dim=32,
+    num_attn_gpus=2,                    # TP group size for attention
+    num_moe_gpus=4,                     # EP group size for MoE
+    attn_device_ids=(0, 1),             # Physical GPUs for attention
+    moe_device_ids=(0, 1, 2, 3),       # Physical GPUs for MoE (superset)
+    num_microbatches=1,
+    use_subset=True,                    # ag_attn is subset_of ag_moe
+)
+```
+
+This generates:
+
+- **4 stages**: `attn_0` (source) → `moe_0` → `attn_1` → `moe_1` (terminal)
+- **3 edges**: `attn_0→moe_0`, `moe_0→attn_1`, `attn_1→moe_1`
+- **2 resource sets**: `ag_attn` (2 GPUs, `subset_of` ag_moe) and `ag_moe` (4 GPUs)
+- **Placements**: all `attn_*` stages on `ag_attn`, all `moe_*` stages on `ag_moe`
+
+The `subset_of` relationship means attention actors share physical GPUs 0–1 with MoE actors, enabling T1 (CUDA IPC) transport on those pairs while MoE actors on GPUs 2–3 use T2 (NCCL) transport.
+
+### Step 3: Generate Model Specs
+
+`StageModelSpec` is a serializable specification that tells each Ray actor how to construct its model, optimizer, and loss function:
+
+```python
+specs = generate_moe_model_specs(
+    num_layers=2,
+    hidden_dim=32,
+    output_dim=10,                      # Classification head output
+    num_experts=4,
+    top_k=2,
+    lr=0.01,
+    seed=42,
+)
+# Returns 4 specs: [attn_0, moe_0, attn_1, moe_1]
+# Only moe_1 (terminal) has loss_cls=nn.CrossEntropyLoss
+```
+
+Each `StageModelSpec` contains:
+
+| Field | Description |
+|-------|-------------|
+| `stage_name` | Must match a stage name in the Pipeline |
+| `model_cls` | The `nn.Module` class (e.g., `SimpleAttentionBlock`) |
+| `model_kwargs` | Constructor arguments (e.g., `{"hidden_dim": 32}`) |
+| `state_dict` | Pre-initialized weights (ensures deterministic init across actors) |
+| `is_terminal` | Whether this stage computes loss |
+| `optimizer_cls` | Optimizer class (e.g., `torch.optim.Adam`) |
+| `optimizer_kwargs` | Optimizer arguments (e.g., `{"lr": 0.01}`) |
+| `loss_cls` | Loss function class (only for terminal stage) |
+
+### Step 4: Build and Run
+
+```python
+from python.pipeline.placement import PlacementManager
+from python.pipeline.ray_runner import RayPipelineRunner
+from python.pipeline.scheduler import OneFOneBScheduler
+
+# Create placement groups and actor groups
+manager = PlacementManager(pipeline, model_specs=specs)
+plan = manager.plan()
+
+# Optional: use 1F1B schedule for better pipeline utilization
+scheduler = OneFOneBScheduler()
+runner = RayPipelineRunner(pipeline, plan, scheduler=scheduler)
+
+try:
+    # Build models on actors
+    manager.build_models(plan)
+
+    # Training loop
+    for i in range(num_iterations):
+        result = runner.run_iteration(
+            data=data,              # Input tensor [batch, hidden_dim]
+            labels=labels,          # Target tensor [batch]
+            iteration=i,
+            num_microbatches=2,     # Split batch into microbatches for 1F1B
+        )
+        print(f"Iter {i}: loss={result['loss']:.4f}")
+finally:
+    runner.shutdown()
+    manager.shutdown()
+```
+
+### How M:N Actor Routing Works
+
+When attention stages have 2 actors (TP=2) and MoE stages have 4 actors (EP=4), the `CrossStageRouter` builds `RoutingPlan` objects for each edge:
+
+- **attn(2) → moe(4)**: Each attn actor broadcasts to 2 MoE actors. Attn rank 0 → MoE ranks 0,1; Attn rank 1 → MoE ranks 2,3.
+- **moe(4) → attn(2)**: Each MoE actor sends to 1 attn actor. MoE ranks 0,1 → Attn rank 0; MoE ranks 2,3 → Attn rank 1.
+
+### How Transport Tiers Apply
+
+With `ag_attn` as `subset_of` `ag_moe` (devices 0,1 ⊆ 0,1,2,3):
+
+| Actor Pair | Same GPU? | Transport |
+|------------|-----------|-----------|
+| attn rank 0 ↔ moe rank 0 | Yes (GPU 0) | T1 (CUDA IPC) |
+| attn rank 1 ↔ moe rank 1 | Yes (GPU 1) | T1 (CUDA IPC) |
+| attn rank 0 ↔ moe rank 2 | No | T2 (NCCL) |
+| attn rank 1 ↔ moe rank 3 | No | T2 (NCCL) |
+
+The router detects this automatically per actor pair. Edges with mixed transport are labeled `"mixed"`.
+
+### Layout Adapters (TP↔EP)
+
+When data crosses between TP and EP stages, tensor layouts may need redistribution. The framework resolves layout adapters automatically based on the source and destination parallelism types:
+
+| Edge | Adapter | Current Behavior |
+|------|---------|------------------|
+| TP → EP | `tp_to_ep_adapter` | Identity (per-actor passthrough) |
+| EP → TP | `ep_to_tp_adapter` | Identity (per-actor passthrough) |
+
+> **Note**: These are currently identity adapters. A full implementation would perform all-to-all redistribution (gather TP hidden-dim shards, scatter by expert routing for TP→EP, and the reverse for EP→TP). Cross-actor redistribution is currently handled by the `CrossStageRouter`'s M:N routing rather than by per-tensor layout transforms. See [Limitations](#17-limitations) and [Future Plans](#18-future-plans).
+
+### Writing Your Own MoE Config Generator
+
+`generate_moe_pipeline()` is a convenience function for the standard interleaved pattern. For custom topologies, construct the `Pipeline` directly:
+
+```python
+from python.pipeline.stage import Stage, EdgeConfig, ResourceSet, Placement, Pipeline, ParallelismType
+
+stages = [
+    Stage(name="attn_0", is_source=True, parallelism=ParallelismType.TENSOR),
+    Stage(name="moe_0", parallelism=ParallelismType.EXPERT),
+    Stage(name="attn_1", parallelism=ParallelismType.TENSOR),
+    Stage(name="moe_1", is_terminal=True, parallelism=ParallelismType.EXPERT),
+]
+edges = [
+    EdgeConfig(src="attn_0", dst="moe_0"),
+    EdgeConfig(src="moe_0", dst="attn_1"),
+    EdgeConfig(src="attn_1", dst="moe_1"),
+]
+resource_sets = [
+    ResourceSet(name="ag_moe", num_gpus=4, device_ids=(0, 1, 2, 3)),
+    ResourceSet(name="ag_attn", num_gpus=2, device_ids=(0, 1), subset_of="ag_moe"),
+]
+placements = [
+    Placement(stage_name="attn_0", resource_set="ag_attn"),
+    Placement(stage_name="moe_0", resource_set="ag_moe"),
+    Placement(stage_name="attn_1", resource_set="ag_attn"),
+    Placement(stage_name="moe_1", resource_set="ag_moe"),
+]
+pipeline = Pipeline(stages=stages, edges=edges, resource_sets=resource_sets, placements=placements)
+
+errors = pipeline.validate()
+assert not errors, f"Validation errors: {errors}"
+```
+
+---
+
+## 11. Payload Interface
 
 Stages communicate via typed payload dataclasses defined in `python/ray/payloads.py`.
 
@@ -703,7 +929,7 @@ normalize_stage_gradients(payload)    # dict/TextBackwardOutputs/StageGradients 
 
 ---
 
-## 11. Example Commands
+## 12. Example Commands
 
 ### UC1: Two-Stage VLM
 
@@ -767,7 +993,7 @@ python -m python.train_pipeline --config-path=../configs --config-name=pipeline_
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 ### Common Errors
 
@@ -802,7 +1028,7 @@ python -m python.train_pipeline --config-path=../configs --config-name=pipeline_
 
 ---
 
-## 13. Checkpoint Management
+## 14. Checkpoint Management
 
 ### How Checkpoints Work
 
@@ -844,7 +1070,7 @@ checkpoint_dir/
 
 ---
 
-## 14. Logging
+## 15. Logging
 
 ### Log Location
 
@@ -873,7 +1099,7 @@ Or set `profile_time: true` in the config to get per-step timing in the log outp
 
 ---
 
-## 15. Transport Tiers Deep Dive
+## 16. Transport Tiers Deep Dive
 
 The framework selects transport automatically based on where source and destination actors are placed.
 
@@ -906,7 +1132,7 @@ The framework selects transport automatically based on where source and destinat
 
 ---
 
-## 16. Limitations
+## 17. Limitations
 
 - **`dp_size` must be 1**: No global data parallelism across the pipeline yet.
 - **Gradient accumulation**: `gradient_accumulation_steps` must be ≤ 1 when using microbatches.
@@ -917,16 +1143,17 @@ The framework selects transport automatically based on where source and destinat
 - **Attention backend**: SDPA required. `flash_attention_2` has ABI mismatch with Ray runtime.
 - **Full 32B models**: 64 layers require ZeRO-2 or more GPUs when collocated on 4×80GB GPUs.
 - **MoE YAML config**: Interleaved MoE topologies are not configurable via YAML — use the Python API (`moe_config_gen.py`).
+- **Fan-in merge policy**: `merge_policy` (`concat`, `sum`, `dict`) is validated in config but **not applied at runtime**. Runners only consume the first predecessor's output (`preds[0]`). Fan-in DAG topologies require runtime merge implementation before use.
 
 ---
 
-## 17. Future Plans
+## 18. Future Plans
 
 - **Global data parallelism** (`dp_size > 1`) across the pipeline.
 - **Distributed layout adapters** with all-gather/scatter/all-to-all for real expert parallelism.
 - **Full model testing** with ZeRO-2+ on larger GPU clusters (8+ GPUs).
 - **CUDA MPS** for compute overlap on shared GPUs (MoE interleaving).
-- **Fan-out/fan-in DAG topologies** beyond linear pipelines.
+- **Fan-out/fan-in DAG topologies** beyond linear pipelines, including runtime `merge_policy` execution (`concat` along the token dimension, `sum` element-wise, `dict` keyed by source stage name) for `StageOutputs.activations`.
 - **Bridge engine backends** (DeepSpeed, Megatron) for distributed bridge training.
 - **Performance benchmarking**: pipeline bubble ratio, throughput metrics, 1F1B vs sequential comparison.
 - **Remove legacy custom model code** (`python/models/qwen2_5_vl/`) — trainers now use HuggingFace native.
