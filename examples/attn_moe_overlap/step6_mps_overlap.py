@@ -28,8 +28,8 @@ import torch.nn as nn
 
 from examples.attn_moe_overlap.flops_utils import (
     compute_attn_forward_flops,
-    compute_moe_forward_flops,
     compute_mfu,
+    compute_moe_forward_flops,
     get_gpu_peak_tflops,
 )
 from examples.attn_moe_overlap.model_utils import (
@@ -41,7 +41,11 @@ from examples.attn_moe_overlap.model_utils import (
 from examples.attn_moe_overlap.mps_utils import MPSContext, check_mps_support, get_gpu_arch
 from python.pipeline.placement import PlacementManager, StageModelSpec
 from python.pipeline.ray_runner import RayPipelineRunner
-from python.pipeline.scheduler import OneFOneBScheduler
+from python.pipeline.scheduler import (
+    DEFAULT_GPIPE_MAX_MICROBATCHES,
+    get_scheduler,
+    validate_scheduler_request,
+)
 from python.pipeline.stage import EdgeConfig, ParallelismType, Pipeline, Placement, ResourceSet, Stage
 from python.ray.multi_stage_actor import MultiStageActor
 from python.ray.payloads import StageOutputs
@@ -131,10 +135,7 @@ class BenchmarkMultiStageActor(MultiStageActor):
     def forward_step(self, stage_name, inputs=None, labels=None):
         # For the preloaded source stage, use cached GPU data instead of the
         # serialized CPU input from the pipeline runner.
-        if (
-            hasattr(self, "_preloaded_stage")
-            and self._preloaded_stage == stage_name
-        ):
+        if hasattr(self, "_preloaded_stage") and self._preloaded_stage == stage_name:
             idx = self._preload_counter % len(self._preloaded_data)
             self._preload_counter += 1
             inputs = StageOutputs(activations=self._preloaded_data[idx])
@@ -329,6 +330,8 @@ def _run_pipeline_variant(
     data,
     labels,
     actor_cls=BenchmarkMultiStageActor,
+    scheduler_name: str = "1f1b",
+    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
 ) -> tuple[list[float], list[float], object]:
     """Run a pipeline variant and return (times_ms, losses, plan).
 
@@ -338,6 +341,9 @@ def _run_pipeline_variant(
 
     Caller is responsible for ray.init/shutdown and MPS lifecycle.
     """
+    # Validate scheduler before any pipeline setup (fail-fast)
+    validate_scheduler_request(scheduler_name, NUM_MICROBATCHES, gpipe_max_microbatches=gpipe_max_microbatches)
+
     resource_sets, placements = _make_single_gpu_resources()
     pipeline = _make_pipeline(resource_sets, placements)
     specs = _make_specs(config, attn_state_dict, moe_state_dict)
@@ -353,8 +359,7 @@ def _run_pipeline_variant(
         # The actor splits it into microbatches and caches them on GPU.
         attn_group = plan.stage_to_actor_group["attn"]
         preload_refs = [
-            actor.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for actor in attn_group.actors
+            actor.preload_data.remote("attn", data, labels, NUM_MICROBATCHES) for actor in attn_group.actors
         ]
         ray.get(preload_refs)
 
@@ -362,7 +367,7 @@ def _run_pipeline_variant(
         # The BenchmarkMultiStageActor ignores this and uses cached GPU data.
         dummy_data = torch.zeros(BATCH_SIZE, 1, 1, dtype=DTYPE)
 
-        runner = RayPipelineRunner(pipeline, plan, scheduler=OneFOneBScheduler())
+        runner = RayPipelineRunner(pipeline, plan, scheduler=get_scheduler(scheduler_name))
 
         losses = []
         times_ms = []
@@ -406,6 +411,8 @@ def run_variant_b(
     attn_fwd_flops: int,
     moe_fwd_flops: int,
     peak_tflops: float | None,
+    scheduler_name: str = "1f1b",
+    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
 ) -> dict:
     """Run pipeline variant without MPS."""
     print("\n=== Variant B: subset_of, no MPS ===")
@@ -420,7 +427,14 @@ def run_variant_b(
     try:
         ray.init()
         times_ms, losses, _plan = _run_pipeline_variant(
-            "B", config, attn_state_dict, moe_state_dict, data, labels
+            "B",
+            config,
+            attn_state_dict,
+            moe_state_dict,
+            data,
+            labels,
+            scheduler_name=scheduler_name,
+            gpipe_max_microbatches=gpipe_max_microbatches,
         )
 
         # Build stage metrics (wall-clock based for pipeline variants)
@@ -436,18 +450,14 @@ def run_variant_b(
                 "train_flops": attn_train_flops,
                 "timed_mean_ms": mean_ms,
                 "achieved_flops_per_sec": total_achieved * (attn_train_flops / total_train_flops),
-                "mfu": compute_mfu(
-                    total_achieved * (attn_train_flops / total_train_flops), peak_tflops
-                ),
+                "mfu": compute_mfu(total_achieved * (attn_train_flops / total_train_flops), peak_tflops),
             },
             "moe": {
                 "forward_flops": moe_fwd_flops,
                 "train_flops": moe_train_flops,
                 "timed_mean_ms": mean_ms,
                 "achieved_flops_per_sec": total_achieved * (moe_train_flops / total_train_flops),
-                "mfu": compute_mfu(
-                    total_achieved * (moe_train_flops / total_train_flops), peak_tflops
-                ),
+                "mfu": compute_mfu(total_achieved * (moe_train_flops / total_train_flops), peak_tflops),
             },
         }
 
@@ -474,6 +484,8 @@ def run_variant_c(
     attn_fwd_flops: int,
     moe_fwd_flops: int,
     peak_tflops: float | None,
+    scheduler_name: str = "1f1b",
+    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
 ) -> dict:
     """Run pipeline variant with MPS enabled."""
     print("\n=== Variant C: subset_of + MPS ===")
@@ -494,6 +506,8 @@ def run_variant_c(
 
         # IPC smoke test (1 iteration, uses raw data — not timing-sensitive)
         print("  [C] Running IPC smoke test under MPS...")
+        smoke_runner = None
+        smoke_manager = None
         try:
             resource_sets, placements = _make_single_gpu_resources()
             pipeline = _make_pipeline(resource_sets, placements)
@@ -501,14 +515,12 @@ def run_variant_c(
             smoke_manager = PlacementManager(pipeline, model_specs=specs)
             smoke_plan = smoke_manager.plan()
             smoke_manager.build_models(smoke_plan)
-            smoke_runner = RayPipelineRunner(pipeline, smoke_plan, scheduler=OneFOneBScheduler())
+            smoke_runner = RayPipelineRunner(pipeline, smoke_plan, scheduler=get_scheduler(scheduler_name))
             smoke_result = smoke_runner.run_iteration(
                 data=data, labels=labels, iteration=0, num_microbatches=NUM_MICROBATCHES
             )
             assert smoke_result["loss"] is not None, "Smoke test loss is None"
             print(f"  [C] Smoke test passed (loss={smoke_result['loss']:.6f})")
-            smoke_runner.shutdown()
-            smoke_manager.shutdown()
         except Exception as e:
             error_str = str(e)
             if _is_ipc_error(error_str):
@@ -517,6 +529,11 @@ def run_variant_c(
             else:
                 print(f"  [C] Smoke test failed (non-IPC error): {error_str}")
                 return _make_result("failed", error=f"Smoke test failed: {error_str}")
+        finally:
+            if smoke_runner is not None:
+                smoke_runner.shutdown()
+            if smoke_manager is not None:
+                smoke_manager.shutdown()
 
         # Need fresh Ray session after smoke test
         if ray.is_initialized():
@@ -525,7 +542,14 @@ def run_variant_c(
 
         # Timed run
         times_ms, losses, _plan = _run_pipeline_variant(
-            "C", config, attn_state_dict, moe_state_dict, data, labels
+            "C",
+            config,
+            attn_state_dict,
+            moe_state_dict,
+            data,
+            labels,
+            scheduler_name=scheduler_name,
+            gpipe_max_microbatches=gpipe_max_microbatches,
         )
 
         # Build stage metrics
@@ -541,18 +565,14 @@ def run_variant_c(
                 "train_flops": attn_train_flops,
                 "timed_mean_ms": mean_ms,
                 "achieved_flops_per_sec": total_achieved * (attn_train_flops / total_train_flops),
-                "mfu": compute_mfu(
-                    total_achieved * (attn_train_flops / total_train_flops), peak_tflops
-                ),
+                "mfu": compute_mfu(total_achieved * (attn_train_flops / total_train_flops), peak_tflops),
             },
             "moe": {
                 "forward_flops": moe_fwd_flops,
                 "train_flops": moe_train_flops,
                 "timed_mean_ms": mean_ms,
                 "achieved_flops_per_sec": total_achieved * (moe_train_flops / total_train_flops),
-                "mfu": compute_mfu(
-                    total_achieved * (moe_train_flops / total_train_flops), peak_tflops
-                ),
+                "mfu": compute_mfu(total_achieved * (moe_train_flops / total_train_flops), peak_tflops),
             },
         }
 
@@ -623,6 +643,8 @@ def run_profiling(
     moe_state_dict,
     data,
     labels,
+    scheduler_name: str = "1f1b",
+    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
 ) -> dict:
     """Run a profiling pass for the specified variant.
 
@@ -652,54 +674,56 @@ def run_profiling(
         pipeline = _make_pipeline(resource_sets, placements)
         specs = _make_specs(config, attn_state_dict, moe_state_dict)
 
+        runner = None
         manager = PlacementManager(pipeline, model_specs=specs, actor_cls=ProfiledMultiStageActor)
-        plan = manager.plan()
-        manager.build_models(plan)
-
-        # Pre-load data on source actor
-        attn_group = plan.stage_to_actor_group["attn"]
-        moe_group = plan.stage_to_actor_group["moe"]
-        preload_refs = [
-            actor.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for actor in attn_group.actors
-        ]
-        ray.get(preload_refs)
-        dummy_data = torch.zeros(BATCH_SIZE, 1, 1, dtype=DTYPE)
-
-        runner = RayPipelineRunner(pipeline, plan, scheduler=OneFOneBScheduler())
-
-        # Enable profiling on actors
-        attn_trace = os.path.join(variant_trace_dir, "stage_attn")
-        moe_trace = os.path.join(variant_trace_dir, "stage_moe")
-
-        enable_refs = []
-        for actor in attn_group.actors:
-            enable_refs.append(actor.enable_profiling.remote(attn_trace))
-        for actor in moe_group.actors:
-            enable_refs.append(actor.enable_profiling.remote(moe_trace))
-        ray.get(enable_refs)
-
         try:
-            total = profiling_warmup + profiling_iters
-            for step in range(total):
-                result = runner.run_iteration(
-                    data=dummy_data, labels=labels, iteration=step, num_microbatches=NUM_MICROBATCHES
-                )
-                label = "warmup" if step < profiling_warmup else "profiled"
-                print(f"  [prof/{variant}] Step {step:3d} ({label}) | Loss: {result['loss']:.6f}")
-        finally:
-            flush_refs = []
+            plan = manager.plan()
+            manager.build_models(plan)
+
+            # Pre-load data on source actor
+            attn_group = plan.stage_to_actor_group["attn"]
+            moe_group = plan.stage_to_actor_group["moe"]
+            preload_refs = [
+                actor.preload_data.remote("attn", data, labels, NUM_MICROBATCHES) for actor in attn_group.actors
+            ]
+            ray.get(preload_refs)
+            dummy_data = torch.zeros(BATCH_SIZE, 1, 1, dtype=DTYPE)
+
+            runner = RayPipelineRunner(pipeline, plan, scheduler=get_scheduler(scheduler_name))
+
+            # Enable profiling on actors
+            attn_trace = os.path.join(variant_trace_dir, "stage_attn")
+            moe_trace = os.path.join(variant_trace_dir, "stage_moe")
+
+            enable_refs = []
             for actor in attn_group.actors:
-                flush_refs.append(actor.flush_profiling.remote())
+                enable_refs.append(actor.enable_profiling.remote(attn_trace))
             for actor in moe_group.actors:
-                flush_refs.append(actor.flush_profiling.remote())
-            ray.get(flush_refs)
+                enable_refs.append(actor.enable_profiling.remote(moe_trace))
+            ray.get(enable_refs)
 
-        runner.shutdown()
-        manager.shutdown()
+            try:
+                total = profiling_warmup + profiling_iters
+                for step in range(total):
+                    result = runner.run_iteration(
+                        data=dummy_data, labels=labels, iteration=step, num_microbatches=NUM_MICROBATCHES
+                    )
+                    label = "warmup" if step < profiling_warmup else "profiled"
+                    print(f"  [prof/{variant}] Step {step:3d} ({label}) | Loss: {result['loss']:.6f}")
+            finally:
+                flush_refs = []
+                for actor in attn_group.actors:
+                    flush_refs.append(actor.flush_profiling.remote())
+                for actor in moe_group.actors:
+                    flush_refs.append(actor.flush_profiling.remote())
+                ray.get(flush_refs)
 
-        print(f"  [prof/{variant}] Traces saved to {variant_trace_dir}/")
-        return _make_result("ok")
+            print(f"  [prof/{variant}] Traces saved to {variant_trace_dir}/")
+            return _make_result("ok")
+        finally:
+            if runner is not None:
+                runner.shutdown()
+            manager.shutdown()
 
     except Exception as e:
         error_str = str(e)
@@ -732,14 +756,19 @@ def print_report(results_a: dict, results_b: dict, results_c: dict, config, peak
     print("MPS Overlap Results")
     print("=" * 60)
     print(f"\nGPU: {gpu_name} | Arch: {arch} | bf16 Peak: {peak_str} TFLOP/s")
-    print(f"Config: batch={BATCH_SIZE}, seq={SEQ_LEN}, hidden={config.hidden_size}, "
-          f"heads={config.num_attention_heads}, kv_heads={config.num_key_value_heads}, "
-          f"experts={config.num_experts}, k={config.num_experts_per_tok}")
+    print(
+        f"Config: batch={BATCH_SIZE}, seq={SEQ_LEN}, hidden={config.hidden_size}, "
+        f"heads={config.num_attention_heads}, kv_heads={config.num_key_value_heads}, "
+        f"experts={config.num_experts}, k={config.num_experts_per_tok}"
+    )
 
     # --- Timing ---
     print(f"\n--- Timing (mean +/- std over {TIMED_ITERS} iterations) ---")
-    for label, r in [("A. Single-process", results_a), ("B. subset_of (no MPS)", results_b),
-                      ("C. subset_of + MPS", results_c)]:
+    for label, r in [
+        ("A. Single-process", results_a),
+        ("B. subset_of (no MPS)", results_b),
+        ("C. subset_of + MPS", results_c),
+    ]:
         if r["status"] == "ok":
             arr = np.array(r["times_ms"])
             print(f"{label:30s}: {arr.mean():.2f} +/- {arr.std():.2f} ms/iter")
@@ -812,10 +841,23 @@ def print_report(results_a: dict, results_b: dict, results_c: dict, config, peak
 
 def main():
     parser = argparse.ArgumentParser(description="MPS compute overlap benchmark")
-    parser.add_argument("--trace-dir", type=str, default="/mnt/local_storage/mps_traces",
-                        help="Directory for profiling traces")
-    parser.add_argument("--skip-profiling", action="store_true",
-                        help="Skip profiling pass")
+    parser.add_argument(
+        "--trace-dir", type=str, default="/mnt/local_storage/mps_traces", help="Directory for profiling traces"
+    )
+    parser.add_argument("--skip-profiling", action="store_true", help="Skip profiling pass")
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="1f1b",
+        choices=["1f1b", "gpipe", "sequential"],
+        help="Pipeline schedule strategy (default: 1f1b)",
+    )
+    parser.add_argument(
+        "--gpipe-max-microbatches",
+        type=int,
+        default=DEFAULT_GPIPE_MAX_MICROBATCHES,
+        help="Safety cap for GPipe microbatches (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -833,14 +875,21 @@ def main():
 
     # Compute FLOPs
     attn_fwd_flops = compute_attn_forward_flops(
-        batch_size=BATCH_SIZE, seq_len=SEQ_LEN, hidden_size=config.hidden_size,
-        num_heads=config.num_attention_heads, num_kv_heads=config.num_key_value_heads,
+        batch_size=BATCH_SIZE,
+        seq_len=SEQ_LEN,
+        hidden_size=config.hidden_size,
+        num_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
         head_dim=config.hidden_size // config.num_attention_heads,
     )
     moe_fwd_flops = compute_moe_forward_flops(
-        batch_size=BATCH_SIZE, seq_len=SEQ_LEN, hidden_size=config.hidden_size,
-        num_experts=config.num_experts, num_experts_per_tok=config.num_experts_per_tok,
-        moe_intermediate_size=config.moe_intermediate_size, num_classes=NUM_CLASSES,
+        batch_size=BATCH_SIZE,
+        seq_len=SEQ_LEN,
+        hidden_size=config.hidden_size,
+        num_experts=config.num_experts,
+        num_experts_per_tok=config.num_experts_per_tok,
+        moe_intermediate_size=config.moe_intermediate_size,
+        num_classes=NUM_CLASSES,
     )
     print(f"Attention forward FLOPs: {attn_fwd_flops:,}")
     print(f"MoE forward FLOPs: {moe_fwd_flops:,}")
@@ -860,24 +909,66 @@ def main():
 
     # --- Run variants ---
     results_a = run_variant_a(
-        config, attn_state_dict, moe_state_dict, data, labels,
-        attn_fwd_flops, moe_fwd_flops, peak_tflops,
+        config,
+        attn_state_dict,
+        moe_state_dict,
+        data,
+        labels,
+        attn_fwd_flops,
+        moe_fwd_flops,
+        peak_tflops,
     )
 
     results_b = run_variant_b(
-        config, attn_state_dict, moe_state_dict, data, labels,
-        attn_fwd_flops, moe_fwd_flops, peak_tflops,
+        config,
+        attn_state_dict,
+        moe_state_dict,
+        data,
+        labels,
+        attn_fwd_flops,
+        moe_fwd_flops,
+        peak_tflops,
+        scheduler_name=args.scheduler,
+        gpipe_max_microbatches=args.gpipe_max_microbatches,
     )
 
     results_c = run_variant_c(
-        config, attn_state_dict, moe_state_dict, data, labels,
-        attn_fwd_flops, moe_fwd_flops, peak_tflops,
+        config,
+        attn_state_dict,
+        moe_state_dict,
+        data,
+        labels,
+        attn_fwd_flops,
+        moe_fwd_flops,
+        peak_tflops,
+        scheduler_name=args.scheduler,
+        gpipe_max_microbatches=args.gpipe_max_microbatches,
     )
 
     # --- Profiling (separate pass) ---
     if not args.skip_profiling:
-        run_profiling("no_mps", args.trace_dir, config, attn_state_dict, moe_state_dict, data, labels)
-        run_profiling("mps", args.trace_dir, config, attn_state_dict, moe_state_dict, data, labels)
+        run_profiling(
+            "no_mps",
+            args.trace_dir,
+            config,
+            attn_state_dict,
+            moe_state_dict,
+            data,
+            labels,
+            scheduler_name=args.scheduler,
+            gpipe_max_microbatches=args.gpipe_max_microbatches,
+        )
+        run_profiling(
+            "mps",
+            args.trace_dir,
+            config,
+            attn_state_dict,
+            moe_state_dict,
+            data,
+            labels,
+            scheduler_name=args.scheduler,
+            gpipe_max_microbatches=args.gpipe_max_microbatches,
+        )
 
     # --- Report ---
     print_report(results_a, results_b, results_c, config, peak_tflops)

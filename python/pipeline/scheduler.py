@@ -142,6 +142,39 @@ class OneFOneBScheduler(PipelineScheduler):
         return steps
 
 
+class GPipeScheduler(PipelineScheduler):
+    """GPipe (all-forward-then-all-backward) pipeline schedule.
+
+    Separates forward and backward phases completely:
+      Forward:  For each stage (topological order), forward all microbatches.
+      Backward: For each stage (reverse order), backward all microbatches (FIFO mb order).
+
+    Trade-off vs 1F1B:
+      + Creates overlap windows with few stages (2 stages + MPS)
+      + Simpler schedule structure
+      - Higher peak memory (all activations stored during forward phase)
+      - 1F1B is better with many stages (natural overlap from interleaving)
+
+    FIFO constraint: Backward uses forward mb order (0, 1, ..., M-1) within each
+    stage, matching StageTrainer.backward_step()'s FIFO activation pop semantics.
+    """
+
+    def generate_schedule(self, stage_order: list[str], num_microbatches: int) -> list[ScheduleStep]:
+        steps: list[ScheduleStep] = []
+        if num_microbatches < 1:
+            return steps
+        # Forward: stage-first order (enables overlap for source stage)
+        for stage in stage_order:
+            for mb in range(num_microbatches):
+                steps.append(ScheduleStep(OpType.FORWARD, stage, mb))
+        # Backward: reverse stage order, FIFO mb order (required by StageTrainer's
+        # FIFO activation pop — must backward in same mb order as forward)
+        for stage in reversed(stage_order):
+            for mb in range(num_microbatches):
+                steps.append(ScheduleStep(OpType.BACKWARD, stage, mb))
+        return steps
+
+
 class SequentialScheduler(PipelineScheduler):
     """Sequential (fill-drain) schedule: all forwards then all backwards for each microbatch.
 
@@ -160,3 +193,61 @@ class SequentialScheduler(PipelineScheduler):
             for stage in reversed(stage_order):
                 steps.append(ScheduleStep(op=OpType.BACKWARD, stage_name=stage, microbatch_id=mb))
         return steps
+
+
+# ---------------------------------------------------------------------------
+# Scheduler factory and validation
+# ---------------------------------------------------------------------------
+
+SCHEDULER_REGISTRY: dict[str, type[PipelineScheduler]] = {
+    "sequential": SequentialScheduler,
+    "1f1b": OneFOneBScheduler,
+    "gpipe": GPipeScheduler,
+}
+
+DEFAULT_GPIPE_MAX_MICROBATCHES = 8
+
+
+def get_scheduler(name: str) -> PipelineScheduler:
+    """Create a scheduler by name.
+
+    Args:
+        name: One of "sequential", "1f1b", "gpipe".
+
+    Returns:
+        A PipelineScheduler instance.
+
+    Raises:
+        ValueError: If name is not recognized.
+    """
+    cls = SCHEDULER_REGISTRY.get(name)
+    if cls is None:
+        raise ValueError(f"Unknown scheduler '{name}'. Options: {sorted(SCHEDULER_REGISTRY)}")
+    return cls()
+
+
+def validate_scheduler_request(
+    name: str,
+    num_microbatches: int,
+    *,
+    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
+) -> None:
+    """Validate a scheduler request and enforce GPipe memory guardrails.
+
+    Args:
+        name: Scheduler name (must be in SCHEDULER_REGISTRY).
+        num_microbatches: Number of microbatches for this run.
+        gpipe_max_microbatches: Maximum microbatches allowed for GPipe (default: 8).
+
+    Raises:
+        ValueError: If name is unknown or GPipe exceeds microbatch limit.
+    """
+    if name not in SCHEDULER_REGISTRY:
+        raise ValueError(f"Unknown scheduler '{name}'. Options: {sorted(SCHEDULER_REGISTRY)}")
+    if gpipe_max_microbatches < 1:
+        raise ValueError("gpipe_max_microbatches must be >= 1")
+    if name == "gpipe" and num_microbatches > gpipe_max_microbatches:
+        raise ValueError(
+            f"GPipe with {num_microbatches} microbatches may OOM "
+            f"(limit={gpipe_max_microbatches}). Use 1f1b/sequential or lower microbatches."
+        )

@@ -17,7 +17,16 @@ import torch.nn as nn
 
 from python.pipeline.placement import PlacementManager, StageModelSpec
 from python.pipeline.ray_runner import RayPipelineRunner
-from python.pipeline.scheduler import OneFOneBScheduler, OpType, SequentialScheduler
+from python.pipeline.scheduler import (
+    DEFAULT_GPIPE_MAX_MICROBATCHES,
+    GPipeScheduler,
+    OneFOneBScheduler,
+    OpType,
+    PipelineScheduler,
+    SequentialScheduler,
+    get_scheduler,
+    validate_scheduler_request,
+)
 from python.pipeline.stage import EdgeConfig, Pipeline, Placement, ResourceSet, Stage
 
 # Dimensions
@@ -48,20 +57,14 @@ def _validate_schedule(stage_order, num_microbatches, steps):
         if step.op == OpType.FORWARD:
             # Predecessor must have forwarded this mb
             if s > 0:
-                assert (s - 1, mb) in fwd_done, (
-                    f"F({step.stage_name}, mb{mb}): predecessor not done"
-                )
+                assert (s - 1, mb) in fwd_done, f"F({step.stage_name}, mb{mb}): predecessor not done"
             fwd_done.add((s, mb))
         else:
             # This stage must have forwarded this mb
-            assert (s, mb) in fwd_done, (
-                f"B({step.stage_name}, mb{mb}): forward not done"
-            )
+            assert (s, mb) in fwd_done, f"B({step.stage_name}, mb{mb}): forward not done"
             # Successor must have done backward for this mb (unless last stage)
             if s < N - 1:
-                assert (s + 1, mb) in bwd_done, (
-                    f"B({step.stage_name}, mb{mb}): successor backward not done"
-                )
+                assert (s + 1, mb) in bwd_done, f"B({step.stage_name}, mb{mb}): successor backward not done"
             bwd_done.add((s, mb))
 
     # All ops must be present
@@ -136,6 +139,181 @@ class TestOneFOneBScheduler:
     def test_empty_microbatches(self):
         steps = OneFOneBScheduler().generate_schedule(["a", "b"], 0)
         assert steps == []
+
+
+@pytest.mark.cpu_only
+class TestGPipeScheduler:
+    def test_basic_2_stages_4_microbatches(self):
+        sched = GPipeScheduler()
+        stages = ["a", "b"]
+        steps = sched.generate_schedule(stages, 4)
+        _validate_schedule(stages, 4, steps)
+        assert len(steps) == 2 * 2 * 4  # 2 stages × 4 mb × (F+B)
+
+    def test_all_forwards_before_backwards(self):
+        """GPipe guarantee: every forward precedes every backward."""
+        stages = ["a", "b", "c"]
+        steps = GPipeScheduler().generate_schedule(stages, 4)
+        last_fwd_idx = max(i for i, s in enumerate(steps) if s.op == OpType.FORWARD)
+        first_bwd_idx = min(i for i, s in enumerate(steps) if s.op == OpType.BACKWARD)
+        assert last_fwd_idx < first_bwd_idx
+
+    def test_stage_first_forward_order(self):
+        """Forwards are emitted stage-by-stage (all mb for stage 0, then stage 1, ...)."""
+        stages = ["a", "b"]
+        steps = GPipeScheduler().generate_schedule(stages, 4)
+        fwd_steps = [s for s in steps if s.op == OpType.FORWARD]
+        # First 4 should be stage "a", next 4 should be stage "b"
+        assert all(s.stage_name == "a" for s in fwd_steps[:4])
+        assert all(s.stage_name == "b" for s in fwd_steps[4:])
+
+    def test_backward_fifo_order(self):
+        """Backward mb order is FIFO (0,1,2,...) per stage, matching StageTrainer activation pop."""
+        stages = ["a", "b"]
+        steps = GPipeScheduler().generate_schedule(stages, 4)
+        for stage_name in stages:
+            bwd_mbs = [s.microbatch_id for s in steps if s.op == OpType.BACKWARD and s.stage_name == stage_name]
+            assert bwd_mbs == [0, 1, 2, 3], f"Stage {stage_name} backward not FIFO: {bwd_mbs}"
+
+    def test_backward_reverse_stage_order(self):
+        """Backward stages are in reverse topological order."""
+        stages = ["a", "b", "c"]
+        steps = GPipeScheduler().generate_schedule(stages, 4)
+        bwd_steps = [s for s in steps if s.op == OpType.BACKWARD]
+        # First 4 backward steps should be stage "c", then "b", then "a"
+        assert all(s.stage_name == "c" for s in bwd_steps[:4])
+        assert all(s.stage_name == "b" for s in bwd_steps[4:8])
+        assert all(s.stage_name == "a" for s in bwd_steps[8:])
+
+    def test_3_stages_8_microbatches(self):
+        stages = ["s0", "s1", "s2"]
+        steps = GPipeScheduler().generate_schedule(stages, 8)
+        _validate_schedule(stages, 8, steps)
+
+    def test_single_microbatch_same_ops_as_sequential(self):
+        stages = ["a", "b", "c"]
+        gpipe = GPipeScheduler().generate_schedule(stages, 1)
+        seq = SequentialScheduler().generate_schedule(stages, 1)
+        gpipe_ops = {(s.op, s.stage_name, s.microbatch_id) for s in gpipe}
+        seq_ops = {(s.op, s.stage_name, s.microbatch_id) for s in seq}
+        assert gpipe_ops == seq_ops
+
+    def test_empty_microbatches(self):
+        steps = GPipeScheduler().generate_schedule(["a", "b"], 0)
+        assert steps == []
+
+
+@pytest.mark.cpu_only
+class TestGetScheduler:
+    def test_known_schedulers(self):
+        assert isinstance(get_scheduler("sequential"), PipelineScheduler)
+        assert isinstance(get_scheduler("1f1b"), PipelineScheduler)
+        assert isinstance(get_scheduler("gpipe"), PipelineScheduler)
+        assert type(get_scheduler("sequential")) is SequentialScheduler
+        assert type(get_scheduler("1f1b")) is OneFOneBScheduler
+        assert type(get_scheduler("gpipe")) is GPipeScheduler
+
+    def test_unknown_scheduler_raises(self):
+        with pytest.raises(ValueError, match="Unknown scheduler"):
+            get_scheduler("nonexistent")
+
+
+@pytest.mark.cpu_only
+class TestValidateSchedulerRequest:
+    def test_known_scheduler_and_microbatch_limits(self):
+        validate_scheduler_request("1f1b", num_microbatches=128)
+        validate_scheduler_request("sequential", num_microbatches=128)
+        validate_scheduler_request(
+            "gpipe",
+            num_microbatches=DEFAULT_GPIPE_MAX_MICROBATCHES,
+            gpipe_max_microbatches=DEFAULT_GPIPE_MAX_MICROBATCHES,
+        )
+
+    def test_gpipe_over_limit_raises(self):
+        with pytest.raises(ValueError, match="may OOM"):
+            validate_scheduler_request("gpipe", num_microbatches=9, gpipe_max_microbatches=8)
+
+    def test_gpipe_at_limit_passes(self):
+        # Exactly at limit should pass
+        validate_scheduler_request("gpipe", num_microbatches=8, gpipe_max_microbatches=8)
+
+    def test_unknown_scheduler_raises(self):
+        with pytest.raises(ValueError, match="Unknown scheduler"):
+            validate_scheduler_request("unknown", num_microbatches=1)
+
+    def test_invalid_gpipe_max_raises(self):
+        with pytest.raises(ValueError, match="gpipe_max_microbatches must be >= 1"):
+            validate_scheduler_request("gpipe", num_microbatches=1, gpipe_max_microbatches=0)
+
+
+@pytest.mark.cpu_only
+class TestStep6SchedulerPlumbing:
+    def test_run_variant_b_forwards_scheduler(self, monkeypatch):
+        import examples.attn_moe_overlap.step6_mps_overlap as step6
+
+        captured = {}
+
+        def _fake_run_pipeline_variant(
+            name,
+            config,
+            attn_state_dict,
+            moe_state_dict,
+            data,
+            labels,
+            actor_cls=step6.BenchmarkMultiStageActor,
+            scheduler_name="1f1b",
+            gpipe_max_microbatches=DEFAULT_GPIPE_MAX_MICROBATCHES,
+        ):
+            captured["scheduler_name"] = scheduler_name
+            captured["gpipe_max_microbatches"] = gpipe_max_microbatches
+            return [1.0], [0.5], object()
+
+        monkeypatch.setattr(step6, "_run_pipeline_variant", _fake_run_pipeline_variant)
+        monkeypatch.setattr(step6.ray, "is_initialized", lambda: False)
+        monkeypatch.setattr(step6.ray, "init", lambda *args, **kwargs: None)
+        monkeypatch.setattr(step6.ray, "shutdown", lambda *args, **kwargs: None)
+
+        out = step6.run_variant_b(
+            config=None,
+            attn_state_dict={},
+            moe_state_dict={},
+            data=None,
+            labels=None,
+            attn_fwd_flops=100,
+            moe_fwd_flops=200,
+            peak_tflops=None,
+            scheduler_name="gpipe",
+            gpipe_max_microbatches=4,
+        )
+        assert out["status"] == "ok"
+        assert captured == {"scheduler_name": "gpipe", "gpipe_max_microbatches": 4}
+
+    def test_run_pipeline_variant_guard_fails_before_setup(self, monkeypatch):
+        import examples.attn_moe_overlap.step6_mps_overlap as step6
+
+        touched = {"setup_called": False}
+
+        original_make = step6._make_single_gpu_resources
+
+        def _fail_if_called():
+            touched["setup_called"] = True
+            return original_make()
+
+        monkeypatch.setattr(step6, "_make_single_gpu_resources", _fail_if_called)
+
+        with pytest.raises(ValueError, match="may OOM"):
+            step6._run_pipeline_variant(
+                "B",
+                None,
+                None,
+                None,
+                None,
+                None,
+                scheduler_name="gpipe",
+                gpipe_max_microbatches=1,
+            )
+
+        assert touched["setup_called"] is False
 
 
 # ── GPU pipeline tests ──
@@ -238,14 +416,15 @@ class TestPipeline1F1B:
 
             for i in range(10):
                 result = runner.run_iteration(
-                    data=data, labels=labels, iteration=i, num_microbatches=4,
+                    data=data,
+                    labels=labels,
+                    iteration=i,
+                    num_microbatches=4,
                 )
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
         finally:
             runner.shutdown()
             manager.shutdown()
@@ -270,7 +449,10 @@ class TestPipeline1F1B:
             seq_losses = []
             for i in range(num_iters):
                 result = seq_runner.run_iteration(
-                    data=data, labels=labels, iteration=i, num_microbatches=num_mb,
+                    data=data,
+                    labels=labels,
+                    iteration=i,
+                    num_microbatches=num_mb,
                 )
                 seq_losses.append(result["loss"])
         finally:
@@ -287,7 +469,10 @@ class TestPipeline1F1B:
             ofob_losses = []
             for i in range(num_iters):
                 result = ofob_runner.run_iteration(
-                    data=data, labels=labels, iteration=i, num_microbatches=num_mb,
+                    data=data,
+                    labels=labels,
+                    iteration=i,
+                    num_microbatches=num_mb,
                 )
                 ofob_losses.append(result["loss"])
         finally:
@@ -295,10 +480,104 @@ class TestPipeline1F1B:
             ofob_manager.shutdown()
 
         # First iteration loss must match exactly (same weights, same data, fp32)
-        assert abs(ofob_losses[0] - seq_losses[0]) < 1e-5, (
-            f"First iter loss mismatch: 1f1b={ofob_losses[0]:.6f}, seq={seq_losses[0]:.6f}"
-        )
+        assert (
+            abs(ofob_losses[0] - seq_losses[0]) < 1e-5
+        ), f"First iter loss mismatch: 1f1b={ofob_losses[0]:.6f}, seq={seq_losses[0]:.6f}"
         # After iterations: within tolerance (same gradient accumulation)
-        assert abs(ofob_losses[-1] - seq_losses[-1]) < 1e-3, (
-            f"Final loss mismatch: 1f1b={ofob_losses[-1]:.6f}, seq={seq_losses[-1]:.6f}"
-        )
+        assert (
+            abs(ofob_losses[-1] - seq_losses[-1]) < 1e-3
+        ), f"Final loss mismatch: 1f1b={ofob_losses[-1]:.6f}, seq={seq_losses[-1]:.6f}"
+
+
+@pytest.mark.gpu
+class TestPipelineGPipe:
+    def test_gpipe_loss_decreases(self, ray_context):
+        """3-stage pipeline with GPipe schedule trains correctly."""
+        if torch.cuda.device_count() < 2:
+            pytest.skip("Requires at least 2 GPUs")
+
+        pipeline = _build_three_stage_pipeline_cross_gpu()
+        specs = _build_model_specs()
+        scheduler = GPipeScheduler()
+        manager = PlacementManager(pipeline, model_specs=specs)
+        plan = manager.plan()
+        runner = RayPipelineRunner(pipeline, plan, scheduler=scheduler)
+
+        try:
+            manager.build_models(plan)
+            data, labels = _generate_batch()
+            losses = []
+
+            for i in range(10):
+                result = runner.run_iteration(
+                    data=data,
+                    labels=labels,
+                    iteration=i,
+                    num_microbatches=4,
+                )
+                assert result["loss"] is not None, f"Loss is None at iter {i}"
+                losses.append(result["loss"])
+
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
+        finally:
+            runner.shutdown()
+            manager.shutdown()
+
+    def test_gpipe_matches_sequential(self, ray_context):
+        """GPipe and sequential produce the same loss (same gradient accumulation)."""
+        if torch.cuda.device_count() < 2:
+            pytest.skip("Requires at least 2 GPUs")
+
+        pipeline = _build_three_stage_pipeline_cross_gpu()
+        data, labels = _generate_batch()
+        num_mb = 4
+        num_iters = 3
+
+        # Run with sequential scheduler
+        seq_specs = _build_model_specs()
+        seq_manager = PlacementManager(pipeline, model_specs=seq_specs)
+        seq_plan = seq_manager.plan()
+        seq_runner = RayPipelineRunner(pipeline, seq_plan, scheduler=SequentialScheduler())
+        try:
+            seq_manager.build_models(seq_plan)
+            seq_losses = []
+            for i in range(num_iters):
+                result = seq_runner.run_iteration(
+                    data=data,
+                    labels=labels,
+                    iteration=i,
+                    num_microbatches=num_mb,
+                )
+                seq_losses.append(result["loss"])
+        finally:
+            seq_runner.shutdown()
+            seq_manager.shutdown()
+
+        # Run with GPipe scheduler
+        gpipe_specs = _build_model_specs()
+        gpipe_manager = PlacementManager(pipeline, model_specs=gpipe_specs)
+        gpipe_plan = gpipe_manager.plan()
+        gpipe_runner = RayPipelineRunner(pipeline, gpipe_plan, scheduler=GPipeScheduler())
+        try:
+            gpipe_manager.build_models(gpipe_plan)
+            gpipe_losses = []
+            for i in range(num_iters):
+                result = gpipe_runner.run_iteration(
+                    data=data,
+                    labels=labels,
+                    iteration=i,
+                    num_microbatches=num_mb,
+                )
+                gpipe_losses.append(result["loss"])
+        finally:
+            gpipe_runner.shutdown()
+            gpipe_manager.shutdown()
+
+        # First iteration loss must match exactly (same weights, same data, fp32)
+        assert (
+            abs(gpipe_losses[0] - seq_losses[0]) < 1e-5
+        ), f"First iter loss mismatch: gpipe={gpipe_losses[0]:.6f}, seq={seq_losses[0]:.6f}"
+        # After iterations: within tolerance (same gradient accumulation)
+        assert (
+            abs(gpipe_losses[-1] - seq_losses[-1]) < 1e-3
+        ), f"Final loss mismatch: gpipe={gpipe_losses[-1]:.6f}, seq={seq_losses[-1]:.6f}"
