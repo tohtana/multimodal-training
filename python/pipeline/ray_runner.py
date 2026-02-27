@@ -7,6 +7,7 @@ import math
 from typing import Any
 
 import ray
+
 import torch
 
 from ..ray.payloads import StageGradients, StageOutputs
@@ -65,13 +66,6 @@ class RayPipelineRunner:
         self._all_same_group = len(group_ids) == 1
         self._has_t1 = self.router.has_t1_edges()
 
-        # Shared buffer state (T19)
-        self._shared_buffer_requested = False
-        self._shared_buffers_ready = False
-        self._shared_buffer_error: str | None = None
-        self._shared_num_microbatches: int = 0
-        self._overlap_pairs: dict[tuple, dict] = {}
-
         # Pre-compute successors map for run_full_backward
         self._stage_successors = {name: self.dag.successors(name) for name in self.topo_order}
 
@@ -101,12 +95,6 @@ class RayPipelineRunner:
                 raise PipelineIterationError(name, "backward", 0)
             if self._should_inject_failure(name, "forward", iteration):
                 raise PipelineIterationError(name, "forward", 0)
-
-        # Shared buffer overlap path (T19)
-        if self._shared_buffer_requested:
-            if self._shared_buffers_ready:
-                return self._run_iteration_overlap(data, labels, max_norm, iteration, num_microbatches)
-            logger.warning(f"shared_buffer disabled; fallback to mixed path: {self._shared_buffer_error}")
 
         # T0 optimized path only for single microbatch + all same group
         if self._all_same_group and num_microbatches == 1:
@@ -213,16 +201,17 @@ class RayPipelineRunner:
                 preds = self.dag.predecessors(step.stage_name)
                 succs = self.dag.successors(step.stage_name)
                 # Only use RDT/NCCL if any successor edge requires T2 transport
-                use_rdt = any(self.router.get_transport(step.stage_name, s) in ("t2", "mixed") for s in succs)
+                use_rdt = any(
+                    self.router.get_transport(step.stage_name, s) in ("t2", "mixed")
+                    for s in succs
+                )
 
                 if not preds:
                     refs = [
                         self._forward_remote(
-                            actor,
-                            step.stage_name,
+                            actor, step.stage_name,
                             StageOutputs(activations=mb_data[mb_id]),
-                            mb_labels[mb_id],
-                            use_rdt,
+                            mb_labels[mb_id], use_rdt,
                         )
                         for actor in group.actors
                     ]
@@ -235,19 +224,20 @@ class RayPipelineRunner:
                     refs = []
                     for dst_rank, actor in enumerate(group.actors):
                         src_rank = routing.dst_to_src[dst_rank]
-                        transport = self.router.get_actor_pair_transport(pred_name, step.stage_name, src_rank, dst_rank)
+                        transport = self.router.get_actor_pair_transport(
+                            pred_name, step.stage_name, src_rank, dst_rank
+                        )
 
                         if transport == "t1":
                             # T1: CUDA IPC — get IPC handle from sender, reconstruct on receiver
                             ipc_ref = pred_group.actors[src_rank].create_ipc_for_output.remote(pred_name)
-                            ref = actor.forward_from_ipc.remote(step.stage_name, ipc_ref, mb_labels[mb_id])
+                            ref = actor.forward_from_ipc.remote(
+                                step.stage_name, ipc_ref, mb_labels[mb_id]
+                            )
                         else:
                             pred_ref = pred_refs[src_rank]
                             ref = self._forward_remote(
-                                actor,
-                                step.stage_name,
-                                pred_ref,
-                                mb_labels[mb_id],
+                                actor, step.stage_name, pred_ref, mb_labels[mb_id],
                                 use_rdt=(transport == "t2"),
                             )
                         refs.append(ref)
@@ -258,12 +248,14 @@ class RayPipelineRunner:
                 succs_of = self.dag.successors(step.stage_name)
                 preds_of = self.dag.predecessors(step.stage_name)
                 use_rdt_upstream = any(
-                    self.router.get_transport(p, step.stage_name) in ("t2", "mixed") for p in preds_of
+                    self.router.get_transport(p, step.stage_name) in ("t2", "mixed")
+                    for p in preds_of
                 )
 
                 if not succs_of:
                     refs = [
-                        self._backward_remote(actor, step.stage_name, None, use_rdt_upstream) for actor in group.actors
+                        self._backward_remote(actor, step.stage_name, None, use_rdt_upstream)
+                        for actor in group.actors
                     ]
                 else:
                     succ_name = succs_of[0]
@@ -275,13 +267,8 @@ class RayPipelineRunner:
                     for src_rank, actor in enumerate(group.actors):
                         dst_ranks = routing.src_to_dst[src_rank]
                         grad_ref = self._gather_grad_refs_with_transport(
-                            actor,
-                            step.stage_name,
-                            succ_name,
-                            succ_group,
-                            succ_grad_refs,
-                            dst_ranks,
-                            src_rank,
+                            actor, step.stage_name, succ_name, succ_group,
+                            succ_grad_refs, dst_ranks, src_rank,
                         )
                         ref = self._backward_remote(actor, step.stage_name, grad_ref, use_rdt_upstream)
                         refs.append(ref)
@@ -318,202 +305,10 @@ class RayPipelineRunner:
 
         return {"loss": loss_value, "global_grad_norm": global_grad_norm}
 
-    # ── Shared buffer overlap (T19) ──
-
-    def enable_shared_buffer_overlap(
-        self,
-        *,
-        num_microbatches: int,
-        activation_specs: dict[tuple[str, str], dict],
-        scheduler_name: str,
-    ) -> tuple[bool, str | None]:
-        """Preflight + setup for shared-buffer overlap. Returns (ok, reason)."""
-        self._shared_buffer_requested = True
-        self._shared_num_microbatches = num_microbatches
-        self._shared_buffers_ready = False
-        self._shared_buffer_error = None
-
-        # v1 guardrails
-        if scheduler_name != "gpipe":
-            self._shared_buffer_error = "shared_buffer v1 requires --scheduler gpipe"
-            return False, self._shared_buffer_error
-        if len(self.topo_order) != 2:
-            self._shared_buffer_error = "shared_buffer v1 requires exactly 2 stages"
-            return False, self._shared_buffer_error
-
-        # Every overlap edge must be pure T1 and bijective 1:1
-        for (src, dst), tier in self.router.edge_transports.items():
-            if tier != "t1":
-                self._shared_buffer_error = f"edge {src}->{dst} transport={tier}; requires pure t1"
-                return False, self._shared_buffer_error
-            routing = self.router.get_routing(src, dst)
-            if routing.num_src != routing.num_dst or any(len(v) != 1 for v in routing.src_to_dst.values()):
-                self._shared_buffer_error = f"edge {src}->{dst} is not 1:1"
-                return False, self._shared_buffer_error
-            if (src, dst) not in activation_specs:
-                self._shared_buffer_error = f"missing activation spec for edge {src}->{dst}"
-                return False, self._shared_buffer_error
-            spec = activation_specs[(src, dst)]
-            if spec.get("payload_mode") != "activations_only":
-                self._shared_buffer_error = (
-                    f"edge {src}->{dst} payload_mode={spec.get('payload_mode')}; "
-                    "shared_buffer v1 requires activations_only"
-                )
-                return False, self._shared_buffer_error
-            if spec.get("required_meta_keys"):
-                self._shared_buffer_error = (
-                    f"edge {src}->{dst} requires meta keys {spec['required_meta_keys']}; "
-                    "shared_buffer v1 requires empty meta"
-                )
-                return False, self._shared_buffer_error
-
-        try:
-            self._setup_shared_buffers(num_microbatches, activation_specs)
-            self._shared_buffers_ready = True
-            return True, None
-        except Exception as e:
-            cleanup_err = self._cleanup_shared_buffers()
-            self._shared_buffer_error = f"setup failed: {e}"
-            if cleanup_err:
-                self._shared_buffer_error += f"; cleanup warning: {cleanup_err}"
-            return False, self._shared_buffer_error
-
-    def _setup_shared_buffers(self, num_microbatches: int, activation_specs: dict[tuple[str, str], dict]) -> None:
-        """Create/open forward+backward shared buffers for every eligible actor pair."""
-        self._overlap_pairs = {}
-
-        for (src, dst), _tier in self.router.edge_transports.items():
-            spec = activation_specs[(src, dst)]
-            shape, dtype = spec["shape"], spec["dtype"]
-            src_group = self.plan.stage_to_actor_group[src]
-            dst_group = self.plan.stage_to_actor_group[dst]
-            routing = self.router.get_routing(src, dst)
-
-            for src_rank, dst_ranks in routing.src_to_dst.items():
-                dst_rank = dst_ranks[0]
-                fwd_buffer_id = f"{src}->{dst}:fwd:r{src_rank}->r{dst_rank}"
-                bwd_buffer_id = f"{src}->{dst}:bwd:r{dst_rank}->r{src_rank}"
-
-                # Forward buffer: producer=src, consumer=dst
-                ipc_data = ray.get(
-                    src_group.actors[src_rank].setup_shared_buffers.remote(
-                        fwd_buffer_id, num_microbatches, shape, dtype
-                    )
-                )
-                ray.get(dst_group.actors[dst_rank].open_shared_buffers.remote(ipc_data))
-
-                # Backward buffer: producer=dst, consumer=src
-                ipc_data = ray.get(
-                    dst_group.actors[dst_rank].setup_shared_buffers.remote(
-                        bwd_buffer_id, num_microbatches, shape, dtype
-                    )
-                )
-                ray.get(src_group.actors[src_rank].open_shared_buffers.remote(ipc_data))
-
-                self._overlap_pairs[(src, dst, src_rank, dst_rank)] = {
-                    "fwd_buffer_id": fwd_buffer_id,
-                    "bwd_buffer_id": bwd_buffer_id,
-                }
-
-    def _cleanup_shared_buffers(self) -> str | None:
-        """Best-effort rollback used after setup failure. Never raises."""
-        cleanup_refs = []
-        for group in self.plan.resource_set_to_actor_group.values():
-            for actor in group.actors:
-                cleanup_refs.append(actor.clear_shared_buffers.remote())
-        if not cleanup_refs:
-            return None
-        try:
-            ray.get(cleanup_refs, timeout=15)
-            return None
-        except Exception as cleanup_e:
-            logger.warning(f"shared_buffer cleanup had errors: {cleanup_e}")
-            return str(cleanup_e)
-
-    def _run_iteration_overlap(
-        self,
-        data: Any,
-        labels: Any,
-        max_norm: float | None,
-        iteration: int,
-        num_microbatches: int,
-    ) -> dict[str, Any]:
-        """Pipeline iteration with concurrent dispatch for true stage overlap.
-
-        For a 2-stage pipeline with M microbatches:
-
-        Forward phase:
-          All forward ops dispatched at once. Per-actor FIFO ordering ensures
-          mb0 runs before mb1 on each actor. CUDA events enforce cross-actor
-          data dependencies. MPS enables GPU kernel overlap.
-
-        Backward phase (symmetric):
-          All backward ops dispatched at once. FIFO ordering preserved.
-
-        Dependencies enforced by CUDA events (GPU-side), not by Ray task ordering.
-        ray.get at phase boundaries prevents cross-iteration slot/event reuse races.
-        """
-        if num_microbatches != self._shared_num_microbatches:
-            raise ValueError(
-                f"shared_buffer configured for {self._shared_num_microbatches} microbatches, got {num_microbatches}"
-            )
-
-        mb_data, mb_labels = self._split_batch(data, labels, num_microbatches)
-
-        # Forward phase: enqueue producer+consumer per microbatch for each actor pair.
-        pending_refs = []
-        for mb in range(num_microbatches):
-            for (src, dst, src_rank, dst_rank), ids in self._overlap_pairs.items():
-                src_actor = self.plan.stage_to_actor_group[src].actors[src_rank]
-                dst_actor = self.plan.stage_to_actor_group[dst].actors[dst_rank]
-                pending_refs.append(
-                    src_actor.forward_to_buffer.remote(
-                        src, ids["fwd_buffer_id"], mb, StageOutputs(activations=mb_data[mb]), mb_labels[mb]
-                    )
-                )
-                pending_refs.append(dst_actor.forward_from_buffer.remote(dst, ids["fwd_buffer_id"], mb, mb_labels[mb]))
-        ray.get(pending_refs)  # iteration fence for forward slot/event reuse
-
-        # Backward phase: preserve FIFO microbatch order per actor.
-        pending_refs = []
-        for mb in range(num_microbatches):
-            for (src, dst, src_rank, dst_rank), ids in self._overlap_pairs.items():
-                src_actor = self.plan.stage_to_actor_group[src].actors[src_rank]
-                dst_actor = self.plan.stage_to_actor_group[dst].actors[dst_rank]
-                pending_refs.append(dst_actor.backward_to_buffer.remote(dst, ids["bwd_buffer_id"], mb, None))
-                pending_refs.append(src_actor.backward_from_buffer.remote(src, ids["bwd_buffer_id"], mb))
-        ray.get(pending_refs)  # iteration fence for backward slot/event reuse
-
-        # Loss + grad norm + optimizer (same as _run_iteration_mixed)
-        loss_value = None
-        for stage_cfg in self.pipeline.stages:
-            if stage_cfg.is_terminal:
-                group = self.plan.stage_to_actor_group[stage_cfg.name]
-                loss_value = ray.get(group.actors[0].get_last_loss.remote(stage_cfg.name))
-
-        total_norm_sq = 0.0
-        for name in self.topo_order:
-            group = self.plan.stage_to_actor_group[name]
-            norm_sq = ray.get(group.actors[0].compute_grad_norm_sq.remote(name))
-            total_norm_sq += norm_sq
-        global_grad_norm = math.sqrt(total_norm_sq)
-
-        opt_refs = []
-        for name in self.topo_order:
-            group = self.plan.stage_to_actor_group[name]
-            for actor in group.actors:
-                ref = actor.optimizer_step.remote(
-                    name,
-                    global_grad_norm=global_grad_norm if max_norm else None,
-                    max_norm=max_norm or 1.0,
-                )
-                opt_refs.append(ref)
-        ray.get(opt_refs)
-
-        return {"loss": loss_value, "global_grad_norm": global_grad_norm}
-
     @staticmethod
-    def _split_batch(data: Any, labels: Any, num_microbatches: int) -> tuple[list[Any], list[Any]]:
+    def _split_batch(
+        data: Any, labels: Any, num_microbatches: int
+    ) -> tuple[list[Any], list[Any]]:
         """Split data and labels into microbatches along dim 0."""
         if num_microbatches == 1:
             return [data], [labels]

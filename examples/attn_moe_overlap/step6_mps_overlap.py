@@ -160,17 +160,6 @@ class VoidReturnActor(BenchmarkMultiStageActor):
         return True
 
 
-class SharedBufferActor(VoidReturnActor):
-    """VoidReturnActor with shared ring buffer support.
-
-    Inherits GPU data preloading and void returns from VoidReturnActor.
-    Shared buffer methods (forward_to_buffer, forward_from_buffer, etc.)
-    are inherited from MultiStageActor.
-    """
-
-    pass
-
-
 # ---------------------------------------------------------------------------
 # Variant A: Single-process baseline
 # ---------------------------------------------------------------------------
@@ -360,16 +349,12 @@ def _run_pipeline_variant(
     actor_cls=VoidReturnActor,
     scheduler_name: str = "1f1b",
     gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
-    transport: str = "ipc",
 ) -> tuple[list[float], list[float], object]:
     """Run a pipeline variant and return (times_ms, losses, plan).
 
     Pre-loads data on the source actor's GPU so timing reflects compute + IPC,
     not CPU→object-store serialization. A tiny dummy tensor is sent through the
     pipeline for the source stage; the actor overrides it with cached GPU data.
-
-    Args:
-        transport: "ipc" (per-microbatch IPC) or "shared_buffer" (pre-shared ring buffer).
 
     Caller is responsible for ray.init/shutdown and MPS lifecycle.
     """
@@ -400,27 +385,6 @@ def _run_pipeline_variant(
         dummy_data = torch.zeros(BATCH_SIZE, 1, 1, dtype=DTYPE)
 
         runner = RayPipelineRunner(pipeline, plan, scheduler=get_scheduler(scheduler_name))
-
-        # Shared buffer setup (T19)
-        if transport == "shared_buffer":
-            # Derive activation shape from static config (step6 path: known fixed shapes)
-            batch_chunk = BATCH_SIZE // NUM_MICROBATCHES
-            activation_shape = (batch_chunk, SEQ_LEN, config.hidden_size)
-            activation_specs = {
-                ("attn", "moe"): {
-                    "shape": activation_shape,
-                    "dtype": DTYPE,
-                    "payload_mode": "activations_only",
-                    "required_meta_keys": [],
-                },
-            }
-            ok, reason = runner.enable_shared_buffer_overlap(
-                num_microbatches=NUM_MICROBATCHES,
-                activation_specs=activation_specs,
-                scheduler_name=scheduler_name,
-            )
-            if not ok:
-                print(f"  [{name}] shared_buffer setup failed: {reason}; falling back to IPC")
 
         losses = []
         times_ms = []
@@ -640,88 +604,6 @@ def run_variant_c(
 
 
 # ---------------------------------------------------------------------------
-# Variant D: subset_of + MPS + shared buffer
-# ---------------------------------------------------------------------------
-
-
-def run_variant_d(
-    config,
-    attn_state_dict,
-    moe_state_dict,
-    data,
-    labels,
-    attn_fwd_flops: int,
-    moe_fwd_flops: int,
-    peak_tflops: float | None,
-    scheduler_name: str = "gpipe",
-    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
-) -> dict:
-    """Run pipeline variant with MPS + shared ring buffers for true overlap."""
-    print("\n=== Variant D: subset_of + MPS + shared_buffer ===")
-
-    if not check_mps_support():
-        return _make_result("skipped_unsupported", error="MPS not supported on this machine")
-
-    if scheduler_name != "gpipe":
-        return _make_result("skipped_unsupported", error=f"shared_buffer v1 requires gpipe, got {scheduler_name}")
-
-    # Clean session boundary
-    if ray.is_initialized():
-        ray.shutdown()
-
-    mps_ctx = MPSContext(gpu_id=0)
-    try:
-        mps_ctx.__enter__()
-        ray.init(runtime_env={"env_vars": mps_ctx.get_env_vars()})
-
-        times_ms, losses, _plan = _run_pipeline_variant(
-            "D",
-            config,
-            attn_state_dict,
-            moe_state_dict,
-            data,
-            labels,
-            actor_cls=SharedBufferActor,
-            scheduler_name=scheduler_name,
-            gpipe_max_microbatches=gpipe_max_microbatches,
-            transport="shared_buffer",
-        )
-
-        # Build stage metrics
-        mean_ms = sum(times_ms) / len(times_ms)
-        attn_train_flops = 3 * attn_fwd_flops
-        moe_train_flops = 3 * moe_fwd_flops
-        total_train_flops = attn_train_flops + moe_train_flops
-        total_achieved = total_train_flops / (mean_ms / 1000.0)
-
-        stage_metrics = {
-            "attn": {
-                "forward_flops": attn_fwd_flops,
-                "train_flops": attn_train_flops,
-                "timed_mean_ms": mean_ms,
-                "achieved_flops_per_sec": total_achieved * (attn_train_flops / total_train_flops),
-                "mfu": compute_mfu(total_achieved * (attn_train_flops / total_train_flops), peak_tflops),
-            },
-            "moe": {
-                "forward_flops": moe_fwd_flops,
-                "train_flops": moe_train_flops,
-                "timed_mean_ms": mean_ms,
-                "achieved_flops_per_sec": total_achieved * (moe_train_flops / total_train_flops),
-                "mfu": compute_mfu(total_achieved * (moe_train_flops / total_train_flops), peak_tflops),
-            },
-        }
-
-        return _make_result("ok", times_ms, losses, stage_metrics)
-    except Exception as e:
-        print(f"  [D] FAILED: {e}")
-        return _make_result("failed", error=str(e))
-    finally:
-        if ray.is_initialized():
-            ray.shutdown()
-        mps_ctx.__exit__(None, None, None)
-
-
-# ---------------------------------------------------------------------------
 # ProfiledMultiStageActor
 # ---------------------------------------------------------------------------
 
@@ -879,15 +761,8 @@ def run_profiling(
 # ---------------------------------------------------------------------------
 
 
-def print_report(
-    results_a: dict,
-    results_b: dict,
-    results_c: dict,
-    config,
-    peak_tflops: float | None,
-    results_d: dict | None = None,
-):
-    """Print the comparison report."""
+def print_report(results_a: dict, results_b: dict, results_c: dict, config, peak_tflops: float | None):
+    """Print the 3-way comparison report."""
     import numpy as np
 
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
@@ -905,51 +780,36 @@ def print_report(
     )
 
     # --- Timing ---
-    all_variants = [
+    print(f"\n--- Timing (mean +/- std over {TIMED_ITERS} iterations) ---")
+    for label, r in [
         ("A. Single-process", results_a),
         ("B. subset_of (no MPS)", results_b),
-        ("C. subset_of + MPS (IPC)", results_c),
-    ]
-    if results_d is not None:
-        all_variants.append(("D. subset_of + MPS (shared_buf)", results_d))
-
-    print(f"\n--- Timing (mean +/- std over {TIMED_ITERS} iterations) ---")
-    for label, r in all_variants:
+        ("C. subset_of + MPS", results_c),
+    ]:
         if r["status"] == "ok":
             arr = np.array(r["times_ms"])
-            print(f"{label:40s}: {arr.mean():.2f} +/- {arr.std():.2f} ms/iter")
+            print(f"{label:30s}: {arr.mean():.2f} +/- {arr.std():.2f} ms/iter")
         else:
-            print(f"{label:40s}: {r['status']} ({r.get('error', 'N/A')})")
+            print(f"{label:30s}: {r['status']} ({r.get('error', 'N/A')})")
 
     # Speedups
     if results_b["status"] == "ok" and results_c["status"] == "ok":
         b_mean = np.mean(results_b["times_ms"])
         c_mean = np.mean(results_c["times_ms"])
-        print(f"{'Speedup C vs B':40s}: {b_mean / c_mean:.2f}x")
-
-    if results_d is not None and results_d["status"] == "ok":
-        d_mean = np.mean(results_d["times_ms"])
-        if results_a["status"] == "ok":
-            a_mean = np.mean(results_a["times_ms"])
-            print(f"{'Speedup D vs A':40s}: {a_mean / d_mean:.2f}x")
-        if results_c["status"] == "ok":
-            c_mean = np.mean(results_c["times_ms"])
-            print(f"{'Speedup D vs C':40s}: {c_mean / d_mean:.2f}x")
-        if results_b["status"] == "ok":
-            b_mean = np.mean(results_b["times_ms"])
-            print(f"{'Speedup D vs B':40s}: {b_mean / d_mean:.2f}x")
+        print(f"{'Speedup C vs B':30s}: {b_mean / c_mean:.2f}x")
+    else:
+        print(f"{'Speedup C vs B':30s}: N/A")
 
     if results_a["status"] == "ok" and results_c["status"] == "ok":
         a_mean = np.mean(results_a["times_ms"])
         c_mean = np.mean(results_c["times_ms"])
-        print(f"{'Speedup C vs A':40s}: {a_mean / c_mean:.2f}x")
+        print(f"{'Speedup C vs A':30s}: {a_mean / c_mean:.2f}x")
+    else:
+        print(f"{'Speedup C vs A':30s}: N/A")
 
     # --- Variant Status ---
     print("\n--- Variant Status ---")
-    status_variants = [("A", results_a), ("B", results_b), ("C", results_c)]
-    if results_d is not None:
-        status_variants.append(("D", results_d))
-    for label, r in status_variants:
+    for label, r in [("A", results_a), ("B", results_b), ("C", results_c)]:
         status_str = r["status"]
         if r.get("error"):
             status_str += f" (reason: {r['error']})"
@@ -957,10 +817,7 @@ def print_report(
 
     # --- Per-Stage MFU ---
     print("\n--- Per-Stage MFU (pipeline variants) ---")
-    mfu_variants = [("B/no_mps", results_b), ("C/mps+ipc", results_c)]
-    if results_d is not None:
-        mfu_variants.append(("D/mps+sbuf", results_d))
-    for label, r in mfu_variants:
+    for label, r in [("B/no_mps", results_b), ("C/mps", results_c)]:
         if r["status"] == "ok" and r.get("stage_metrics"):
             for stage_name in ("attn", "moe"):
                 sm = r["stage_metrics"].get(stage_name, {})
@@ -973,11 +830,11 @@ def print_report(
             print(f"{label} {'':10s}: SKIPPED ({status})")
 
     # --- Correctness ---
+    # Check that the model showed meaningful learning at some point
+    # (min loss < 50% of initial). Robust to oscillation on toy data
+    # when warmup is long enough to cause LR-induced overshooting.
     print("\n--- Correctness ---")
-    correctness_variants = [("A", results_a), ("B", results_b), ("C", results_c)]
-    if results_d is not None:
-        correctness_variants.append(("D", results_d))
-    for label, r in correctness_variants:
+    for label, r in [("A", results_a), ("B", results_b), ("C", results_c)]:
         if r["status"] == "ok":
             all_losses = r["losses"]
             first_5 = sum(all_losses[:5]) / 5
@@ -995,12 +852,6 @@ def print_report(
         print(f"B-C gap: {gap:.6f} (tolerance: 0.10)")
     elif results_c["status"] != "ok":
         print(f"B-C gap: N/A (C {results_c['status']})")
-
-    if results_d is not None and results_d["status"] == "ok" and results_b["status"] == "ok":
-        b_final = results_b["losses"][-1]
-        d_final = results_d["losses"][-1]
-        gap = abs(d_final - b_final)
-        print(f"B-D gap: {gap:.6f} (tolerance: 0.10)")
 
 
 # ---------------------------------------------------------------------------
@@ -1026,13 +877,6 @@ def main():
         type=int,
         default=DEFAULT_GPIPE_MAX_MICROBATCHES,
         help="Safety cap for GPipe microbatches (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--transport",
-        type=str,
-        default="ipc",
-        choices=["ipc", "shared_buffer"],
-        help="T1 transport mechanism (default: ipc; shared_buffer adds variant D with pre-shared ring buffers)",
     )
     args = parser.parse_args()
 
@@ -1121,21 +965,6 @@ def main():
         gpipe_max_microbatches=args.gpipe_max_microbatches,
     )
 
-    results_d = None
-    if args.transport == "shared_buffer":
-        results_d = run_variant_d(
-            config,
-            attn_state_dict,
-            moe_state_dict,
-            data,
-            labels,
-            attn_fwd_flops,
-            moe_fwd_flops,
-            peak_tflops,
-            scheduler_name=args.scheduler,
-            gpipe_max_microbatches=args.gpipe_max_microbatches,
-        )
-
     # --- Profiling (separate pass) ---
     if not args.skip_profiling:
         run_profiling(
@@ -1162,7 +991,7 @@ def main():
         )
 
     # --- Report ---
-    print_report(results_a, results_b, results_c, config, peak_tflops, results_d=results_d)
+    print_report(results_a, results_b, results_c, config, peak_tflops)
 
     # --- Convergence validation ---
     failed = False
@@ -1194,23 +1023,6 @@ def main():
     elif results_c["status"] == "failed":
         print(f"\nFAILED: Variant C status=failed ({results_c.get('error', 'N/A')})")
         failed = True
-
-    if results_d is not None:
-        if results_d["status"] == "ok":
-            d_losses = results_d["losses"]
-            d_first_5 = sum(d_losses[:5]) / 5
-            d_min = min(d_losses)
-            if d_min >= d_first_5 * 0.5:
-                print(f"\nFAILED: Variant D not learning: first_5={d_first_5:.6f}, min={d_min:.6f}")
-                failed = True
-            if results_b["status"] == "ok":
-                gap = abs(d_losses[-1] - results_b["losses"][-1])
-                if gap > 0.10:
-                    print(f"\nFAILED: B-D loss gap {gap:.6f} exceeds tolerance 0.10")
-                    failed = True
-        elif results_d["status"] == "failed":
-            print(f"\nFAILED: Variant D status=failed ({results_d.get('error', 'N/A')})")
-            failed = True
 
     if failed:
         sys.exit(1)
