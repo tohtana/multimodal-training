@@ -452,8 +452,11 @@ class MultiStageActor:
         """Run forward, then write activations to shared buffer slot and record event.
 
         v1 payload contract: activations-only. Raises if attention_mask or meta present.
+        Reads result from _last_forward_outputs (always set by base forward_step)
+        so subclass overrides (data preloading, void returns) work correctly.
         """
-        result = self.forward_step(stage_name, inputs, labels)
+        self.forward_step(stage_name, inputs, labels)
+        result = self._last_forward_outputs[stage_name]
         if result.attention_mask is not None or bool(result.meta):
             raise RuntimeError(
                 f"{stage_name} emitted attention_mask/meta; shared_buffer v1 requires activations-only payload"
@@ -471,8 +474,13 @@ class MultiStageActor:
         return True
 
     def backward_to_buffer(self, stage_name: str, buffer_id: str, slot: int, downstream_grad=None) -> bool:
-        """Run backward, write upstream gradient to shared buffer slot, record event."""
-        result = self.backward_step(stage_name, downstream_grad)
+        """Run backward, write upstream gradient to shared buffer slot, record event.
+
+        Reads result from _last_backward_grads (always set by base backward_step)
+        so subclass overrides (void returns) work correctly.
+        """
+        self.backward_step(stage_name, downstream_grad)
+        result = self._last_backward_grads.get(stage_name)
         if result is not None and result.grad is not None:
             if bool(result.meta):
                 raise RuntimeError(
