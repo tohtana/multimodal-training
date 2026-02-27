@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from ..ray.payloads import StageGradients, StageOutputs
+from ..ray.shared_buffer import SharedActivationBuffer, SharedEventPool
 
 logger = logging.getLogger(__name__)
 
@@ -241,9 +242,7 @@ class MultiStageActor:
         resolved = []
         for g in grads_or_ipc:
             if isinstance(g, dict) and g.get("__ipc__"):
-                tensor = reconstruct_tensor_from_ipc(
-                    g["ipc_handle"], my_gpu, g["gpu_id"], g.get("event_handle")
-                )
+                tensor = reconstruct_tensor_from_ipc(g["ipc_handle"], my_gpu, g["gpu_id"], g.get("event_handle"))
                 resolved.append(StageGradients(grad=tensor, meta=g.get("meta")))
             else:
                 resolved.append(g)
@@ -264,7 +263,9 @@ class MultiStageActor:
         return StageGradients(grad=summed, meta=grads[0].meta)
 
     def accumulate_gradient(
-        self, current: StageGradients, new_grad: StageGradients,
+        self,
+        current: StageGradients,
+        new_grad: StageGradients,
     ) -> StageGradients:
         """Add a gradient to an accumulator (for sequential M:N aggregation).
 
@@ -356,7 +357,140 @@ class MultiStageActor:
         grad = StageGradients(grad=tensor, meta=ipc_data.get("meta"))
         return self.backward_step(stage_name, grad)
 
-    def _get_trainer(self, stage_name: str) -> StageTrainer:
+    # ── Shared buffer methods (T19: zero-overhead inter-process tensor transfer) ──
+
+    def infer_activation_spec(
+        self,
+        stage_name: str,
+        sample_inputs: StageOutputs,
+        sample_labels: Any = None,
+    ) -> dict:
+        """Infer output shape/dtype without mutating trainer runtime queues/state.
+
+        Uses trainer.model(...) under torch.no_grad(); must NOT call forward_step/backward_step.
+        """
+        trainer = self._get_trainer(stage_name)
+        x = sample_inputs.activations.to(trainer.device)
+        with torch.no_grad():
+            out = trainer.model(x)
+        return {
+            "shape": tuple(out.shape),
+            "dtype": out.dtype,
+            "payload_mode": "unknown",
+            "required_meta_keys": [],
+        }
+
+    def setup_shared_buffers(
+        self,
+        buffer_id: str,
+        num_slots: int,
+        shape: tuple,
+        dtype: torch.dtype,
+    ) -> dict:
+        """Create shared ring buffer + event pool. Returns IPC handles dict.
+
+        Called once on the producer actor at pipeline setup time.
+        buffer_id convention: "{src}->{dst}:{fwd|bwd}:r{src_rank}->r{dst_rank}"
+        """
+        device = torch.device("cuda:0")
+        buffer = SharedActivationBuffer(num_slots, shape, dtype, device)
+        events = SharedEventPool(num_slots, device)
+
+        if not hasattr(self, "_shared_local_buffers"):
+            self._shared_local_buffers = {}
+            self._shared_local_events = {}
+        self._shared_local_buffers[buffer_id] = buffer
+        self._shared_local_events[buffer_id] = events
+
+        return {
+            "buffer_id": buffer_id,
+            "buffer_ipc": buffer.export_ipc_handles(),
+            "event_ipc": events.export_ipc_handles(),
+        }
+
+    def open_shared_buffers(self, ipc_data: dict) -> bool:
+        """Open shared ring buffer + event pool from IPC handles.
+
+        Called once on the consumer actor at pipeline setup time.
+        """
+        device = torch.device("cuda:0")
+        buffer_id = ipc_data["buffer_id"]
+
+        if not hasattr(self, "_shared_remote_buffers"):
+            self._shared_remote_buffers = {}
+            self._shared_remote_events = {}
+        self._shared_remote_buffers[buffer_id] = SharedActivationBuffer.open_from_ipc(ipc_data["buffer_ipc"], device)
+        self._shared_remote_events[buffer_id] = SharedEventPool.open_from_ipc(ipc_data["event_ipc"], device)
+        return True
+
+    def clear_shared_buffers(self, buffer_ids: list[str] | None = None) -> bool:
+        """Best-effort cleanup used when setup fails part-way. Never raises."""
+        for attr in (
+            "_shared_local_buffers",
+            "_shared_local_events",
+            "_shared_remote_buffers",
+            "_shared_remote_events",
+        ):
+            store = getattr(self, attr, None)
+            if not isinstance(store, dict):
+                continue
+            if buffer_ids is None:
+                store.clear()
+            else:
+                for key in buffer_ids:
+                    store.pop(key, None)
+        return True
+
+    def forward_to_buffer(
+        self,
+        stage_name: str,
+        buffer_id: str,
+        slot: int,
+        inputs=None,
+        labels=None,
+    ) -> bool:
+        """Run forward, then write activations to shared buffer slot and record event.
+
+        v1 payload contract: activations-only. Raises if attention_mask or meta present.
+        """
+        result = self.forward_step(stage_name, inputs, labels)
+        if result.attention_mask is not None or bool(result.meta):
+            raise RuntimeError(
+                f"{stage_name} emitted attention_mask/meta; shared_buffer v1 requires activations-only payload"
+            )
+        self._shared_local_buffers[buffer_id].write(slot, result.activations.detach())
+        self._shared_local_events[buffer_id].record(slot)
+        return True
+
+    def forward_from_buffer(self, stage_name: str, buffer_id: str, slot: int, labels=None) -> bool:
+        """Wait on shared buffer event, read activations, run forward."""
+        self._shared_remote_events[buffer_id].wait(slot)
+        tensor = self._shared_remote_buffers[buffer_id].read(slot)
+        inputs = StageOutputs(activations=tensor, attention_mask=None, meta={})
+        self.forward_step(stage_name, inputs, labels)
+        return True
+
+    def backward_to_buffer(self, stage_name: str, buffer_id: str, slot: int, downstream_grad=None) -> bool:
+        """Run backward, write upstream gradient to shared buffer slot, record event."""
+        result = self.backward_step(stage_name, downstream_grad)
+        if result is not None and result.grad is not None:
+            if bool(result.meta):
+                raise RuntimeError(
+                    f"{stage_name} emitted gradient meta; shared_buffer v1 requires tensor-only StageGradients"
+                )
+            self._shared_local_buffers[buffer_id].write(slot, result.grad)
+            self._shared_local_events[buffer_id].record(slot)
+        return True
+
+    def backward_from_buffer(self, stage_name: str, buffer_id: str, slot: int) -> bool:
+        """Wait on shared buffer event, read gradient, run backward."""
+        self._shared_remote_events[buffer_id].wait(slot)
+        grad_tensor = self._shared_remote_buffers[buffer_id].read(slot)
+        downstream_grad = StageGradients(grad=grad_tensor, meta={})
+        self.backward_step(stage_name, downstream_grad)
+        return True
+
+    def _get_trainer(self, stage_name: str) -> "StageTrainer":
         if stage_name not in self._trainers:
             raise ValueError(f"[r{self.rank}] Stage '{stage_name}' not built. Call build_model first.")
         return self._trainers[stage_name]
