@@ -126,9 +126,7 @@ class TestPipelineMLPRay:
                 losses.append(result["loss"])
 
             # Verify loss decreased
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
             # Global grad norm should be computed
             assert result["global_grad_norm"] is not None
             assert result["global_grad_norm"] > 0
@@ -143,7 +141,8 @@ class TestPipelineMLPRay:
         manager = PlacementManager(pipeline, model_specs=specs)
         plan = manager.plan()
         runner = RayPipelineRunner(
-            pipeline, plan,
+            pipeline,
+            plan,
             failure_injection={"stage_name": "b", "op": "backward", "iteration": 0},
         )
 

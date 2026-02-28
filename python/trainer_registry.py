@@ -103,9 +103,7 @@ def _normalize_component(component_type: str) -> str:
 def _normalize_engine(engine: str) -> str:
     engine = engine.strip().lower()
     if engine not in {"native", "deepspeed", "megatron"}:
-        raise ValueError(
-            f"Unsupported engine '{engine}'. Supported engines: native, deepspeed, megatron."
-        )
+        raise ValueError(f"Unsupported engine '{engine}'. Supported engines: native, deepspeed, megatron.")
     return engine
 
 

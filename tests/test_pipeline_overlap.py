@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from python.pipeline.dag import PipelineDAG
-from python.pipeline.placement import PlacementManager, PlacementPlan, PipelineActorGroup, StageModelSpec
+from python.pipeline.placement import PipelineActorGroup, PlacementManager, PlacementPlan, StageModelSpec
 from python.pipeline.ray_runner import RayPipelineRunner
 from python.pipeline.router import CrossStageRouter, RoutingPlan
 from python.pipeline.stage import EdgeConfig, Pipeline, Placement, ResourceSet, Stage
@@ -206,7 +206,10 @@ class TestRouterTransportDetection:
         plan.resource_set_to_actor_group["child"] = child_group
         # Partial overlap: GPU 0 and 1 shared, GPU 2 and 3 only parent
         plan.actor_gpu_ids["parent"] = {
-            0: "GPU-UUID-0", 1: "GPU-UUID-1", 2: "GPU-UUID-2", 3: "GPU-UUID-3",
+            0: "GPU-UUID-0",
+            1: "GPU-UUID-1",
+            2: "GPU-UUID-2",
+            3: "GPU-UUID-3",
         }
         plan.actor_gpu_ids["child"] = {0: "GPU-UUID-0", 1: "GPU-UUID-1"}
 
@@ -344,9 +347,9 @@ class TestPipelineOverlapGPU:
             parent_gpus = plan.actor_gpu_ids.get("parent", {})
             child_gpus = plan.actor_gpu_ids.get("child", {})
             for rank in range(2):
-                assert parent_gpus[rank] == child_gpus[rank], (
-                    f"Rank {rank}: parent GPU {parent_gpus[rank]} != child GPU {child_gpus[rank]}"
-                )
+                assert (
+                    parent_gpus[rank] == child_gpus[rank]
+                ), f"Rank {rank}: parent GPU {parent_gpus[rank]} != child GPU {child_gpus[rank]}"
 
             data, labels = _generate_batch()
             losses = []
@@ -356,9 +359,7 @@ class TestPipelineOverlapGPU:
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
         finally:
             runner.shutdown()
             manager.shutdown()
@@ -392,9 +393,9 @@ class TestPipelineOverlapGPU:
             # Verify mixed transport detection
             edge_transport = runner.router.get_transport("a", "b")
             assert edge_transport in ("mixed", "t1", "t2"), f"Unexpected transport: {edge_transport}"
-            assert runner.router.has_t1_edges() or edge_transport == "t2", (
-                "Expected at least some T1 pairs for partial overlap"
-            )
+            assert (
+                runner.router.has_t1_edges() or edge_transport == "t2"
+            ), "Expected at least some T1 pairs for partial overlap"
 
             data, labels = _generate_batch()
             losses = []
@@ -404,9 +405,7 @@ class TestPipelineOverlapGPU:
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
         finally:
             runner.shutdown()
             manager.shutdown()
@@ -443,15 +442,13 @@ class TestPipelineOverlapGPU:
 
             # Bundles 0 and 1 should be shared (child devices 0,1 placed on parent bundles 0,1)
             shared_count = sum(
-                1 for r in range(min(len(parent_gpus), len(child_gpus)))
-                if parent_gpus.get(r) == child_gpus.get(r)
+                1 for r in range(min(len(parent_gpus), len(child_gpus))) if parent_gpus.get(r) == child_gpus.get(r)
             )
 
             # At minimum, verify the router detected SOME T1 pairs if GPUs actually overlap
             if shared_count > 0:
                 assert runner.router.has_t1_edges(), (
-                    f"Expected T1 edges with {shared_count} shared GPU(s), "
-                    f"parent={parent_gpus}, child={child_gpus}"
+                    f"Expected T1 edges with {shared_count} shared GPU(s), " f"parent={parent_gpus}, child={child_gpus}"
                 )
 
             # Verify routing plan

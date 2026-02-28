@@ -25,8 +25,8 @@ from examples.attn_moe_overlap.model_utils import (
     generate_dummy_batch,
 )
 from examples.attn_moe_overlap.step6_mps_overlap import (
-    BATCH_SIZE,
     BASE_LR,
+    BATCH_SIZE,
     DTYPE,
     NUM_CLASSES,
     NUM_MICROBATCHES,
@@ -62,13 +62,15 @@ class BatchedActor(BenchmarkMultiStageActor):
             )
             result = self._last_forward_outputs.get(stage_name)
             handle, gpu_id, event_handle = create_ipc_handle(result.activations.detach())
-            ipc_handles.append({
-                "__ipc__": True,
-                "ipc_handle": handle,
-                "gpu_id": gpu_id,
-                "event_handle": event_handle,
-                "meta": result.meta,
-            })
+            ipc_handles.append(
+                {
+                    "__ipc__": True,
+                    "ipc_handle": handle,
+                    "gpu_id": gpu_id,
+                    "event_handle": event_handle,
+                    "meta": result.meta,
+                }
+            )
         return ipc_handles
 
     def forward_backward_batch_ipc(self, stage_name, fwd_ipc_handles, labels_list):
@@ -86,9 +88,7 @@ class BatchedActor(BenchmarkMultiStageActor):
         # Forward all microbatches
         for mb_i in range(num_mb):
             ipc = fwd_ipc_handles[mb_i]
-            tensor = reconstruct_tensor_from_ipc(
-                ipc["ipc_handle"], my_gpu, ipc["gpu_id"], ipc.get("event_handle")
-            )
+            tensor = reconstruct_tensor_from_ipc(ipc["ipc_handle"], my_gpu, ipc["gpu_id"], ipc.get("event_handle"))
             inputs = StageOutputs(activations=tensor, meta=ipc.get("meta"))
             super().forward_step(stage_name, inputs, labels_list[mb_i])
 
@@ -98,13 +98,15 @@ class BatchedActor(BenchmarkMultiStageActor):
             super().backward_step(stage_name, None)  # terminal stage
             result = self._last_backward_grads.get(stage_name)
             handle, gpu_id, event_handle = create_ipc_handle(result.grad)
-            grad_ipc_handles.append({
-                "__ipc__": True,
-                "ipc_handle": handle,
-                "gpu_id": gpu_id,
-                "event_handle": event_handle,
-                "meta": result.meta,
-            })
+            grad_ipc_handles.append(
+                {
+                    "__ipc__": True,
+                    "ipc_handle": handle,
+                    "gpu_id": gpu_id,
+                    "event_handle": event_handle,
+                    "meta": result.meta,
+                }
+            )
         return grad_ipc_handles
 
     def backward_batch_from_ipc(self, stage_name, grad_ipc_handles):
@@ -114,9 +116,7 @@ class BatchedActor(BenchmarkMultiStageActor):
 
         my_gpu = get_physical_gpu_id()
         for ipc in grad_ipc_handles:
-            tensor = reconstruct_tensor_from_ipc(
-                ipc["ipc_handle"], my_gpu, ipc["gpu_id"], ipc.get("event_handle")
-            )
+            tensor = reconstruct_tensor_from_ipc(ipc["ipc_handle"], my_gpu, ipc["gpu_id"], ipc.get("event_handle"))
             grad = StageGradients(grad=tensor, meta=ipc.get("meta"))
             super().backward_step(stage_name, grad)
         return True
@@ -150,21 +150,19 @@ def main():
 
         attn_actor = plan.stage_to_actor_group["attn"].actors[0]
         moe_actor = plan.stage_to_actor_group["moe"].actors[0]
-        ray.get([
-            a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for a in plan.stage_to_actor_group["attn"].actors
-        ])
+        ray.get(
+            [
+                a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
+                for a in plan.stage_to_actor_group["attn"].actors
+            ]
+        )
 
         # Warmup
         for _ in range(WARMUP_ITERS):
             # Phase 1: attn forward all microbatches → IPC handles
-            fwd_handles_ref = attn_actor.forward_batch_ipc.remote(
-                "attn", NUM_MICROBATCHES, dummy_mb, mb_labels_list
-            )
+            fwd_handles_ref = attn_actor.forward_batch_ipc.remote("attn", NUM_MICROBATCHES, dummy_mb, mb_labels_list)
             # Phase 2: moe forward+backward all → grad IPC handles
-            grad_handles_ref = moe_actor.forward_backward_batch_ipc.remote(
-                "moe", fwd_handles_ref, mb_labels_list
-            )
+            grad_handles_ref = moe_actor.forward_backward_batch_ipc.remote("moe", fwd_handles_ref, mb_labels_list)
             # Phase 3: attn backward all
             ray.get(attn_actor.backward_batch_from_ipc.remote("attn", grad_handles_ref))
             # Post-schedule
@@ -181,12 +179,8 @@ def main():
             t0 = time.perf_counter()
 
             # 3 Ray calls for the schedule (fire-and-forget with dependency chain)
-            fwd_handles_ref = attn_actor.forward_batch_ipc.remote(
-                "attn", NUM_MICROBATCHES, dummy_mb, mb_labels_list
-            )
-            grad_handles_ref = moe_actor.forward_backward_batch_ipc.remote(
-                "moe", fwd_handles_ref, mb_labels_list
-            )
+            fwd_handles_ref = attn_actor.forward_batch_ipc.remote("attn", NUM_MICROBATCHES, dummy_mb, mb_labels_list)
+            grad_handles_ref = moe_actor.forward_backward_batch_ipc.remote("moe", fwd_handles_ref, mb_labels_list)
             attn_actor.backward_batch_from_ipc.remote("attn", grad_handles_ref)
 
             # Post-schedule: 5 Ray calls

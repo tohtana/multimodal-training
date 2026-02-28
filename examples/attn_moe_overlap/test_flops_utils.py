@@ -4,7 +4,6 @@ import pytest
 
 from examples.attn_moe_overlap.flops_utils import compute_attn_forward_flops, compute_moe_forward_flops
 
-
 # Default config: batch=8, seq=8192, hidden=2048, heads=32, kv_heads=4, head_dim=64,
 # experts=8, k=2, moe_intermediate=768, classes=10
 BATCH = 8

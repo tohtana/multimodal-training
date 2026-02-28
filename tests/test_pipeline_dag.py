@@ -1,11 +1,19 @@
 """Tests for pipeline DAG, dataclasses, config loader, and validation (M0)."""
 
 import os
-import textwrap
 import tempfile
+import textwrap
 
 import pytest
 
+from python.pipeline.config_loader import (
+    ConfigLoadError,
+    load_pipeline_config,
+    parse_pipeline_dict,
+    register_trainer,
+)
+from python.pipeline.dag import PipelineDAG, PipelineDAGError
+from python.pipeline.scheduler import OpType, ScheduleStep, SequentialScheduler
 from python.pipeline.stage import (
     EdgeConfig,
     EngineType,
@@ -16,16 +24,7 @@ from python.pipeline.stage import (
     ResourceSet,
     Stage,
 )
-from python.pipeline.dag import PipelineDAG, PipelineDAGError
-from python.pipeline.scheduler import OpType, ScheduleStep, SequentialScheduler
-from python.pipeline.config_loader import (
-    ConfigLoadError,
-    load_pipeline_config,
-    parse_pipeline_dict,
-    register_trainer,
-)
-from python.ray.payloads import StageOutputs, StageGradients
-
+from python.ray.payloads import StageGradients, StageOutputs
 
 # ── Helpers ──
 
@@ -405,7 +404,8 @@ class TestConfigLoader:
             parse_pipeline_dict(raw)
 
     def test_reject_cycle_in_yaml(self):
-        content = textwrap.dedent("""\
+        content = textwrap.dedent(
+            """\
             stages:
               - name: a
                 is_source: true
@@ -429,7 +429,8 @@ class TestConfigLoader:
                 resource_set: gpus
               - stage: c
                 resource_set: gpus
-        """)
+        """
+        )
         path = _write_yaml(content)
         try:
             pipeline = load_pipeline_config(path)

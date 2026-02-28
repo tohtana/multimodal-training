@@ -165,9 +165,7 @@ class TestPipelineThreeStage:
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
             assert result["global_grad_norm"] is not None
             assert result["global_grad_norm"] > 0
         finally:

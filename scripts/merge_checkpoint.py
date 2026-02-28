@@ -55,8 +55,8 @@ def _resolve_ms_swift_mapping(
     model_name: str, model_type: Optional[str]
 ) -> Tuple[str, Dict[str, str], Dict[str, str], type]:
     _add_ms_swift_to_path()
-    from swift.model import get_model_info_meta
     from swift.megatron.model.register import get_megatron_model_meta
+    from swift.model import get_model_info_meta
 
     model_info, _ = get_model_info_meta(model_name, model_type=model_type, use_hf=True, download_model=False)
     megatron_meta = get_megatron_model_meta(model_info.model_type)
@@ -267,9 +267,7 @@ def merge_checkpoint(
         normalized_text = _normalize_hf_state_dict(text_state_dict, hf_state_dict_mapping)
         text_prefix = _get_text_prefix(bridge_cls)
         if len(module_mapping) > 1:
-            logger.warning(
-                f"Multiple visual mappings found ({module_mapping}); using first entry for merge output."
-            )
+            logger.warning(f"Multiple visual mappings found ({module_mapping}); using first entry for merge output.")
         visual_prefix = list(module_mapping.keys())[0]
         full_state_dict = _build_full_state_dict(normalized_vision, normalized_text, visual_prefix, text_prefix)
         logger.info(f"ms-swift model_type: {resolved_model_type}")

@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 import ray
 import torch
-from ray.experimental.collective import create_collective_group
 from ray.exceptions import GetTimeoutError
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.experimental.collective import create_collective_group
 from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 pytestmark = [pytest.mark.gpu]
 

@@ -64,7 +64,9 @@ def _parse_args():
     parser.add_argument("--steps", type=int, default=10, help="Number of training iterations to run")
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate for Adam")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16", help="Training dtype")
+    parser.add_argument(
+        "--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16", help="Training dtype"
+    )
     parser.add_argument(
         "--attention-backend",
         choices=["sdpa", "flash_attention_2", "eager"],

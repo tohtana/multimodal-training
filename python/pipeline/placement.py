@@ -91,11 +91,13 @@ class PlacementManager:
         model_specs: list[StageModelSpec] | None = None,
         actor_cls: type = MultiStageActor,
         num_cpus_per_actor: int = 1,
+        actor_runtime_env_by_resource_set: dict[str, dict] | None = None,
     ):
         self.pipeline = pipeline
         self.model_specs = {spec.stage_name: spec for spec in (model_specs or [])}
         self.actor_cls = actor_cls
         self.num_cpus_per_actor = num_cpus_per_actor
+        self.actor_runtime_env_by_resource_set = actor_runtime_env_by_resource_set or {}
         self._groups: list[PipelineActorGroup] = []
 
     def plan(self) -> PlacementPlan:
@@ -218,26 +220,32 @@ class PlacementManager:
         bundles = []
         for i, dev_id in enumerate(parent_rs.device_ids):
             num_actors_on_gpu = 1 + sum(1 for cs in child_device_sets if dev_id in cs)
-            bundles.append({
-                "GPU": 1,
-                "CPU": self.num_cpus_per_actor * num_actors_on_gpu,
-            })
+            bundles.append(
+                {
+                    "GPU": 1,
+                    "CPU": self.num_cpus_per_actor * num_actors_on_gpu,
+                }
+            )
         pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
 
         # Create parent actors (0.5 GPU each)
-        parent_remote_cls = ray.remote(
-            num_cpus=self.num_cpus_per_actor, num_gpus=0.5, enable_tensor_transport=True
-        )(self.actor_cls)
+        parent_remote_cls = ray.remote(num_cpus=self.num_cpus_per_actor, num_gpus=0.5, enable_tensor_transport=True)(
+            self.actor_cls
+        )
 
         parent_actors = []
+        parent_runtime_env = self.actor_runtime_env_by_resource_set.get(parent_rs.name)
         for i in range(num_parent_gpus):
-            actor = parent_remote_cls.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
+            opts = {
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=i,
                 ),
-            ).remote({}, i)
+            }
+            if parent_runtime_env:
+                opts["runtime_env"] = parent_runtime_env
+            actor = parent_remote_cls.options(**opts).remote({}, i)
             parent_actors.append(actor)
 
         parent_group = PipelineActorGroup(
@@ -254,19 +262,23 @@ class PlacementManager:
         # Create child actor groups
         child_groups: dict[str, PipelineActorGroup] = {}
         for child_rs in child_rss:
-            child_remote_cls = ray.remote(
-                num_cpus=self.num_cpus_per_actor, num_gpus=0.5, enable_tensor_transport=True
-            )(self.actor_cls)
+            child_remote_cls = ray.remote(num_cpus=self.num_cpus_per_actor, num_gpus=0.5, enable_tensor_transport=True)(
+                self.actor_cls
+            )
 
             child_actors = []
+            child_runtime_env = self.actor_runtime_env_by_resource_set.get(child_rs.name)
             for j, dev_id in enumerate(child_rs.device_ids):
                 bundle_idx = parent_device_to_bundle[dev_id]
-                actor = child_remote_cls.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                opts = {
+                    "scheduling_strategy": PlacementGroupSchedulingStrategy(
                         placement_group=pg,
                         placement_group_bundle_index=bundle_idx,
                     ),
-                ).remote({}, j)
+                }
+                if child_runtime_env:
+                    opts["runtime_env"] = child_runtime_env
+                actor = child_remote_cls.options(**opts).remote({}, j)
                 child_actors.append(actor)
 
             child_stages = child_stages_map.get(child_rs.name, [])
@@ -310,19 +322,23 @@ class PlacementManager:
         ray.get(pg.ready())
 
         # Create remote actor class (enable_tensor_transport for RDT/NCCL cross-GPU transfers)
-        remote_cls = ray.remote(
-            num_cpus=self.num_cpus_per_actor, num_gpus=1, enable_tensor_transport=True
-        )(self.actor_cls)
+        remote_cls = ray.remote(num_cpus=self.num_cpus_per_actor, num_gpus=1, enable_tensor_transport=True)(
+            self.actor_cls
+        )
 
         # Create actors
         actors = []
+        rs_runtime_env = self.actor_runtime_env_by_resource_set.get(rs.name)
         for i in range(num_actors):
-            actor = remote_cls.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
+            opts = {
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=i,
                 ),
-            ).remote({}, i)
+            }
+            if rs_runtime_env:
+                opts["runtime_env"] = rs_runtime_env
+            actor = remote_cls.options(**opts).remote({}, i)
             actors.append(actor)
 
         group = PipelineActorGroup(

@@ -308,9 +308,7 @@ def test_megatron_engine_prepp(verify_weights: bool, parallel_case: str):
             _log(f"Trainer classes: vision={vision_name} text={text_name}", log_path=log_path)
 
             expected_vision_actors = vision_overrides["tensor_parallel_size"]
-            expected_text_actors = (
-                text_overrides["tensor_parallel_size"] * text_overrides["expert_model_parallel_size"]
-            )
+            expected_text_actors = text_overrides["tensor_parallel_size"] * text_overrides["expert_model_parallel_size"]
             vision_actors = _resolve_actor_count("MEGATRON_TEST_VISION_ACTORS", expected_vision_actors)
             text_actors = _resolve_actor_count("MEGATRON_TEST_TEXT_ACTORS", expected_text_actors)
 
@@ -358,8 +356,7 @@ def test_megatron_engine_prepp(verify_weights: bool, parallel_case: str):
             )
             if len(vision_outputs) != text_actors:
                 raise RuntimeError(
-                    "Vision outputs must align with text actors "
-                    f"({len(vision_outputs)} != {text_actors})."
+                    "Vision outputs must align with text actors " f"({len(vision_outputs)} != {text_actors})."
                 )
             text_forward = _execute_all_with_timeout(
                 text_group,
@@ -385,9 +382,7 @@ def test_megatron_engine_prepp(verify_weights: bool, parallel_case: str):
                     assert math.isfinite(loss_value), f"Non-finite loss after weight loading: {loss_value}"
 
             text_backward = _execute_all_with_timeout(text_group, "backward_step", step_timeout_s, log_path=log_path)
-            _execute_all_with_timeout(
-                vision_group, "backward_step", step_timeout_s, text_backward, log_path=log_path
-            )
+            _execute_all_with_timeout(vision_group, "backward_step", step_timeout_s, text_backward, log_path=log_path)
             _log(
                 f"Completed case={parallel_case} vision_tp={vision_tp} text_ep={text_ep}",
                 log_path=log_path,

@@ -135,9 +135,7 @@ class TestPipelineCrossGPU:
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
             assert result["global_grad_norm"] is not None
             assert result["global_grad_norm"] > 0
         finally:
@@ -186,10 +184,10 @@ class TestPipelineCrossGPU:
             t2_manager.shutdown()
 
         # Compare first iteration loss (same model weights, same data)
-        assert abs(t2_losses[0] - t0_losses[0]) < 1e-4, (
-            f"First iteration loss mismatch: t2={t2_losses[0]:.6f}, t0={t0_losses[0]:.6f}"
-        )
+        assert (
+            abs(t2_losses[0] - t0_losses[0]) < 1e-4
+        ), f"First iteration loss mismatch: t2={t2_losses[0]:.6f}, t0={t0_losses[0]:.6f}"
         # Compare last iteration loss (within tolerance for FP32 across GPUs)
-        assert abs(t2_losses[-1] - t0_losses[-1]) < 1e-3, (
-            f"Loss mismatch after 5 iters: t2={t2_losses[-1]:.6f}, t0={t0_losses[-1]:.6f}"
-        )
+        assert (
+            abs(t2_losses[-1] - t0_losses[-1]) < 1e-3
+        ), f"Loss mismatch after 5 iters: t2={t2_losses[-1]:.6f}, t0={t0_losses[-1]:.6f}"

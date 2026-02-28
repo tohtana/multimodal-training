@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 config_dir = str(Path(__file__).parent.parent.parent / "configs")
 
 
-def aggregate_grad_norms(vision_norms: list[dict], text_norms: list[dict], dp_size: int = 1, parallel_size: int = 1) -> float:
+def aggregate_grad_norms(
+    vision_norms: list[dict], text_norms: list[dict], dp_size: int = 1, parallel_size: int = 1
+) -> float:
     """
     Aggregate gradient norm contributions from all actors to compute global gradient norm.
 
@@ -387,7 +389,9 @@ def main(cfg: DictConfig):
             avg_text_fwd_ms = 0.0
             avg_text_bwd_ms = 0.0
             if profile_time:
-                vision_bwd_times = [r.get("backward_time_ms", 0.0) for r in vision_backward_results if isinstance(r, dict)]
+                vision_bwd_times = [
+                    r.get("backward_time_ms", 0.0) for r in vision_backward_results if isinstance(r, dict)
+                ]
                 text_bwd_times = [r.get("backward_time_ms", 0.0) for r in text_backward_results if isinstance(r, dict)]
 
                 # Compute average timings across actors

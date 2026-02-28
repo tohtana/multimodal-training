@@ -19,7 +19,7 @@ class Qwen3AttentionStage(nn.Module):
         super().__init__()
         # Required when instantiating Qwen3 sublayers directly (without Qwen3MoeModel).
         if getattr(config, "_attn_implementation", None) is None:
-            config._attn_implementation = "sdpa"
+            config._attn_implementation = "flash_attention_2"
         self.config = config
         self.layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn = Qwen3MoeAttention(config, layer_idx=0)
@@ -108,7 +108,7 @@ class Qwen3MoEStageWithHead(nn.Module):
         return self.head(x)  # [batch, num_classes]
 
 
-def create_qwen3_config(attn_implementation="sdpa", **overrides) -> Qwen3MoeConfig:
+def create_qwen3_config(attn_implementation="flash_attention_2", **overrides) -> Qwen3MoeConfig:
     """Create reduced Qwen3MoeConfig suitable for single-GPU training."""
     defaults = dict(
         num_experts=8,

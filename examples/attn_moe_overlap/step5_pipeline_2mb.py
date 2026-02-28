@@ -54,8 +54,18 @@ def _make_resource_sets_and_placements():
 
 
 def run_variant(
-    name, config, num_classes, attn_state_dict, moe_state_dict, data, labels, scheduler, num_microbatches, lr,
-    dtype=None, num_steps=20,
+    name,
+    config,
+    num_classes,
+    attn_state_dict,
+    moe_state_dict,
+    data,
+    labels,
+    scheduler,
+    num_microbatches,
+    lr,
+    dtype=None,
+    num_steps=20,
 ):
     """Run one training variant from given initial state_dicts. Returns list of per-step losses.
 

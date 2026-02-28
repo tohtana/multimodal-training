@@ -178,13 +178,9 @@ class Pipeline:
                     parent = rs_by_name[rs.subset_of]
                     # Both must have device_ids
                     if rs.device_ids is None:
-                        errors.append(
-                            f"ResourceSet '{rs.name}' uses subset_of but has no device_ids"
-                        )
+                        errors.append(f"ResourceSet '{rs.name}' uses subset_of but has no device_ids")
                     if parent.device_ids is None:
-                        errors.append(
-                            f"ResourceSet '{rs.name}' parent '{rs.subset_of}' has no device_ids"
-                        )
+                        errors.append(f"ResourceSet '{rs.name}' parent '{rs.subset_of}' has no device_ids")
                     # Child device_ids must be a subset of parent device_ids
                     if rs.device_ids is not None and parent.device_ids is not None:
                         if not set(rs.device_ids).issubset(set(parent.device_ids)):

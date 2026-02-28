@@ -7,10 +7,10 @@ import torch
 from transformers import AutoConfig
 
 from .payloads import (
-    normalize_text_backward_outputs,
-    normalize_vision_outputs,
     TextBackwardOutputs,
     VisionOutputs,
+    normalize_text_backward_outputs,
+    normalize_vision_outputs,
 )
 from .tensor_transfer import TensorTransferRequest, receive_tensor
 from .trainer import Trainer

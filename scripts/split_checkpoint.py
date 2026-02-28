@@ -53,8 +53,8 @@ def _resolve_ms_swift_mapping(
     model_name: str, model_type: Optional[str], use_hf: bool
 ) -> Tuple[str, Dict[str, str], Dict[str, str], type]:
     _add_ms_swift_to_path()
-    from swift.model import get_model_info_meta
     from swift.megatron.model.register import get_megatron_model_meta
+    from swift.model import get_model_info_meta
 
     model_info, _ = get_model_info_meta(model_name, model_type=model_type, use_hf=use_hf, download_model=False)
     megatron_meta = get_megatron_model_meta(model_info.model_type)

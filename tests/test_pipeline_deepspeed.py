@@ -160,9 +160,7 @@ class TestPipelineDeepSpeed:
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
             assert result["global_grad_norm"] is not None
             assert result["global_grad_norm"] > 0
         finally:
@@ -207,10 +205,10 @@ class TestPipelineDeepSpeed:
             mixed_manager.shutdown()
 
         # First iteration must match exactly (same weights, same data, fp32)
-        assert abs(mixed_losses[0] - native_losses[0]) < 1e-5, (
-            f"First iteration loss mismatch: ds={mixed_losses[0]:.6f}, native={native_losses[0]:.6f}"
-        )
+        assert (
+            abs(mixed_losses[0] - native_losses[0]) < 1e-5
+        ), f"First iteration loss mismatch: ds={mixed_losses[0]:.6f}, native={native_losses[0]:.6f}"
         # After 5 iterations (FP32, small tolerance for optimizer impl differences)
-        assert abs(mixed_losses[-1] - native_losses[-1]) < 1e-3, (
-            f"Loss mismatch after 5 iters: ds={mixed_losses[-1]:.6f}, native={native_losses[-1]:.6f}"
-        )
+        assert (
+            abs(mixed_losses[-1] - native_losses[-1]) < 1e-3
+        ), f"Loss mismatch after 5 iters: ds={mixed_losses[-1]:.6f}, native={native_losses[-1]:.6f}"

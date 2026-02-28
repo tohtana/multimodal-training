@@ -206,6 +206,5 @@ class CrossStageRouter:
             all_actors = src_group.actors + dst_group.actors
             create_collective_group(all_actors, backend="nccl")
             logger.info(
-                f"Created NCCL collective group for "
-                f"{src_group.resource_set_name} <-> {dst_group.resource_set_name}"
+                f"Created NCCL collective group for " f"{src_group.resource_set_name} <-> {dst_group.resource_set_name}"
             )

@@ -85,8 +85,10 @@ class TestMoEConfigGeneration:
     def test_2layer_pipeline_structure(self):
         """2-layer MoE: 4 stages, 3 edges."""
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
         )
         assert len(pipeline.stages) == 4
         assert len(pipeline.edges) == 3  # attn0→moe0, moe0→attn1, attn1→moe1
@@ -105,8 +107,10 @@ class TestMoEConfigGeneration:
     def test_4layer_pipeline_structure(self):
         """4-layer MoE: 8 stages, 7 edges."""
         pipeline = generate_moe_pipeline(
-            num_layers=4, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=4, num_moe_gpus=8,
+            num_layers=4,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=4,
+            num_moe_gpus=8,
         )
         assert len(pipeline.stages) == 8
         assert len(pipeline.edges) == 7
@@ -115,8 +119,10 @@ class TestMoEConfigGeneration:
 
     def test_parallelism_types(self):
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
         )
         for s in pipeline.stages:
             if s.name.startswith("attn"):
@@ -127,9 +133,12 @@ class TestMoEConfigGeneration:
     def test_subset_of_resource_sets(self):
         """With device_ids, ag_attn should be subset_of ag_moe."""
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
-            attn_device_ids=(0, 1), moe_device_ids=(0, 1, 2, 3),
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
+            attn_device_ids=(0, 1),
+            moe_device_ids=(0, 1, 2, 3),
             use_subset=True,
         )
         attn_rs = pipeline.get_resource_set("ag_attn")
@@ -139,9 +148,12 @@ class TestMoEConfigGeneration:
 
     def test_no_subset_when_disabled(self):
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
-            attn_device_ids=(0, 1), moe_device_ids=(0, 1, 2, 3),
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
+            attn_device_ids=(0, 1),
+            moe_device_ids=(0, 1, 2, 3),
             use_subset=False,
         )
         attn_rs = pipeline.get_resource_set("ag_attn")
@@ -150,8 +162,10 @@ class TestMoEConfigGeneration:
     def test_topological_order(self):
         """DAG topological order should be attn_0, moe_0, attn_1, moe_1, ..."""
         pipeline = generate_moe_pipeline(
-            num_layers=3, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
+            num_layers=3,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
         )
         dag = PipelineDAG(pipeline)
         topo = dag.topological_sort()
@@ -160,8 +174,11 @@ class TestMoEConfigGeneration:
     def test_model_specs_count(self):
         """One spec per stage."""
         specs = generate_moe_model_specs(
-            num_layers=2, hidden_dim=HIDDEN_DIM, output_dim=OUTPUT_DIM,
-            num_experts=NUM_EXPERTS, top_k=TOP_K,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            output_dim=OUTPUT_DIM,
+            num_experts=NUM_EXPERTS,
+            top_k=TOP_K,
         )
         assert len(specs) == 4
         names = [s.stage_name for s in specs]
@@ -169,7 +186,9 @@ class TestMoEConfigGeneration:
 
     def test_terminal_spec_has_loss(self):
         specs = generate_moe_model_specs(
-            num_layers=2, hidden_dim=HIDDEN_DIM, output_dim=OUTPUT_DIM,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            output_dim=OUTPUT_DIM,
         )
         terminal = [s for s in specs if s.is_terminal]
         assert len(terminal) == 1
@@ -179,8 +198,10 @@ class TestMoEConfigGeneration:
     def test_1f1b_schedule_on_interleaved(self):
         """1F1B schedule generates valid steps for 4-stage interleaved pipeline."""
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
             num_microbatches=2,
         )
         dag = PipelineDAG(pipeline)
@@ -249,15 +270,23 @@ class TestMoEInterleavedGPU:
             pytest.skip("Interleaved MoE test requires at least 4 GPUs")
 
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
-            attn_device_ids=(0, 1), moe_device_ids=(0, 1, 2, 3),
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
+            attn_device_ids=(0, 1),
+            moe_device_ids=(0, 1, 2, 3),
             num_microbatches=1,
             use_subset=True,
         )
         specs = generate_moe_model_specs(
-            num_layers=2, hidden_dim=HIDDEN_DIM, output_dim=OUTPUT_DIM,
-            num_experts=NUM_EXPERTS, top_k=TOP_K, lr=LR, seed=SEED,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            output_dim=OUTPUT_DIM,
+            num_experts=NUM_EXPERTS,
+            top_k=TOP_K,
+            lr=LR,
+            seed=SEED,
         )
 
         manager = PlacementManager(pipeline, model_specs=specs)
@@ -275,9 +304,7 @@ class TestMoEInterleavedGPU:
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
         finally:
             runner.shutdown()
             manager.shutdown()
@@ -288,15 +315,23 @@ class TestMoEInterleavedGPU:
             pytest.skip("Interleaved MoE 1F1B test requires at least 4 GPUs")
 
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
-            attn_device_ids=(0, 1), moe_device_ids=(0, 1, 2, 3),
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
+            attn_device_ids=(0, 1),
+            moe_device_ids=(0, 1, 2, 3),
             num_microbatches=2,
             use_subset=True,
         )
         specs = generate_moe_model_specs(
-            num_layers=2, hidden_dim=HIDDEN_DIM, output_dim=OUTPUT_DIM,
-            num_experts=NUM_EXPERTS, top_k=TOP_K, lr=LR, seed=SEED,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            output_dim=OUTPUT_DIM,
+            num_experts=NUM_EXPERTS,
+            top_k=TOP_K,
+            lr=LR,
+            seed=SEED,
         )
 
         manager = PlacementManager(pipeline, model_specs=specs)
@@ -312,14 +347,15 @@ class TestMoEInterleavedGPU:
 
             for i in range(NUM_ITERS):
                 result = runner.run_iteration(
-                    data=data, labels=labels, iteration=i, num_microbatches=2,
+                    data=data,
+                    labels=labels,
+                    iteration=i,
+                    num_microbatches=2,
                 )
                 assert result["loss"] is not None, f"Loss is None at iter {i}"
                 losses.append(result["loss"])
 
-            assert losses[-1] < losses[0], (
-                f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
-            )
+            assert losses[-1] < losses[0], f"Loss did not decrease: initial={losses[0]:.6f}, final={losses[-1]:.6f}"
         finally:
             runner.shutdown()
             manager.shutdown()
@@ -330,14 +366,22 @@ class TestMoEInterleavedGPU:
             pytest.skip("Transport tier test requires at least 4 GPUs")
 
         pipeline = generate_moe_pipeline(
-            num_layers=2, hidden_dim=HIDDEN_DIM,
-            num_attn_gpus=2, num_moe_gpus=4,
-            attn_device_ids=(0, 1), moe_device_ids=(0, 1, 2, 3),
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            num_attn_gpus=2,
+            num_moe_gpus=4,
+            attn_device_ids=(0, 1),
+            moe_device_ids=(0, 1, 2, 3),
             use_subset=True,
         )
         specs = generate_moe_model_specs(
-            num_layers=2, hidden_dim=HIDDEN_DIM, output_dim=OUTPUT_DIM,
-            num_experts=NUM_EXPERTS, top_k=TOP_K, lr=LR, seed=SEED,
+            num_layers=2,
+            hidden_dim=HIDDEN_DIM,
+            output_dim=OUTPUT_DIM,
+            num_experts=NUM_EXPERTS,
+            top_k=TOP_K,
+            lr=LR,
+            seed=SEED,
         )
 
         manager = PlacementManager(pipeline, model_specs=specs)

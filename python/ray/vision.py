@@ -13,7 +13,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
-from .payloads import normalize_text_backward_outputs, TextBackwardOutputs, VisionOutputs
+from .payloads import TextBackwardOutputs, VisionOutputs, normalize_text_backward_outputs
 from .tensor_transfer import TensorTransferRequest, prepare_tensor_for_transfer, receive_tensor
 from .trainer import Trainer
 from .utils import get_physical_gpu_id, init_distributed_comm
@@ -119,8 +119,7 @@ class BaseVisionTrainer(Trainer):
         if num_hidden_layers is not None:
             vision_config = getattr(model_config, "vision_config", model_config)
             logger.info(
-                f"[r{self.rank}] Overriding vision num_hidden_layers: "
-                f"{vision_config.depth} -> {num_hidden_layers}"
+                f"[r{self.rank}] Overriding vision num_hidden_layers: " f"{vision_config.depth} -> {num_hidden_layers}"
             )
             vision_config.depth = int(num_hidden_layers)
 

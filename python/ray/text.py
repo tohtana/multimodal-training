@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from ..tensor_parallel import VocabParallelEmbedding
 from ..tensor_parallel.cross_entropy import vocab_parallel_causal_cross_entropy
-from .payloads import normalize_vision_outputs, TextBackwardOutputs
+from .payloads import TextBackwardOutputs, normalize_vision_outputs
 from .tensor_transfer import TensorTransferRequest, prepare_tensor_for_transfer, receive_tensor
 from .trainer import Trainer
 from .utils import get_physical_gpu_id, init_distributed_comm
@@ -390,7 +390,9 @@ class BaseTextTrainer(Trainer):
         # Count parameters after TP sharding
         params_after_tp = sum(p.numel() for p in model.parameters())
         reduction_pct = 100 * (params_before_tp - params_after_tp) / params_before_tp
-        logger.debug(f"[r{self.rank}] Parameters AFTER TP sharding: {params_after_tp:,} ({reduction_pct:.1f}% reduction)")
+        logger.debug(
+            f"[r{self.rank}] Parameters AFTER TP sharding: {params_after_tp:,} ({reduction_pct:.1f}% reduction)"
+        )
 
         # Get TP group early for vocab parallel embedding
         tp_group = None
@@ -441,9 +443,7 @@ class BaseTextTrainer(Trainer):
                 else:
                     # Untied weights: lm_head needs its own partitioned weight
                     original_lm_head_weight = lm_head.weight.data.clone()
-                    lm_head.weight = nn.Parameter(
-                        original_lm_head_weight[start_idx:end_idx, :].to(device)
-                    )
+                    lm_head.weight = nn.Parameter(original_lm_head_weight[start_idx:end_idx, :].to(device))
                     logger.debug(f"[r{self.rank}] lm_head weight sharded independently (untied)")
 
                 logger.debug(
@@ -500,9 +500,7 @@ class BaseTextTrainer(Trainer):
 
         # Validate configuration
         if dp_size * tp_size != world_size:
-            raise ValueError(
-                f"dp_size ({dp_size}) * tp_size ({tp_size}) must equal world_size ({world_size})"
-            )
+            raise ValueError(f"dp_size ({dp_size}) * tp_size ({tp_size}) must equal world_size ({world_size})")
 
         # Calculate TP and DP ranks
         tp_rank = global_rank % tp_size
@@ -519,16 +517,13 @@ class BaseTextTrainer(Trainer):
         # Always create 2D device mesh: (dp, tp) for consistency
         # When dp_size=1, this is effectively TP-only but with uniform mesh structure
         logger.debug(f"[r{self.rank}] Creating 2D device mesh: dp_size={dp_size}, tp_size={tp_size}")
-        device_mesh = init_device_mesh(
-            "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
-        )
+        device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
         tp_mesh = device_mesh["tp"]
         dp_mesh = device_mesh["dp"]
         tp_group = tp_mesh.get_group()
 
         logger.debug(
-            f"[r{self.rank}] Applying tensor parallelism to text model "
-            f"(tp_rank={tp_rank}, dp_rank={dp_rank})..."
+            f"[r{self.rank}] Applying tensor parallelism to text model " f"(tp_rank={tp_rank}, dp_rank={dp_rank})..."
         )
 
         # Parallelize transformer layers first
@@ -571,12 +566,12 @@ class BaseTextTrainer(Trainer):
 
         # Handle lm_head sharding based on weight tying configuration
         if not getattr(model.config, "tie_word_embeddings", True):
-            logger.debug(f"[r{self.rank}] Sharding lm_head for untied embeddings (vocab_range=[{start_idx}, {end_idx}))")
+            logger.debug(
+                f"[r{self.rank}] Sharding lm_head for untied embeddings (vocab_range=[{start_idx}, {end_idx}))"
+            )
             with torch.no_grad():
                 original_lm_head_weight = lm_head.weight.data.clone()
-                lm_head.weight = nn.Parameter(
-                    original_lm_head_weight[start_idx:end_idx, :].to(device)
-                )
+                lm_head.weight = nn.Parameter(original_lm_head_weight[start_idx:end_idx, :].to(device))
 
         # Apply FSDP2 to transformer layers only when dp_size > 1
         # IMPORTANT: Do NOT apply FSDP2 when dp_size=1, even though it would be a no-op.
@@ -669,7 +664,9 @@ class BaseTextTrainer(Trainer):
                     logger.warning(f"[r{self.rank}] Missing keys when loading lm_head weights: {lm_missing}")
                 if lm_unexpected:
                     logger.warning(f"[r{self.rank}] Unexpected keys when loading lm_head weights: {lm_unexpected}")
-                logger.info(f"[r{self.rank}] Loaded lm_head pretrained weights ({len(cleaned_lm_head_dict)} parameters)")
+                logger.info(
+                    f"[r{self.rank}] Loaded lm_head pretrained weights ({len(cleaned_lm_head_dict)} parameters)"
+                )
             elif lm_head_state_dict:
                 logger.warning(
                     f"[r{self.rank}] Checkpoint contains lm_head weights but self.lm_head is not set. "

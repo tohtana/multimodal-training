@@ -145,8 +145,8 @@ class TestPipelineMLPLocal:
         mono, mono_opt, mono_loss_fn = _make_monolithic_model(device)
 
         # Verify initial weights match
-        for (pp, mp) in zip([pa, pb, pc], mono.children()):
-            for (p1, p2) in zip(pp.parameters(), mp.parameters()):
+        for pp, mp in zip([pa, pb, pc], mono.children()):
+            for p1, p2 in zip(pp.parameters(), mp.parameters()):
                 assert torch.equal(p1.data, p2.data), "Initial weights don't match"
 
         # Run 5 iterations comparing gradients at each step
@@ -154,8 +154,8 @@ class TestPipelineMLPLocal:
             data, labels = _generate_batch(device, seed_offset=i)
 
             # Pipeline forward+backward (no optimizer step yet — we need to compare grads first)
-            from python.pipeline.scheduler import SequentialScheduler
             from python.pipeline.dag import PipelineDAG
+            from python.pipeline.scheduler import SequentialScheduler
 
             dag = PipelineDAG(pipeline)
             topo_order = dag.topological_sort()
@@ -191,8 +191,8 @@ class TestPipelineMLPLocal:
             mono_loss.backward()
 
             # Compare gradients
-            for (stage_model, mono_module) in zip([pa, pb, pc], mono.children()):
-                for (p_pipe, p_mono) in zip(stage_model.parameters(), mono_module.parameters()):
+            for stage_model, mono_module in zip([pa, pb, pc], mono.children()):
+                for p_pipe, p_mono in zip(stage_model.parameters(), mono_module.parameters()):
                     assert p_pipe.grad is not None, f"Pipeline grad is None for stage"
                     assert p_mono.grad is not None, f"Monolithic grad is None"
                     max_abs_diff = (p_pipe.grad - p_mono.grad).abs().max().item()
@@ -227,8 +227,8 @@ class TestPipelineMLPLocal:
         # Pipeline forward+backward
         runner = NativeRunner(pipeline, trainers)
         # Do forward+backward manually to get grad norm before optimizer step
-        from python.pipeline.scheduler import SequentialScheduler
         from python.pipeline.dag import PipelineDAG
+        from python.pipeline.scheduler import SequentialScheduler
 
         dag = PipelineDAG(pipeline)
         topo_order = dag.topological_sort()
@@ -272,6 +272,6 @@ class TestPipelineMLPLocal:
         mono_grad_norm = math.sqrt(mono_norm_sq)
 
         abs_diff = abs(pipeline_grad_norm - mono_grad_norm)
-        assert abs_diff <= 1e-5, (
-            f"Grad norm mismatch: pipeline={pipeline_grad_norm:.8f}, mono={mono_grad_norm:.8f}, diff={abs_diff:.8f}"
-        )
+        assert (
+            abs_diff <= 1e-5
+        ), f"Grad norm mismatch: pipeline={pipeline_grad_norm:.8f}, mono={mono_grad_norm:.8f}, diff={abs_diff:.8f}"

@@ -127,8 +127,7 @@ class TestPipelineVLM:
         losses = _parse_losses(output)
 
         assert len(losses) >= NUM_ITERS, (
-            f"Expected at least {NUM_ITERS} loss values, got {len(losses)}. "
-            f"Check training output for errors."
+            f"Expected at least {NUM_ITERS} loss values, got {len(losses)}. " f"Check training output for errors."
         )
 
         for i, loss in enumerate(losses):
@@ -163,9 +162,7 @@ class TestPipelineVLM:
         )
         legacy_losses = _parse_losses(legacy_output)
 
-        assert len(legacy_losses) >= NUM_ITERS, (
-            f"Legacy path: expected {NUM_ITERS} losses, got {len(legacy_losses)}"
-        )
+        assert len(legacy_losses) >= NUM_ITERS, f"Legacy path: expected {NUM_ITERS} losses, got {len(legacy_losses)}"
 
         # --- Run pipeline path ---
         print("Running pipeline path (train_pipeline.py)...")
@@ -176,9 +173,9 @@ class TestPipelineVLM:
         )
         pipeline_losses = _parse_losses(pipeline_output)
 
-        assert len(pipeline_losses) >= NUM_ITERS, (
-            f"Pipeline path: expected {NUM_ITERS} losses, got {len(pipeline_losses)}"
-        )
+        assert (
+            len(pipeline_losses) >= NUM_ITERS
+        ), f"Pipeline path: expected {NUM_ITERS} losses, got {len(pipeline_losses)}"
 
         # --- Compare losses ---
         print(f"Legacy   losses: {[f'{l:.6f}' for l in legacy_losses[:NUM_ITERS]]}")

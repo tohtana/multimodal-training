@@ -34,7 +34,9 @@ def main():
 
     # Fixed batch for stable convergence
     torch.manual_seed(42)
-    x, labels = generate_dummy_batch(config, batch_size=8, seq_len=8192, num_classes=num_classes, device=device, dtype=dtype)
+    x, labels = generate_dummy_batch(
+        config, batch_size=8, seq_len=8192, num_classes=num_classes, device=device, dtype=dtype
+    )
 
     losses = []
     for step in range(20):

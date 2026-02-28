@@ -157,6 +157,22 @@ class MPSContext:
             env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(self.active_thread_pct)
         return env
 
+    def get_env_vars_for_stage(self, thread_pct: int | None = None) -> dict[str, str]:
+        """Return env vars for an MPS client with a specific thread percentage.
+
+        Args:
+            thread_pct: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE value (1-100),
+                or None to leave the variable unset (unconstrained).
+        """
+        env = {
+            "CUDA_MPS_PIPE_DIRECTORY": self.pipe_dir,
+            "CUDA_MPS_LOG_DIRECTORY": self.log_dir,
+            "CUDA_VISIBLE_DEVICES": str(self.gpu_id),
+        }
+        if thread_pct is not None:
+            env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(thread_pct)
+        return env
+
     def _restore_env(self) -> None:
         """Restore environment variables to their pre-context values."""
         for key, old_value in self._saved_env.items():

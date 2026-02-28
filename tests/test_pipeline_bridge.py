@@ -181,8 +181,7 @@ class TestPipelineBridgeGPU:
         losses = _parse_losses(combined)
 
         assert len(losses) >= NUM_ITERS, (
-            f"Expected at least {NUM_ITERS} loss values, got {len(losses)}. "
-            f"Check training output for errors."
+            f"Expected at least {NUM_ITERS} loss values, got {len(losses)}. " f"Check training output for errors."
         )
 
         for i, loss in enumerate(losses):
