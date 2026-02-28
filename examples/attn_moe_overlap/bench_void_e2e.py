@@ -19,8 +19,8 @@ from examples.attn_moe_overlap.model_utils import (
     generate_dummy_batch,
 )
 from examples.attn_moe_overlap.step6_mps_overlap import (
-    BATCH_SIZE,
     BASE_LR,
+    BATCH_SIZE,
     DTYPE,
     NUM_CLASSES,
     NUM_MICROBATCHES,
@@ -47,12 +47,12 @@ class VoidReturnActor(BenchmarkMultiStageActor):
     never ray.get()s them for T1 transport.
     """
 
-    def forward_step(self, stage_name, inputs=None, labels=None):
-        super().forward_step(stage_name, inputs, labels)
+    def forward_step(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
+        super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
         return True
 
-    def backward_step(self, stage_name, downstream_grad=None):
-        super().backward_step(stage_name, downstream_grad)
+    def backward_step(self, stage_name, downstream_grad=None, microbatch_id: int | None = None):
+        super().backward_step(stage_name, downstream_grad, microbatch_id=microbatch_id)
         return True
 
 
@@ -73,10 +73,7 @@ def run_variant(name, actor_cls, config, attn_sd, moe_sd, data, labels):
 
         # Pre-load data on source actor
         attn_group = plan.stage_to_actor_group["attn"]
-        ray.get([
-            a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for a in attn_group.actors
-        ])
+        ray.get([a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES) for a in attn_group.actors])
         dummy_data = torch.zeros(BATCH_SIZE, 1, 1, dtype=DTYPE)
 
         runner = RayPipelineRunner(pipeline, plan, scheduler=OneFOneBScheduler())
@@ -88,7 +85,10 @@ def run_variant(name, actor_cls, config, attn_sd, moe_sd, data, labels):
             is_timed = step >= WARMUP_ITERS
             t0 = time.perf_counter()
             result = runner.run_iteration(
-                data=dummy_data, labels=labels, iteration=step, num_microbatches=NUM_MICROBATCHES,
+                data=dummy_data,
+                labels=labels,
+                iteration=step,
+                num_microbatches=NUM_MICROBATCHES,
             )
             t1 = time.perf_counter()
 
@@ -127,13 +127,25 @@ def main():
     # --- Normal (returns tensors) ---
     print("\n=== Variant B: Normal (returns full tensors) ===")
     times_normal, losses_normal = run_variant(
-        "normal", BenchmarkMultiStageActor, config, attn_sd, moe_sd, data, labels,
+        "normal",
+        BenchmarkMultiStageActor,
+        config,
+        attn_sd,
+        moe_sd,
+        data,
+        labels,
     )
 
     # --- Void (returns True) ---
     print("\n=== Variant B: Void (returns True, no serialization) ===")
     times_void, losses_void = run_variant(
-        "void", VoidReturnActor, config, attn_sd, moe_sd, data, labels,
+        "void",
+        VoidReturnActor,
+        config,
+        attn_sd,
+        moe_sd,
+        data,
+        labels,
     )
 
     # --- Report ---

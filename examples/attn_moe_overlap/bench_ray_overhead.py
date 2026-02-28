@@ -22,8 +22,8 @@ from examples.attn_moe_overlap.model_utils import (
     generate_dummy_batch,
 )
 from examples.attn_moe_overlap.step6_mps_overlap import (
-    BATCH_SIZE,
     BASE_LR,
+    BATCH_SIZE,
     DTYPE,
     NUM_CLASSES,
     NUM_MICROBATCHES,
@@ -177,7 +177,9 @@ def measure_pipeline_breakdown():
             preds = dag.predecessors(step.stage_name)
             if not preds:
                 refs = [
-                    actor.forward_step.remote(step.stage_name, StageOutputs(activations=mb_data[mb_id]), mb_labels[mb_id])
+                    actor.forward_step.remote(
+                        step.stage_name, StageOutputs(activations=mb_data[mb_id]), mb_labels[mb_id], mb_id
+                    )
                     for actor in group.actors
                 ]
             else:
@@ -189,18 +191,18 @@ def measure_pipeline_breakdown():
                     src_rank = routing.dst_to_src[dst_rank]
                     transport = router.get_actor_pair_transport(pred_name, step.stage_name, src_rank, dst_rank)
                     if transport == "t1":
-                        ipc_ref = pred_group.actors[src_rank].create_ipc_for_output.remote(pred_name)
-                        ref = actor.forward_from_ipc.remote(step.stage_name, ipc_ref, mb_labels[mb_id])
+                        ipc_ref = pred_group.actors[src_rank].create_ipc_for_output.remote(pred_name, mb_id)
+                        ref = actor.forward_from_ipc.remote(step.stage_name, ipc_ref, mb_labels[mb_id], mb_id)
                     else:
                         pred_refs = stage_output_refs[pred_name][mb_id]
-                        ref = actor.forward_step.remote(step.stage_name, pred_refs[src_rank], mb_labels[mb_id])
+                        ref = actor.forward_step.remote(step.stage_name, pred_refs[src_rank], mb_labels[mb_id], mb_id)
                     refs.append(ref)
             stage_output_refs.setdefault(step.stage_name, {})[mb_id] = refs
 
         else:  # BACKWARD
             succs = dag.successors(step.stage_name)
             if not succs:
-                refs = [actor.backward_step.remote(step.stage_name, None) for actor in group.actors]
+                refs = [actor.backward_step.remote(step.stage_name, None, mb_id) for actor in group.actors]
             else:
                 succ_name = succs[0]
                 succ_group = plan.stage_to_actor_group[succ_name]
@@ -215,12 +217,12 @@ def measure_pipeline_breakdown():
                         dst_rank = dst_ranks[0]
                         transport = router.get_actor_pair_transport(step.stage_name, succ_name, src_rank, dst_rank)
                         if transport == "t1":
-                            grad_ref = succ_group.actors[dst_rank].create_ipc_for_grad.remote(succ_name)
+                            grad_ref = succ_group.actors[dst_rank].create_ipc_for_grad.remote(succ_name, mb_id)
                         else:
                             grad_ref = stage_grad_refs[succ_name][mb_id][dst_rank]
                     else:
                         grad_ref = None  # simplification
-                    ref = actor.backward_step.remote(step.stage_name, grad_ref)
+                    ref = actor.backward_step.remote(step.stage_name, grad_ref, mb_id)
                     refs.append(ref)
             stage_grad_refs.setdefault(step.stage_name, {})[mb_id] = refs
 
@@ -241,6 +243,7 @@ def measure_pipeline_breakdown():
     # Post-schedule: grad norm
     t_norm_start = time.perf_counter()
     import math
+
     total_norm_sq = 0.0
     for name in topo_order:
         group = plan.stage_to_actor_group[name]
@@ -328,22 +331,22 @@ def measure_ipc_overhead():
     # Run one forward to populate last_forward_outputs
     mb_data = data.chunk(NUM_MICROBATCHES, dim=0)[0]
     mb_labels = labels.chunk(NUM_MICROBATCHES, dim=0)[0]
-    ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels))
+    ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels, 0))
 
     N = 50
 
     # Measure create_ipc_for_output
     t0 = time.perf_counter()
     for _ in range(N):
-        ray.get(attn_actor.create_ipc_for_output.remote("attn"))
+        ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
     t1 = time.perf_counter()
     create_ipc_ms = (t1 - t0) / N * 1000
 
     # Measure forward_from_ipc (create + reconstruct + forward)
     t0 = time.perf_counter()
     for _ in range(N):
-        ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-        ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels))
+        ipc_ref = attn_actor.create_ipc_for_output.remote("attn", 0)
+        ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels, 0))
     t1 = time.perf_counter()
     full_ipc_fwd_ms = (t1 - t0) / N * 1000
 
@@ -351,23 +354,23 @@ def measure_ipc_overhead():
     # First get a StageOutputs ref from attn
     t0 = time.perf_counter()
     for _ in range(N):
-        fwd_ref = attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels)
-        ray.get(moe_actor.forward_step.remote("moe", fwd_ref, mb_labels))
+        fwd_ref = attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels, 0)
+        ray.get(moe_actor.forward_step.remote("moe", fwd_ref, mb_labels, 0))
     t1 = time.perf_counter()
     direct_fwd_ms = (t1 - t0) / N * 1000
 
     # Measure just attn forward
     t0 = time.perf_counter()
     for _ in range(N):
-        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels))
+        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels, 0))
     t1 = time.perf_counter()
     attn_fwd_ms = (t1 - t0) / N * 1000
 
     # Measure just moe forward (using IPC handle from attn)
-    ipc_data = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
+    ipc_data = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
     t0 = time.perf_counter()
     for _ in range(N):
-        ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_data, mb_labels))
+        ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_data, mb_labels, 0))
     t1 = time.perf_counter()
     moe_fwd_ipc_ms = (t1 - t0) / N * 1000
 

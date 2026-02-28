@@ -15,8 +15,8 @@ from examples.attn_moe_overlap.model_utils import (
     generate_dummy_batch,
 )
 from examples.attn_moe_overlap.step6_mps_overlap import (
-    BATCH_SIZE,
     BASE_LR,
+    BATCH_SIZE,
     DTYPE,
     NUM_CLASSES,
     NUM_MICROBATCHES,
@@ -64,12 +64,12 @@ def main():
         mb_labels = labels.chunk(NUM_MICROBATCHES, dim=0)[0]
 
         # Warmup
-        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels))
-        ipc_data = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
-        ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_data, mb_labels))
-        ray.get(moe_actor.backward_step.remote("moe", None))
-        ipc_grad = ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
-        ray.get(attn_actor.backward_step.remote("attn", ipc_grad))
+        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels, 0))
+        ipc_data = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
+        ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_data, mb_labels, 0))
+        ray.get(moe_actor.backward_step.remote("moe", None, 0))
+        ipc_grad = ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
+        ray.get(attn_actor.backward_step.remote("attn", ipc_grad, 0))
 
         N = 30
         results = {}
@@ -77,76 +77,76 @@ def main():
         # 1. attn.forward_step (source stage with preloaded data)
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels, 0))
         t1 = time.perf_counter()
         results["attn.forward_step"] = (t1 - t0) / N * 1000
 
         # 2. attn.create_ipc_for_output
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.create_ipc_for_output.remote("attn"))
+            ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
         t1 = time.perf_counter()
         results["attn.create_ipc_for_output"] = (t1 - t0) / N * 1000
 
         # 3. moe.forward_from_ipc (reusing same handle)
-        ipc_data = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
+        ipc_data = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_data, mb_labels))
+            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_data, mb_labels, 0))
         t1 = time.perf_counter()
         results["moe.forward_from_ipc (cached handle)"] = (t1 - t0) / N * 1000
 
         # 4. moe.forward_from_ipc (fresh handle each time)
         t0 = time.perf_counter()
         for _ in range(N):
-            ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels))
+            ipc_ref = attn_actor.create_ipc_for_output.remote("attn", 0)
+            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels, 0))
         t1 = time.perf_counter()
         results["create_ipc + forward_from_ipc (chain)"] = (t1 - t0) / N * 1000
 
         # 5. moe.backward_step (terminal, no downstream grad)
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.backward_step.remote("moe", None))
+            ray.get(moe_actor.backward_step.remote("moe", None, 0))
         t1 = time.perf_counter()
         results["moe.backward_step (terminal)"] = (t1 - t0) / N * 1000
 
         # 6. moe.create_ipc_for_grad
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
+            ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
         t1 = time.perf_counter()
         results["moe.create_ipc_for_grad"] = (t1 - t0) / N * 1000
 
         # 7. attn.backward_step (with IPC grad, cached handle)
-        ipc_grad = ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
+        ipc_grad = ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.backward_step.remote("attn", ipc_grad))
+            ray.get(attn_actor.backward_step.remote("attn", ipc_grad, 0))
         t1 = time.perf_counter()
         results["attn.backward_step (cached IPC grad)"] = (t1 - t0) / N * 1000
 
         # 8. Full microbatch chain (6 serial calls)
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels))
-            ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels))
-            ray.get(moe_actor.backward_step.remote("moe", None))
-            ipc_grad_ref = moe_actor.create_ipc_for_grad.remote("moe")
-            ray.get(attn_actor.backward_step.remote("attn", ipc_grad_ref))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels, 0))
+            ipc_ref = attn_actor.create_ipc_for_output.remote("attn", 0)
+            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels, 0))
+            ray.get(moe_actor.backward_step.remote("moe", None, 0))
+            ipc_grad_ref = moe_actor.create_ipc_for_grad.remote("moe", 0)
+            ray.get(attn_actor.backward_step.remote("attn", ipc_grad_ref, 0))
         t1 = time.perf_counter()
         results["full microbatch chain (6 calls)"] = (t1 - t0) / N * 1000
 
         # 9. Full microbatch chain fire-and-forget (let Ray handle deps)
         t0 = time.perf_counter()
         for _ in range(N):
-            _f_attn = attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels)
-            _ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-            _f_moe = moe_actor.forward_from_ipc.remote("moe", _ipc_ref, mb_labels)
-            _b_moe = moe_actor.backward_step.remote("moe", None)
-            _ipc_grad_ref = moe_actor.create_ipc_for_grad.remote("moe")
-            _b_attn = attn_actor.backward_step.remote("attn", _ipc_grad_ref)
+            _f_attn = attn_actor.forward_step.remote("attn", StageOutputs(activations=mb_data), mb_labels, 0)
+            _ipc_ref = attn_actor.create_ipc_for_output.remote("attn", 0)
+            _f_moe = moe_actor.forward_from_ipc.remote("moe", _ipc_ref, mb_labels, 0)
+            _b_moe = moe_actor.backward_step.remote("moe", None, 0)
+            _ipc_grad_ref = moe_actor.create_ipc_for_grad.remote("moe", 0)
+            _b_attn = attn_actor.backward_step.remote("attn", _ipc_grad_ref, 0)
         # Wait only for the final ref of the last iteration
         ray.get(_b_attn)
         t1 = time.perf_counter()

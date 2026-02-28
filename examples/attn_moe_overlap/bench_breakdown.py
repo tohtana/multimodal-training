@@ -22,8 +22,8 @@ from examples.attn_moe_overlap.model_utils import (
     generate_dummy_batch,
 )
 from examples.attn_moe_overlap.step6_mps_overlap import (
-    BATCH_SIZE,
     BASE_LR,
+    BATCH_SIZE,
     DTYPE,
     NUM_CLASSES,
     NUM_MICROBATCHES,
@@ -36,43 +36,33 @@ from examples.attn_moe_overlap.step6_mps_overlap import (
 from python.pipeline.placement import PlacementManager
 from python.pipeline.ray_runner import RayPipelineRunner
 from python.pipeline.scheduler import OneFOneBScheduler
-from python.ray.payloads import StageGradients, StageOutputs
+from python.ray.payloads import StageOutputs
 
 
 class InstrumentedVoidActor(BenchmarkMultiStageActor):
     """Void-return actor with additional measurement methods."""
 
-    def forward_step(self, stage_name, inputs=None, labels=None):
-        super().forward_step(stage_name, inputs, labels)
+    def forward_step(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
+        super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
         return True
 
-    def backward_step(self, stage_name, downstream_grad=None):
-        super().backward_step(stage_name, downstream_grad)
+    def backward_step(self, stage_name, downstream_grad=None, microbatch_id: int | None = None):
+        super().backward_step(stage_name, downstream_grad, microbatch_id=microbatch_id)
         return True
 
-    def forward_step_void_no_ipc(self, stage_name, inputs=None, labels=None):
+    def forward_step_void_no_ipc(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
         """Forward with preloaded data, no IPC, return True."""
-        super().forward_step(stage_name, inputs, labels)
+        super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
         return True
 
-    def forward_from_ipc_void(self, stage_name, ipc_data, labels=None):
+    def forward_from_ipc_void(self, stage_name, ipc_data, labels=None, microbatch_id: int | None = None):
         """Reconstruct from IPC + forward, return True."""
-        super().forward_from_ipc(stage_name, ipc_data, labels)
+        super().forward_from_ipc(stage_name, ipc_data, labels, microbatch_id=microbatch_id)
         return True
 
-    def backward_with_ipc_void(self, stage_name, ipc_data):
+    def backward_with_ipc_void(self, stage_name, ipc_data, microbatch_id: int | None = None):
         """Reconstruct grad from IPC + backward, return True."""
-        from python.ray.tensor_transfer import reconstruct_tensor_from_ipc
-        from python.ray.utils import get_physical_gpu_id
-
-        tensor = reconstruct_tensor_from_ipc(
-            ipc_data["ipc_handle"],
-            get_physical_gpu_id(),
-            ipc_data["gpu_id"],
-            ipc_data.get("event_handle"),
-        )
-        grad = StageGradients(grad=tensor, meta=ipc_data.get("meta"))
-        super().backward_step(stage_name, grad)
+        super().backward_from_ipc(stage_name, ipc_data, microbatch_id=microbatch_id)
         return True
 
     def noop(self):
@@ -83,40 +73,18 @@ class InstrumentedVoidActor(BenchmarkMultiStageActor):
         return True
 
     # --- IPC reuse test ---
-    def create_and_cache_ipc_for_output(self, stage_name):
+    def create_and_cache_ipc_for_output(self, stage_name, microbatch_id: int | None = None):
         """Create IPC handle and cache it for reuse."""
-        result = self._last_forward_outputs.get(stage_name)
-        if result is None or result.activations is None:
-            return None
-        from python.ray.tensor_transfer import create_ipc_handle
-        handle, gpu_id, event_handle = create_ipc_handle(result.activations.detach())
-        self._cached_ipc_output = {
-            "__ipc__": True,
-            "ipc_handle": handle,
-            "gpu_id": gpu_id,
-            "event_handle": event_handle,
-            "meta": result.meta,
-        }
+        self._cached_ipc_output = super().create_ipc_for_output(stage_name, microbatch_id=microbatch_id)
         return self._cached_ipc_output
 
     def get_cached_ipc_for_output(self):
         """Return previously cached IPC handle (no new cudaIpcGetMemHandle)."""
         return getattr(self, "_cached_ipc_output", None)
 
-    def create_and_cache_ipc_for_grad(self, stage_name):
+    def create_and_cache_ipc_for_grad(self, stage_name, microbatch_id: int | None = None):
         """Create IPC handle for grad and cache it."""
-        result = self._last_backward_grads.get(stage_name)
-        if result is None or result.grad is None:
-            return None
-        from python.ray.tensor_transfer import create_ipc_handle
-        handle, gpu_id, event_handle = create_ipc_handle(result.grad)
-        self._cached_ipc_grad = {
-            "__ipc__": True,
-            "ipc_handle": handle,
-            "gpu_id": gpu_id,
-            "event_handle": event_handle,
-            "meta": result.meta,
-        }
+        self._cached_ipc_grad = super().create_ipc_for_grad(stage_name, microbatch_id=microbatch_id)
         return self._cached_ipc_grad
 
     def get_cached_ipc_for_grad(self):
@@ -134,7 +102,8 @@ def measure_pure_cuda_compute():
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         list(attn_stage.parameters()) + list(moe_stage.parameters()),
-        lr=BASE_LR, foreach=False,
+        lr=BASE_LR,
+        foreach=False,
     )
 
     torch.manual_seed(42)
@@ -238,19 +207,21 @@ def measure_ray_scheduling_gap():
 
         attn_actor = plan.stage_to_actor_group["attn"].actors[0]
         moe_actor = plan.stage_to_actor_group["moe"].actors[0]
-        ray.get([
-            a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for a in plan.stage_to_actor_group["attn"].actors
-        ])
+        ray.get(
+            [
+                a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
+                for a in plan.stage_to_actor_group["attn"].actors
+            ]
+        )
 
         # Warmup
         for _ in range(5):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
-            ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc, mb_labels))
-            ray.get(moe_actor.backward_step.remote("moe", None))
-            ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
-            ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
+            ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc, mb_labels, 0))
+            ray.get(moe_actor.backward_step.remote("moe", None, 0))
+            ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
+            ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g, 0))
 
         N = 30
         results = {}
@@ -278,11 +249,11 @@ def measure_ray_scheduling_gap():
         t0 = time.perf_counter()
         for _ in range(N):
             r1 = attn_actor.noop.remote()
-            r2 = attn_actor.noop.remote()       # depends on r1 (same actor)
-            r3 = moe_actor.noop.remote()         # independent
-            r4 = moe_actor.noop.remote()         # depends on r3 (same actor)
-            r5 = moe_actor.noop.remote()         # depends on r4 (same actor)
-            r6 = attn_actor.noop.remote()        # depends on r2 (same actor)
+            r2 = attn_actor.noop.remote()  # depends on r1 (same actor)
+            r3 = moe_actor.noop.remote()  # independent
+            r4 = moe_actor.noop.remote()  # depends on r3 (same actor)
+            r5 = moe_actor.noop.remote()  # depends on r4 (same actor)
+            r6 = attn_actor.noop.remote()  # depends on r2 (same actor)
         ray.get(r6)
         t1 = time.perf_counter()
         results["6 noops fire-forget (last get)"] = (t1 - t0) / N * 1000
@@ -290,24 +261,24 @@ def measure_ray_scheduling_gap():
         # --- B) Full microbatch chain: serial ray.get between each call ---
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
-            ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc, mb_labels))
-            ray.get(moe_actor.backward_step.remote("moe", None))
-            ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
-            ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
+            ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc, mb_labels, 0))
+            ray.get(moe_actor.backward_step.remote("moe", None, 0))
+            ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
+            ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g, 0))
         t1 = time.perf_counter()
         results["microbatch chain (serial get)"] = (t1 - t0) / N * 1000
 
         # --- C) Full microbatch chain: fire-and-forget (like pipeline runner) ---
         t0 = time.perf_counter()
         for _ in range(N):
-            _f_attn = attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels)
-            _ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-            _f_moe = moe_actor.forward_from_ipc_void.remote("moe", _ipc_ref, mb_labels)
-            _b_moe = moe_actor.backward_step.remote("moe", None)
-            _ipc_g_ref = moe_actor.create_ipc_for_grad.remote("moe")
-            _b_attn = attn_actor.backward_with_ipc_void.remote("attn", _ipc_g_ref)
+            _f_attn = attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0)
+            _ipc_ref = attn_actor.create_ipc_for_output.remote("attn", 0)
+            _f_moe = moe_actor.forward_from_ipc_void.remote("moe", _ipc_ref, mb_labels, 0)
+            _b_moe = moe_actor.backward_step.remote("moe", None, 0)
+            _ipc_g_ref = moe_actor.create_ipc_for_grad.remote("moe", 0)
+            _b_attn = attn_actor.backward_with_ipc_void.remote("attn", _ipc_g_ref, 0)
         ray.get(_b_attn)
         t1 = time.perf_counter()
         results["microbatch chain (fire-forget)"] = (t1 - t0) / N * 1000
@@ -316,12 +287,12 @@ def measure_ray_scheduling_gap():
         t0 = time.perf_counter()
         for _ in range(N):
             for _ in range(8):
-                ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-                ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
-                ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc, mb_labels))
-                ray.get(moe_actor.backward_step.remote("moe", None))
-                ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
-                ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g))
+                ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+                ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
+                ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc, mb_labels, 0))
+                ray.get(moe_actor.backward_step.remote("moe", None, 0))
+                ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
+                ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g, 0))
         t1 = time.perf_counter()
         results["8 mb chains (serial get)"] = (t1 - t0) / N * 1000
 
@@ -329,12 +300,12 @@ def measure_ray_scheduling_gap():
         t0 = time.perf_counter()
         for _ in range(N):
             for _ in range(8):
-                _f_attn = attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels)
-                _ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-                _f_moe = moe_actor.forward_from_ipc_void.remote("moe", _ipc_ref, mb_labels)
-                _b_moe = moe_actor.backward_step.remote("moe", None)
-                _ipc_g_ref = moe_actor.create_ipc_for_grad.remote("moe")
-                _b_attn = attn_actor.backward_with_ipc_void.remote("attn", _ipc_g_ref)
+                _f_attn = attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0)
+                _ipc_ref = attn_actor.create_ipc_for_output.remote("attn", 0)
+                _f_moe = moe_actor.forward_from_ipc_void.remote("moe", _ipc_ref, mb_labels, 0)
+                _b_moe = moe_actor.backward_step.remote("moe", None, 0)
+                _ipc_g_ref = moe_actor.create_ipc_for_grad.remote("moe", 0)
+                _b_attn = attn_actor.backward_with_ipc_void.remote("attn", _ipc_g_ref, 0)
             ray.get(_b_attn)
         t1 = time.perf_counter()
         results["8 mb chains (fire-forget, 1 final get)"] = (t1 - t0) / N * 1000
@@ -343,12 +314,12 @@ def measure_ray_scheduling_gap():
         # Fresh handle each time
         t0 = time.perf_counter()
         for _ in range(N):
-            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
+            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
         t1 = time.perf_counter()
         results["create_ipc_for_output (fresh)"] = (t1 - t0) / N * 1000
 
         # Cached handle (first call caches, subsequent calls return cached)
-        ray.get(attn_actor.create_and_cache_ipc_for_output.remote("attn"))
+        ray.get(attn_actor.create_and_cache_ipc_for_output.remote("attn", 0))
         t0 = time.perf_counter()
         for _ in range(N):
             ipc = ray.get(attn_actor.get_cached_ipc_for_output.remote())
@@ -359,59 +330,59 @@ def measure_ray_scheduling_gap():
         cached_ipc = ray.get(attn_actor.get_cached_ipc_for_output.remote())
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.forward_from_ipc_void.remote("moe", cached_ipc, mb_labels))
+            ray.get(moe_actor.forward_from_ipc_void.remote("moe", cached_ipc, mb_labels, 0))
         t1 = time.perf_counter()
         results["forward_from_ipc (cached handle)"] = (t1 - t0) / N * 1000
 
         # forward_from_ipc with fresh handle for comparison
         t0 = time.perf_counter()
         for _ in range(N):
-            ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-            ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc_ref, mb_labels))
+            ipc_ref = attn_actor.create_ipc_for_output.remote("attn", 0)
+            ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc_ref, mb_labels, 0))
         t1 = time.perf_counter()
         results["forward_from_ipc (fresh handle chain)"] = (t1 - t0) / N * 1000
 
         # Same for grad (must run forward+backward first to populate state)
-        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-        ipc_tmp = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
-        ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc_tmp, mb_labels))
-        ray.get(moe_actor.backward_step.remote("moe", None))
-        ray.get(moe_actor.create_and_cache_ipc_for_grad.remote("moe"))
+        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+        ipc_tmp = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
+        ray.get(moe_actor.forward_from_ipc_void.remote("moe", ipc_tmp, mb_labels, 0))
+        ray.get(moe_actor.backward_step.remote("moe", None, 0))
+        ray.get(moe_actor.create_and_cache_ipc_for_grad.remote("moe", 0))
         cached_ipc_g = ray.get(moe_actor.get_cached_ipc_for_grad.remote())
 
         t0 = time.perf_counter()
         for _ in range(N):
             # Re-run forward each time so backward has activations
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-            ray.get(attn_actor.backward_with_ipc_void.remote("attn", cached_ipc_g))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+            ray.get(attn_actor.backward_with_ipc_void.remote("attn", cached_ipc_g, 0))
         t1 = time.perf_counter()
         results["backward_ipc (cached grad handle)"] = (t1 - t0) / N * 1000
 
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-            ipc_g_ref = moe_actor.create_ipc_for_grad.remote("moe")
-            ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g_ref))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+            ipc_g_ref = moe_actor.create_ipc_for_grad.remote("moe", 0)
+            ray.get(attn_actor.backward_with_ipc_void.remote("attn", ipc_g_ref, 0))
         t1 = time.perf_counter()
         results["backward_ipc (fresh grad handle chain)"] = (t1 - t0) / N * 1000
 
         # --- G) Full chain with cached IPC handles ---
         # Run a full chain to populate both actors' state, then cache handles
-        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-        ray.get(attn_actor.create_and_cache_ipc_for_output.remote("attn"))
+        ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+        ray.get(attn_actor.create_and_cache_ipc_for_output.remote("attn", 0))
         cached_fwd_ipc = ray.get(attn_actor.get_cached_ipc_for_output.remote())
-        ray.get(moe_actor.forward_from_ipc_void.remote("moe", cached_fwd_ipc, mb_labels))
-        ray.get(moe_actor.backward_step.remote("moe", None))
-        ray.get(moe_actor.create_and_cache_ipc_for_grad.remote("moe"))
+        ray.get(moe_actor.forward_from_ipc_void.remote("moe", cached_fwd_ipc, mb_labels, 0))
+        ray.get(moe_actor.backward_step.remote("moe", None, 0))
+        ray.get(moe_actor.create_and_cache_ipc_for_grad.remote("moe", 0))
         cached_bwd_ipc = ray.get(moe_actor.get_cached_ipc_for_grad.remote())
 
         # Microbatch with cached handles (skip create_ipc calls entirely)
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-            ray.get(moe_actor.forward_from_ipc_void.remote("moe", cached_fwd_ipc, mb_labels))
-            ray.get(moe_actor.backward_step.remote("moe", None))
-            ray.get(attn_actor.backward_with_ipc_void.remote("attn", cached_bwd_ipc))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+            ray.get(moe_actor.forward_from_ipc_void.remote("moe", cached_fwd_ipc, mb_labels, 0))
+            ray.get(moe_actor.backward_step.remote("moe", None, 0))
+            ray.get(attn_actor.backward_with_ipc_void.remote("attn", cached_bwd_ipc, 0))
         t1 = time.perf_counter()
         results["microbatch (cached IPC, 4 calls)"] = (t1 - t0) / N * 1000
 

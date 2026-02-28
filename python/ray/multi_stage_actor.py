@@ -8,6 +8,7 @@ calls to the named stage trainer.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable
 
 import ray
@@ -37,6 +38,10 @@ class MultiStageActor:
         self._trainers: dict[str, StageTrainer] = {}
         self._last_forward_outputs: dict[str, StageOutputs] = {}
         self._last_backward_grads: dict[str, StageGradients | None] = {}
+        self._t1_forward_ipc_cache: dict[tuple[str, int], StageOutputs] = {}
+        self._t1_backward_ipc_cache: dict[tuple[str, int], StageGradients | None] = {}
+        self._t1_forward_peak_entries = 0
+        self._t1_backward_peak_entries = 0
 
     def build_model_from_state_dict(
         self,
@@ -125,6 +130,7 @@ class MultiStageActor:
         stage_name: str,
         inputs: StageOutputs | None = None,
         labels: Any = None,
+        microbatch_id: int | None = None,
     ) -> StageOutputs:
         """Run forward for a named stage.
 
@@ -134,12 +140,16 @@ class MultiStageActor:
         trainer = self._get_trainer(stage_name)
         result = trainer.forward_step(inputs, labels=labels)
         self._last_forward_outputs[stage_name] = result
+        if microbatch_id is not None:
+            self._t1_forward_ipc_cache[(stage_name, microbatch_id)] = result
+            self._t1_forward_peak_entries = max(self._t1_forward_peak_entries, len(self._t1_forward_ipc_cache))
         return result
 
     def backward_step(
         self,
         stage_name: str,
         downstream_grad: StageGradients | dict | None = None,
+        microbatch_id: int | None = None,
     ) -> StageGradients | None:
         """Run backward for a named stage.
 
@@ -164,6 +174,11 @@ class MultiStageActor:
         trainer = self._get_trainer(stage_name)
         result = trainer.backward_step(downstream_grad)
         self._last_backward_grads[stage_name] = result
+        if microbatch_id is not None:
+            self._t1_backward_ipc_cache[(stage_name, microbatch_id)] = result
+            self._t1_backward_peak_entries = max(
+                self._t1_backward_peak_entries, len(self._t1_backward_ipc_cache)
+            )
         return result
 
     def optimizer_step(
@@ -241,9 +256,7 @@ class MultiStageActor:
         resolved = []
         for g in grads_or_ipc:
             if isinstance(g, dict) and g.get("__ipc__"):
-                tensor = reconstruct_tensor_from_ipc(
-                    g["ipc_handle"], my_gpu, g["gpu_id"], g.get("event_handle")
-                )
+                tensor = reconstruct_tensor_from_ipc(g["ipc_handle"], my_gpu, g["gpu_id"], g.get("event_handle"))
                 resolved.append(StageGradients(grad=tensor, meta=g.get("meta")))
             else:
                 resolved.append(g)
@@ -264,7 +277,9 @@ class MultiStageActor:
         return StageGradients(grad=summed, meta=grads[0].meta)
 
     def accumulate_gradient(
-        self, current: StageGradients, new_grad: StageGradients,
+        self,
+        current: StageGradients,
+        new_grad: StageGradients,
     ) -> StageGradients:
         """Add a gradient to an accumulator (for sequential M:N aggregation).
 
@@ -281,16 +296,28 @@ class MultiStageActor:
 
         return get_physical_gpu_id()
 
-    def create_ipc_for_output(self, stage_name: str) -> dict | None:
+    def get_mps_thread_pct(self) -> str | None:
+        """Return the CUDA_MPS_ACTIVE_THREAD_PERCENTAGE env var, or None if not set."""
+        return os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE")
+
+    def create_ipc_for_output(self, stage_name: str, microbatch_id: int | None = None) -> dict:
         """Create CUDA IPC handle for the last forward output of a stage.
 
         Returns a dict of IPC metadata (no CUDA tensors — safe for object store).
         Must be called on the same actor after forward_step.
         Detaches the tensor (autograd graphs do not cross process boundaries).
         """
-        result = self._last_forward_outputs.get(stage_name)
-        if result is None or result.activations is None or not result.activations.is_cuda:
-            return None
+        if microbatch_id is None:
+            raise ValueError(f"T1 create_ipc_for_output requires microbatch_id (stage='{stage_name}')")
+
+        key = (stage_name, microbatch_id)
+        result = self._t1_forward_ipc_cache.get(key)
+        if result is None:
+            raise KeyError(f"T1 IPC cache miss for forward output: stage='{stage_name}', microbatch={microbatch_id}")
+        if result.activations is None or not result.activations.is_cuda:
+            raise ValueError(
+                f"T1 create_ipc_for_output requires CUDA activations: stage='{stage_name}', microbatch={microbatch_id}"
+            )
         from ..ray.tensor_transfer import create_ipc_handle
 
         handle, gpu_id, event_handle = create_ipc_handle(result.activations.detach())
@@ -300,13 +327,22 @@ class MultiStageActor:
             "gpu_id": gpu_id,
             "event_handle": event_handle,
             "meta": result.meta,
+            "microbatch_id": microbatch_id,
         }
 
-    def forward_from_ipc(self, stage_name: str, ipc_data: dict, labels: Any = None) -> StageOutputs:
+    def forward_from_ipc(
+        self,
+        stage_name: str,
+        ipc_data: dict,
+        labels: Any = None,
+        microbatch_id: int | None = None,
+    ) -> StageOutputs:
         """Reconstruct tensor from IPC metadata and run forward.
 
         Used by T1 (same-GPU, different-process) transport receivers.
         """
+        if microbatch_id is None:
+            raise ValueError(f"T1 forward_from_ipc requires microbatch_id (stage='{stage_name}')")
         from ..ray.tensor_transfer import reconstruct_tensor_from_ipc
         from ..ray.utils import get_physical_gpu_id
 
@@ -317,17 +353,25 @@ class MultiStageActor:
             ipc_data.get("event_handle"),
         )
         inputs = StageOutputs(activations=tensor, meta=ipc_data.get("meta"))
-        return self.forward_step(stage_name, inputs, labels)
+        return self.forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
 
-    def create_ipc_for_grad(self, stage_name: str) -> dict | None:
+    def create_ipc_for_grad(self, stage_name: str, microbatch_id: int | None = None) -> dict:
         """Create CUDA IPC handle for the last backward gradient of a stage.
 
         Returns a dict of IPC metadata (no CUDA tensors — safe for object store).
         Must be called on the same actor after backward_step.
         """
-        result = self._last_backward_grads.get(stage_name)
-        if result is None or result.grad is None or not result.grad.is_cuda:
-            return None
+        if microbatch_id is None:
+            raise ValueError(f"T1 create_ipc_for_grad requires microbatch_id (stage='{stage_name}')")
+
+        key = (stage_name, microbatch_id)
+        result = self._t1_backward_ipc_cache.get(key)
+        if result is None:
+            raise KeyError(f"T1 IPC cache miss for backward grad: stage='{stage_name}', microbatch={microbatch_id}")
+        if result.grad is None or not result.grad.is_cuda:
+            raise ValueError(
+                f"T1 create_ipc_for_grad requires CUDA gradients: stage='{stage_name}', microbatch={microbatch_id}"
+            )
         from ..ray.tensor_transfer import create_ipc_handle
 
         handle, gpu_id, event_handle = create_ipc_handle(result.grad)
@@ -337,13 +381,21 @@ class MultiStageActor:
             "gpu_id": gpu_id,
             "event_handle": event_handle,
             "meta": result.meta,
+            "microbatch_id": microbatch_id,
         }
 
-    def backward_from_ipc(self, stage_name: str, ipc_data: dict) -> StageGradients | None:
+    def backward_from_ipc(
+        self,
+        stage_name: str,
+        ipc_data: dict,
+        microbatch_id: int | None = None,
+    ) -> StageGradients | None:
         """Reconstruct gradient from IPC metadata and run backward.
 
         Used by T1 (same-GPU, different-process) transport receivers.
         """
+        if microbatch_id is None:
+            raise ValueError(f"T1 backward_from_ipc requires microbatch_id (stage='{stage_name}')")
         from ..ray.tensor_transfer import reconstruct_tensor_from_ipc
         from ..ray.utils import get_physical_gpu_id
 
@@ -354,7 +406,25 @@ class MultiStageActor:
             ipc_data.get("event_handle"),
         )
         grad = StageGradients(grad=tensor, meta=ipc_data.get("meta"))
-        return self.backward_step(stage_name, grad)
+        return self.backward_step(stage_name, grad, microbatch_id=microbatch_id)
+
+    def clear_t1_ipc_cache(self) -> dict[str, int]:
+        """Clear iteration-scoped T1 IPC caches and reset per-iteration peak stats."""
+        stats = self.get_t1_ipc_cache_stats()
+        self._t1_forward_ipc_cache.clear()
+        self._t1_backward_ipc_cache.clear()
+        self._t1_forward_peak_entries = 0
+        self._t1_backward_peak_entries = 0
+        return stats
+
+    def get_t1_ipc_cache_stats(self) -> dict[str, int]:
+        """Return current and peak T1 IPC cache sizes for observability."""
+        return {
+            "forward_current_entries": len(self._t1_forward_ipc_cache),
+            "backward_current_entries": len(self._t1_backward_ipc_cache),
+            "forward_peak_entries": self._t1_forward_peak_entries,
+            "backward_peak_entries": self._t1_backward_peak_entries,
+        }
 
     def _get_trainer(self, stage_name: str) -> StageTrainer:
         if stage_name not in self._trainers:

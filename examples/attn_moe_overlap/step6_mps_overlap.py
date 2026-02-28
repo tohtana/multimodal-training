@@ -17,10 +17,12 @@ Requires at least 1 CUDA GPU with MPS support (Volta+).
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
+from typing import Callable
 
 import ray
 import torch
@@ -97,6 +99,21 @@ def _is_ipc_error(error_str: str) -> bool:
     return any(kw in error_str for kw in _IPC_ERROR_KEYWORDS)
 
 
+def _normalize_variant_d_split_component(pct: int | None) -> str:
+    """Canonicalize variant-D split components (None -> dflt)."""
+    return "dflt" if pct is None else str(pct)
+
+
+def _variant_d_split_label(attn_pct: int | None, moe_pct: int | None) -> str:
+    """Build canonical result key label for variant D."""
+    return f"{_normalize_variant_d_split_component(attn_pct)}:{_normalize_variant_d_split_component(moe_pct)}"
+
+
+def _variant_d_trace_segment(attn_pct: int | None, moe_pct: int | None) -> str:
+    """Build canonical trace directory segment for variant D."""
+    return f"attn{_normalize_variant_d_split_component(attn_pct)}_moe{_normalize_variant_d_split_component(moe_pct)}"
+
+
 # ---------------------------------------------------------------------------
 # BenchmarkMultiStageActor — pre-loads data on GPU for source stages
 # ---------------------------------------------------------------------------
@@ -132,7 +149,7 @@ class BenchmarkMultiStageActor(MultiStageActor):
         self._preload_counter = 0
         return True
 
-    def forward_step(self, stage_name, inputs=None, labels=None):
+    def forward_step(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
         # For the preloaded source stage, use cached GPU data instead of the
         # serialized CPU input from the pipeline runner.
         if hasattr(self, "_preloaded_stage") and self._preloaded_stage == stage_name:
@@ -140,7 +157,7 @@ class BenchmarkMultiStageActor(MultiStageActor):
             self._preload_counter += 1
             inputs = StageOutputs(activations=self._preloaded_data[idx])
             labels = self._preloaded_labels[idx]
-        return super().forward_step(stage_name, inputs, labels)
+        return super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
 
 
 class VoidReturnActor(BenchmarkMultiStageActor):
@@ -151,12 +168,12 @@ class VoidReturnActor(BenchmarkMultiStageActor):
     parent. T1 transport (IPC) reads from internal state, not return values.
     """
 
-    def forward_step(self, stage_name, inputs=None, labels=None):
-        super().forward_step(stage_name, inputs, labels)
+    def forward_step(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
+        super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
         return True
 
-    def backward_step(self, stage_name, downstream_grad=None):
-        super().backward_step(stage_name, downstream_grad)
+    def backward_step(self, stage_name, downstream_grad=None, microbatch_id: int | None = None):
+        super().backward_step(stage_name, downstream_grad, microbatch_id=microbatch_id)
         return True
 
 
@@ -349,6 +366,8 @@ def _run_pipeline_variant(
     actor_cls=VoidReturnActor,
     scheduler_name: str = "1f1b",
     gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
+    actor_runtime_env_by_resource_set: dict[str, dict] | None = None,
+    pre_timing_validation: Callable | None = None,
 ) -> tuple[list[float], list[float], object]:
     """Run a pipeline variant and return (times_ms, losses, plan).
 
@@ -357,6 +376,12 @@ def _run_pipeline_variant(
     pipeline for the source stage; the actor overrides it with cached GPU data.
 
     Caller is responsible for ray.init/shutdown and MPS lifecycle.
+
+    Args:
+        actor_runtime_env_by_resource_set: Optional per-resource-set runtime_env
+            overrides passed to PlacementManager (e.g., for CUDA_MPS_ACTIVE_THREAD_PERCENTAGE).
+        pre_timing_validation: Optional callback receiving the PlacementPlan.
+            Called after build_models() while actors are alive, before timing.
     """
     # Validate scheduler before any pipeline setup (fail-fast)
     validate_scheduler_request(scheduler_name, NUM_MICROBATCHES, gpipe_max_microbatches=gpipe_max_microbatches)
@@ -368,9 +393,17 @@ def _run_pipeline_variant(
     runner = None
     manager = None
     try:
-        manager = PlacementManager(pipeline, model_specs=specs, actor_cls=actor_cls)
+        manager = PlacementManager(
+            pipeline,
+            model_specs=specs,
+            actor_cls=actor_cls,
+            actor_runtime_env_by_resource_set=actor_runtime_env_by_resource_set,
+        )
         plan = manager.plan()
         manager.build_models(plan)
+
+        if pre_timing_validation is not None:
+            pre_timing_validation(plan)
 
         # Pre-load full batch on the source (attn) actor's GPU.
         # The actor splits it into microbatches and caches them on GPU.
@@ -604,6 +637,396 @@ def run_variant_c(
 
 
 # ---------------------------------------------------------------------------
+# Variant D: MPS with per-actor SM partitioning
+# ---------------------------------------------------------------------------
+
+# Transient startup error patterns that warrant retry
+_TRANSIENT_STARTUP_PATTERNS = (
+    "actor startup",
+    "placement timeout",
+    "GCS",
+    "session connection",
+    "MPS daemon",
+    "RayActorError",
+    "ActorDiedError",
+    "grpc",
+    "ConnectionError",
+)
+
+
+def parse_thread_pct_splits(splits_str: str) -> list[tuple[int | None, int | None]]:
+    """Parse and validate thread percentage splits string.
+
+    Format: "90:0,80:0,70:0,100:100"
+    Each side must be int in [0, 100]. 0 means "default" (don't set
+    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for that stage — unconstrained).
+    De-duplicates preserving order. Ensures (100, 100) control is present.
+
+    Args:
+        splits_str: Comma-separated attn:moe pairs.
+
+    Returns:
+        List of (attn_pct, moe_pct) tuples. None means unconstrained.
+
+    Raises:
+        ValueError: If input is malformed.
+    """
+    seen = set()
+    result = []
+    for part in splits_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        pieces = part.split(":")
+        if len(pieces) != 2:
+            raise ValueError(f"Invalid split '{part}': expected 'attn_pct:moe_pct'")
+        try:
+            a_raw, m_raw = int(pieces[0]), int(pieces[1])
+        except ValueError:
+            raise ValueError(f"Invalid split '{part}': values must be integers")
+        if not (0 <= a_raw <= 100) or not (0 <= m_raw <= 100):
+            raise ValueError(f"Invalid split '{part}': values must be in [0, 100] (0=default)")
+        a = a_raw if a_raw > 0 else None
+        m = m_raw if m_raw > 0 else None
+        key = (a, m)
+        if key not in seen:
+            seen.add(key)
+            result.append(key)
+
+    # Ensure (100, 100) control is present
+    if (100, 100) not in seen:
+        result.append((100, 100))
+
+    return result
+
+
+def load_overlap_metrics(json_path: str) -> dict | None:
+    """Load and validate overlap metrics from JSON.
+
+    Returns dict with keys: overlap_pct, attn_full_sm_pct, moe_full_sm_pct.
+    Returns None if file is missing/invalid.
+    """
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    # Accept either a single-variant dict or a variant-keyed dict
+    if "mps" in data:
+        entry = data["mps"]
+    elif "variant" in data:
+        entry = data
+    else:
+        # Take the first (and usually only) entry
+        vals = list(data.values())
+        if not vals:
+            return None
+        entry = vals[0]
+
+    required = ("overlap_pct", "attn_full_sm_pct", "moe_full_sm_pct")
+    for key in required:
+        if key not in entry:
+            return None
+        val = entry[key]
+        if not isinstance(val, (int, float)) or val < 0 or val > 100:
+            return None
+
+    return {k: entry[k] for k in required}
+
+
+def _is_transient_startup_error(error_str: str) -> bool:
+    """Check if an error is a transient startup failure (retryable)."""
+    lower = error_str.lower()
+    return any(p.lower() in lower for p in _TRANSIENT_STARTUP_PATTERNS)
+
+
+def _make_validation_callback(attn_pct: int | None, moe_pct: int | None):
+    """Create a pre_timing_validation callback for variant D."""
+
+    def validate(plan):
+        attn_group = plan.resource_set_to_actor_group["rs_parent"]
+        moe_group = plan.resource_set_to_actor_group["rs_child"]
+
+        # Verify thread percentages
+        attn_thread_pcts = ray.get([a.get_mps_thread_pct.remote() for a in attn_group.actors])
+        moe_thread_pcts = ray.get([a.get_mps_thread_pct.remote() for a in moe_group.actors])
+
+        expected_attn = str(attn_pct) if attn_pct is not None else None
+        expected_moe = str(moe_pct) if moe_pct is not None else None
+
+        for i, pct in enumerate(attn_thread_pcts):
+            if pct != expected_attn:
+                raise RuntimeError(
+                    f"Startup validation failed: attn actor {i} reports "
+                    f"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={pct!r}, expected {expected_attn!r}"
+                )
+        for i, pct in enumerate(moe_thread_pcts):
+            if pct != expected_moe:
+                raise RuntimeError(
+                    f"Startup validation failed: moe actor {i} reports "
+                    f"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={pct!r}, expected {expected_moe!r}"
+                )
+
+        # Verify GPU colocation
+        attn_gpus = ray.get([a.get_physical_gpu_id.remote() for a in attn_group.actors])
+        moe_gpus = ray.get([a.get_physical_gpu_id.remote() for a in moe_group.actors])
+        for i, (ag, mg) in enumerate(zip(attn_gpus, moe_gpus)):
+            if ag != mg:
+                raise RuntimeError(
+                    f"Startup validation failed: attn actor {i} on GPU {ag}, "
+                    f"moe actor {i} on GPU {mg} — not colocated"
+                )
+
+        attn_str = f"{attn_pct}%" if attn_pct is not None else "default"
+        moe_str = f"{moe_pct}%" if moe_pct is not None else "default"
+        print(f"  [D] Startup validation passed: attn={attn_str}, moe={moe_str}, GPU={attn_gpus[0][:12]}...")
+
+    return validate
+
+
+def run_variant_d_sweep(
+    config,
+    attn_state_dict,
+    moe_state_dict,
+    data,
+    labels,
+    attn_fwd_flops: int,
+    moe_fwd_flops: int,
+    peak_tflops: float | None,
+    scheduler_name: str = "gpipe",
+    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
+    splits: list[tuple[int | None, int | None]] | None = None,
+) -> dict[str, dict]:
+    """Run SM partitioning sweep with CUDA_MPS_ACTIVE_THREAD_PERCENTAGE.
+
+    For each (attn_pct, moe_pct) split, runs an isolated MPS session with
+    per-actor thread percentage limits. Use None for either side to leave
+    CUDA_MPS_ACTIVE_THREAD_PERCENTAGE unset (unconstrained).
+
+    Returns:
+        Dict mapping split label (e.g., "90:dflt") to result dict.
+    """
+    if splits is None:
+        splits = [(90, None), (80, None), (70, None), (100, 100)]
+
+    print(f"\n{'='*60}")
+    print("SM Partitioning Sweep (variant D)")
+    print(f"{'='*60}")
+    print(f"Splits: {', '.join(_variant_d_split_label(a, m) for a, m in splits)}")
+
+    results: dict[str, dict] = {}
+    max_attempts = 3
+    backoff_secs = [5, 15]
+
+    for attn_pct, moe_pct in splits:
+        label = _variant_d_split_label(attn_pct, moe_pct)
+        print(f"\n--- Split {label} ---")
+
+        attempt = 0
+        result = None
+
+        while attempt < max_attempts:
+            attempt += 1
+            if attempt > 1:
+                wait = backoff_secs[min(attempt - 2, len(backoff_secs) - 1)]
+                print(f"  [D/{label}] Retry {attempt}/{max_attempts} after {wait}s backoff...")
+                time.sleep(wait)
+
+            mps_ctx = None
+            try:
+                # Clean session
+                if ray.is_initialized():
+                    ray.shutdown()
+                torch.cuda.empty_cache()
+
+                mps_ctx = MPSContext(gpu_id=0)
+                mps_ctx.__enter__()
+
+                # Start Ray with shared MPS vars only (no global thread %)
+                ray.init(runtime_env={"env_vars": mps_ctx.get_env_vars()})
+
+                # Per-resource-set env overrides
+                env_overrides = {
+                    "rs_parent": {"env_vars": mps_ctx.get_env_vars_for_stage(attn_pct)},
+                    "rs_child": {"env_vars": mps_ctx.get_env_vars_for_stage(moe_pct)},
+                }
+
+                validation_cb = _make_validation_callback(attn_pct, moe_pct)
+
+                times_ms, losses, _plan = _run_pipeline_variant(
+                    f"D/{label}",
+                    config,
+                    attn_state_dict,
+                    moe_state_dict,
+                    data,
+                    labels,
+                    scheduler_name=scheduler_name,
+                    gpipe_max_microbatches=gpipe_max_microbatches,
+                    actor_runtime_env_by_resource_set=env_overrides,
+                    pre_timing_validation=validation_cb,
+                )
+
+                # Build stage metrics
+                mean_ms = sum(times_ms) / len(times_ms)
+                attn_train_flops = 3 * attn_fwd_flops
+                moe_train_flops = 3 * moe_fwd_flops
+                total_train_flops = attn_train_flops + moe_train_flops
+                total_achieved = total_train_flops / (mean_ms / 1000.0)
+
+                result = _make_result(
+                    "ok",
+                    times_ms,
+                    losses,
+                    stage_metrics={
+                        "attn": {
+                            "forward_flops": attn_fwd_flops,
+                            "train_flops": attn_train_flops,
+                            "timed_mean_ms": mean_ms,
+                            "achieved_flops_per_sec": total_achieved * (attn_train_flops / total_train_flops),
+                            "mfu": compute_mfu(total_achieved * (attn_train_flops / total_train_flops), peak_tflops),
+                        },
+                        "moe": {
+                            "forward_flops": moe_fwd_flops,
+                            "train_flops": moe_train_flops,
+                            "timed_mean_ms": mean_ms,
+                            "achieved_flops_per_sec": total_achieved * (moe_train_flops / total_train_flops),
+                            "mfu": compute_mfu(total_achieved * (moe_train_flops / total_train_flops), peak_tflops),
+                        },
+                    },
+                )
+                result["attempts"] = attempt
+                break  # success
+
+            except Exception as e:
+                error_str = str(e)
+                print(f"  [D/{label}] Attempt {attempt} failed: {error_str}")
+
+                if _is_ipc_error(error_str):
+                    result = _make_result("skipped_unsupported", error=f"MPS+IPC incompatible: {error_str}")
+                    result["attempts"] = attempt
+                    break  # deterministic, don't retry
+
+                if not _is_transient_startup_error(error_str) or attempt >= max_attempts:
+                    result = _make_result("failed", error=error_str)
+                    result["attempts"] = attempt
+                    break  # deterministic failure or exhausted retries
+
+                # Transient startup failure — retry after cleanup
+            finally:
+                if ray.is_initialized():
+                    ray.shutdown()
+                if mps_ctx is not None:
+                    mps_ctx.__exit__(None, None, None)
+                torch.cuda.empty_cache()
+
+        if result is None:
+            result = _make_result("failed", error="No result produced")
+            result["attempts"] = attempt
+
+        results[label] = result
+
+    return results
+
+
+def print_variant_d_report(results: dict[str, dict], b_mean_ms: float | None = None) -> None:
+    """Print SM partitioning sweep results."""
+    import numpy as np
+
+    print(f"\n--- SM Partitioning Sweep (variant D) ---")
+    print(f"{'Split (attn:moe)':>18}  {'Mean (ms/iter)':>14}  {'Std':>8}  ", end="")
+    if b_mean_ms is not None:
+        print(f"{'Speedup vs B':>12}  ", end="")
+    print(f"{'Status':>10}  {'Attempts':>8}")
+    print(f"{'-'*18}  {'-'*14}  {'-'*8}  ", end="")
+    if b_mean_ms is not None:
+        print(f"{'-'*12}  ", end="")
+    print(f"{'-'*10}  {'-'*8}")
+
+    for label, r in results.items():
+        attempts = r.get("attempts", "?")
+        if r["status"] == "ok":
+            arr = np.array(r["times_ms"])
+            mean = arr.mean()
+            std = arr.std()
+            line = f"{label:>18}  {mean:14.2f}  {std:8.2f}  "
+            if b_mean_ms is not None:
+                speedup = b_mean_ms / mean
+                line += f"{speedup:11.2f}x  "
+            is_control = label == "100:100"
+            status = "ok (ctrl)" if is_control else "ok"
+            line += f"{status:>10}  {attempts:>8}"
+        else:
+            line = f"{label:>18}  {'N/A':>14}  {'N/A':>8}  "
+            if b_mean_ms is not None:
+                line += f"{'N/A':>12}  "
+            line += f"{r['status']:>10}  {attempts:>8}"
+        print(line)
+
+
+def run_variant_d_behavioral_check(
+    results: dict[str, dict],
+    trace_dir: str,
+    splits: list[tuple[int | None, int | None]],
+    num_sms: int = 132,
+) -> str:
+    """Check if CUDA_MPS_ACTIVE_THREAD_PERCENTAGE is effectively applied.
+
+    Compares capped splits against (100, 100) control. If no capped split
+    changes overlap or SM-saturation metrics by >= 5 percentage points,
+    reports as 'not_effective'.
+
+    Returns: 'effective', 'not_effective', or 'inconclusive'.
+    """
+    control_label = "100:100"
+    if control_label not in results or results[control_label]["status"] != "ok":
+        return "inconclusive"
+
+    # Load control metrics
+    control_path = os.path.join(trace_dir, "variant_d", _variant_d_trace_segment(100, 100), "mps_overlap_metrics.json")
+    control_metrics = load_overlap_metrics(control_path)
+    if control_metrics is None:
+        return "inconclusive"
+
+    effective = False
+    for attn_pct, moe_pct in splits:
+        if attn_pct == 100 and moe_pct == 100:
+            continue
+        label = _variant_d_split_label(attn_pct, moe_pct)
+        if label not in results or results[label]["status"] != "ok":
+            continue
+
+        split_metrics = None
+        split_path = os.path.join(
+            trace_dir,
+            "variant_d",
+            _variant_d_trace_segment(attn_pct, moe_pct),
+            "mps_overlap_metrics.json",
+        )
+        split_metrics = load_overlap_metrics(split_path)
+        if split_metrics is None and (attn_pct is None or moe_pct is None):
+            legacy_path = os.path.join(
+                trace_dir,
+                "variant_d",
+                f"attn{attn_pct}_moe{moe_pct}",
+                "mps_overlap_metrics.json",
+            )
+            split_metrics = load_overlap_metrics(legacy_path)
+        if split_metrics is None:
+            continue
+
+        for key in ("overlap_pct", "attn_full_sm_pct", "moe_full_sm_pct"):
+            delta = abs(split_metrics[key] - control_metrics[key])
+            if delta >= 5.0:
+                print(f"  [D] Behavioral check: {label} {key} differs from control by {delta:.1f}pp")
+                effective = True
+
+    if effective:
+        return "effective"
+    return "not_effective"
+
+
+# ---------------------------------------------------------------------------
 # ProfiledMultiStageActor
 # ---------------------------------------------------------------------------
 
@@ -632,17 +1055,17 @@ class ProfiledMultiStageActor(VoidReturnActor):
             self._profiler.export_chrome_trace(os.path.join(self._trace_dir, "trace.json"))
             self._profiler = None
 
-    def forward_step(self, stage_name, inputs=None, labels=None):
+    def forward_step(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
         if getattr(self, "_profiler", None) is None:
-            return super().forward_step(stage_name, inputs, labels)
+            return super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
         with torch.profiler.record_function(f"{stage_name}.forward"):
-            return super().forward_step(stage_name, inputs, labels)
+            return super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
 
-    def backward_step(self, stage_name, downstream_grad=None):
+    def backward_step(self, stage_name, downstream_grad=None, microbatch_id: int | None = None):
         if getattr(self, "_profiler", None) is None:
-            return super().backward_step(stage_name, downstream_grad)
+            return super().backward_step(stage_name, downstream_grad, microbatch_id=microbatch_id)
         with torch.profiler.record_function(f"{stage_name}.backward"):
-            out = super().backward_step(stage_name, downstream_grad)
+            out = super().backward_step(stage_name, downstream_grad, microbatch_id=microbatch_id)
         self._profiler.step()
         return out
 
@@ -662,15 +1085,17 @@ def run_profiling(
     labels,
     scheduler_name: str = "1f1b",
     gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
+    profiling_warmup: int = 30,
+    profiling_iters: int = 10,
 ) -> dict:
     """Run a profiling pass for the specified variant.
 
     Args:
         variant: "no_mps" or "mps"
+        profiling_warmup: Number of warmup iterations before profiling.
+        profiling_iters: Number of iterations to profile.
     """
-    print(f"\n=== Profiling: {variant} ===")
-    profiling_warmup = 5
-    profiling_iters = 5
+    print(f"\n=== Profiling: {variant} ({profiling_warmup} warmup + {profiling_iters} profiled) ===")
     variant_trace_dir = os.path.join(trace_dir, variant)
 
     mps_ctx = None
@@ -855,6 +1280,219 @@ def print_report(results_a: dict, results_b: dict, results_c: dict, config, peak
 
 
 # ---------------------------------------------------------------------------
+# Model-size sweep
+# ---------------------------------------------------------------------------
+
+MODEL_SIZE_CONFIGS = [
+    {"name": "small", "hidden_size": 2048, "moe_intermediate_size": 768},
+    {"name": "medium", "hidden_size": 4096, "moe_intermediate_size": 1536},
+    {"name": "large", "hidden_size": 8192, "moe_intermediate_size": 3072},
+]
+
+SWEEP_WARMUP_ITERS = 5
+SWEEP_TIMED_ITERS = 5
+
+
+def run_model_size_sweep(
+    scheduler_name: str = "gpipe",
+    gpipe_max_microbatches: int = DEFAULT_GPIPE_MAX_MICROBATCHES,
+    sweep_thread_pct: bool = False,
+    thread_pct_splits_str: str = "50:50,70:30,90:10,100:100",
+) -> list[dict]:
+    """Run B/C comparison across model sizes to find MPS crossover point.
+
+    Executes configs from smallest to largest. On OOM, marks as skipped and continues.
+
+    Returns:
+        List of per-config result dicts.
+    """
+    print(f"\n{'='*60}")
+    print("Model-Size Sweep")
+    print(f"{'='*60}")
+
+    # Save module-level constants
+    global WARMUP_ITERS, TIMED_ITERS
+    saved_warmup, saved_timed = WARMUP_ITERS, TIMED_ITERS
+
+    results = []
+
+    for cfg in MODEL_SIZE_CONFIGS:
+        config_name = cfg["name"]
+        print(
+            f"\n--- Model config: {config_name} (hidden={cfg['hidden_size']}, moe_ffn={cfg['moe_intermediate_size']}) ---"
+        )
+
+        entry = {
+            "name": config_name,
+            "hidden_size": cfg["hidden_size"],
+            "moe_intermediate_size": cfg["moe_intermediate_size"],
+            "b_result": None,
+            "c_result": None,
+            "status": "pending",
+        }
+
+        try:
+            config = create_qwen3_config(
+                hidden_size=cfg["hidden_size"],
+                moe_intermediate_size=cfg["moe_intermediate_size"],
+            )
+            peak_tflops = get_gpu_peak_tflops(DTYPE)
+
+            attn_fwd_flops = compute_attn_forward_flops(
+                batch_size=BATCH_SIZE,
+                seq_len=SEQ_LEN,
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.hidden_size // config.num_attention_heads,
+            )
+            moe_fwd_flops = compute_moe_forward_flops(
+                batch_size=BATCH_SIZE,
+                seq_len=SEQ_LEN,
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                moe_intermediate_size=config.moe_intermediate_size,
+                num_classes=NUM_CLASSES,
+            )
+
+            # Create models
+            torch.manual_seed(42)
+            attn_model = Qwen3AttentionStage(config, dtype=DTYPE)
+            moe_model = Qwen3MoEStageWithHead(config, NUM_CLASSES, dtype=DTYPE)
+            attn_state_dict = attn_model.state_dict()
+            moe_state_dict = moe_model.state_dict()
+            del attn_model, moe_model
+
+            torch.manual_seed(42)
+            data, labels = generate_dummy_batch(
+                config, batch_size=BATCH_SIZE, seq_len=SEQ_LEN, num_classes=NUM_CLASSES, device="cpu", dtype=DTYPE
+            )
+
+            # 1-iteration OOM preflight
+            print(f"  [{config_name}] Running OOM preflight...")
+            WARMUP_ITERS, TIMED_ITERS = 0, 1
+            try:
+                preflight_b = run_variant_b(
+                    config,
+                    attn_state_dict,
+                    moe_state_dict,
+                    data,
+                    labels,
+                    attn_fwd_flops,
+                    moe_fwd_flops,
+                    peak_tflops,
+                    scheduler_name=scheduler_name,
+                    gpipe_max_microbatches=gpipe_max_microbatches,
+                )
+                if preflight_b["status"] != "ok":
+                    raise RuntimeError(preflight_b.get("error", "preflight failed"))
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"  [{config_name}] OOM during preflight — skipping")
+                    entry["status"] = "skipped_oom"
+                    entry["error"] = str(e)
+                    results.append(entry)
+                    torch.cuda.empty_cache()
+                    continue
+                raise
+            finally:
+                if ray.is_initialized():
+                    ray.shutdown()
+                torch.cuda.empty_cache()
+
+            # Full sweep
+            WARMUP_ITERS, TIMED_ITERS = SWEEP_WARMUP_ITERS, SWEEP_TIMED_ITERS
+
+            entry["b_result"] = run_variant_b(
+                config,
+                attn_state_dict,
+                moe_state_dict,
+                data,
+                labels,
+                attn_fwd_flops,
+                moe_fwd_flops,
+                peak_tflops,
+                scheduler_name=scheduler_name,
+                gpipe_max_microbatches=gpipe_max_microbatches,
+            )
+
+            entry["c_result"] = run_variant_c(
+                config,
+                attn_state_dict,
+                moe_state_dict,
+                data,
+                labels,
+                attn_fwd_flops,
+                moe_fwd_flops,
+                peak_tflops,
+                scheduler_name=scheduler_name,
+                gpipe_max_microbatches=gpipe_max_microbatches,
+            )
+
+            entry["status"] = "ok"
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"  [{config_name}] OOM — skipping")
+                entry["status"] = "skipped_oom"
+                entry["error"] = str(e)
+            else:
+                print(f"  [{config_name}] FAILED: {e}")
+                entry["status"] = "failed"
+                entry["error"] = str(e)
+        except Exception as e:
+            print(f"  [{config_name}] FAILED: {e}")
+            entry["status"] = "failed"
+            entry["error"] = str(e)
+        finally:
+            if ray.is_initialized():
+                ray.shutdown()
+            torch.cuda.empty_cache()
+
+        results.append(entry)
+
+    # Restore module-level constants
+    WARMUP_ITERS, TIMED_ITERS = saved_warmup, saved_timed
+
+    return results
+
+
+def print_model_size_report(results: list[dict]) -> None:
+    """Print model-size sweep results."""
+    import numpy as np
+
+    print(f"\n--- Model-Size Sweep ---")
+    print(
+        f"{'Config':>8}  {'Hidden':>6}  {'MoE-FFN':>7}  {'B (ms)':>10}  {'C (ms)':>10}  {'Speedup':>8}  {'Status':>12}"
+    )
+    print(f"{'-'*8}  {'-'*6}  {'-'*7}  {'-'*10}  {'-'*10}  {'-'*8}  {'-'*12}")
+
+    for entry in results:
+        name = entry["name"]
+        hidden = entry["hidden_size"]
+        moe_ffn = entry["moe_intermediate_size"]
+        status = entry["status"]
+
+        if status == "ok":
+            b_r = entry["b_result"]
+            c_r = entry["c_result"]
+            b_str = f"{np.mean(b_r['times_ms']):10.2f}" if b_r and b_r["status"] == "ok" else f"{'N/A':>10}"
+            c_str = f"{np.mean(c_r['times_ms']):10.2f}" if c_r and c_r["status"] == "ok" else f"{'N/A':>10}"
+            if b_r and c_r and b_r["status"] == "ok" and c_r["status"] == "ok":
+                speedup = np.mean(b_r["times_ms"]) / np.mean(c_r["times_ms"])
+                speedup_str = f"{speedup:7.2f}x"
+            else:
+                speedup_str = f"{'N/A':>8}"
+        else:
+            b_str = f"{'N/A':>10}"
+            c_str = f"{'N/A':>10}"
+            speedup_str = f"{'N/A':>8}"
+
+        print(f"{name:>8}  {hidden:>6}  {moe_ffn:>7}  {b_str}  {c_str}  {speedup_str}  {status:>12}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -877,6 +1515,34 @@ def main():
         type=int,
         default=DEFAULT_GPIPE_MAX_MICROBATCHES,
         help="Safety cap for GPipe microbatches (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--profile-warmup-iters",
+        type=int,
+        default=30,
+        help="Warmup iterations before profiling (default: 30)",
+    )
+    parser.add_argument(
+        "--profile-iters",
+        type=int,
+        default=10,
+        help="Number of iterations to profile (default: 10)",
+    )
+    parser.add_argument(
+        "--sweep-thread-pct",
+        action="store_true",
+        help="Enable SM partitioning sweep (variant D) with CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+    )
+    parser.add_argument(
+        "--thread-pct-splits",
+        type=str,
+        default="90:0,80:0,70:0,100:100",
+        help="Thread percentage splits for variant D sweep. 0=default/unconstrained. (default: '90:0,80:0,70:0,100:100')",
+    )
+    parser.add_argument(
+        "--sweep-model-size",
+        action="store_true",
+        help="Enable model-size sweep to find MPS crossover point",
     )
     args = parser.parse_args()
 
@@ -977,6 +1643,8 @@ def main():
             labels,
             scheduler_name=args.scheduler,
             gpipe_max_microbatches=args.gpipe_max_microbatches,
+            profiling_warmup=args.profile_warmup_iters,
+            profiling_iters=args.profile_iters,
         )
         run_profiling(
             "mps",
@@ -988,10 +1656,49 @@ def main():
             labels,
             scheduler_name=args.scheduler,
             gpipe_max_microbatches=args.gpipe_max_microbatches,
+            profiling_warmup=args.profile_warmup_iters,
+            profiling_iters=args.profile_iters,
+        )
+
+    # --- Variant D: SM partitioning sweep ---
+    results_d = None
+    if args.sweep_thread_pct:
+        splits = parse_thread_pct_splits(args.thread_pct_splits)
+        results_d = run_variant_d_sweep(
+            config,
+            attn_state_dict,
+            moe_state_dict,
+            data,
+            labels,
+            attn_fwd_flops,
+            moe_fwd_flops,
+            peak_tflops,
+            scheduler_name=args.scheduler,
+            gpipe_max_microbatches=args.gpipe_max_microbatches,
+            splits=splits,
+        )
+
+    # --- Model-size sweep ---
+    model_size_results = None
+    if args.sweep_model_size:
+        model_size_results = run_model_size_sweep(
+            scheduler_name=args.scheduler,
+            gpipe_max_microbatches=args.gpipe_max_microbatches,
+            sweep_thread_pct=args.sweep_thread_pct,
+            thread_pct_splits_str=args.thread_pct_splits,
         )
 
     # --- Report ---
     print_report(results_a, results_b, results_c, config, peak_tflops)
+
+    if results_d is not None:
+        import numpy as np
+
+        b_mean_ms = float(np.mean(results_b["times_ms"])) if results_b["status"] == "ok" else None
+        print_variant_d_report(results_d, b_mean_ms)
+
+    if model_size_results is not None:
+        print_model_size_report(model_size_results)
 
     # --- Convergence validation ---
     failed = False
@@ -1023,6 +1730,16 @@ def main():
     elif results_c["status"] == "failed":
         print(f"\nFAILED: Variant C status=failed ({results_c.get('error', 'N/A')})")
         failed = True
+
+    # Variant D convergence check (non-fatal — informational)
+    if results_d is not None:
+        for label, r in results_d.items():
+            if r["status"] == "ok":
+                d_losses = r["losses"]
+                d_first_5 = sum(d_losses[:5]) / 5
+                d_min = min(d_losses)
+                if d_min >= d_first_5 * 0.5:
+                    print(f"\nWARN: Variant D/{label} not converging: first_5={d_first_5:.6f}, min={d_min:.6f}")
 
     if failed:
         sys.exit(1)

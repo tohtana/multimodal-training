@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import re
 from typing import Any
 
 import ray
@@ -60,6 +62,8 @@ class RayPipelineRunner:
         self.scheduler = scheduler or SequentialScheduler()
         self.failure_injection = failure_injection
         self.router = CrossStageRouter(self.dag, self.plan)
+        self._verify_t1_cleanup = os.environ.get("MM_VERIFY_T1_CACHE_CLEANUP", "0") == "1"
+        self._last_t1_cache_cleanup_stats: list[dict[str, Any]] = []
 
         # Pre-compute: check if all stages share a single ActorGroup (T0)
         group_ids = {id(self.plan.stage_to_actor_group[name]) for name in self.topo_order}
@@ -89,13 +93,6 @@ class RayPipelineRunner:
                 the optimizer step.
         """
 
-        # Check failure injection for backward
-        for name in self.topo_order:
-            if self._should_inject_failure(name, "backward", iteration):
-                raise PipelineIterationError(name, "backward", 0)
-            if self._should_inject_failure(name, "forward", iteration):
-                raise PipelineIterationError(name, "forward", 0)
-
         # T0 optimized path only for single microbatch + all same group
         if self._all_same_group and num_microbatches == 1:
             return self._run_iteration_t0(data, labels, max_norm, iteration)
@@ -119,23 +116,28 @@ class RayPipelineRunner:
         stage_output_refs: dict[str, list] = {}
 
         for stage_name in self.topo_order:
+            if self._should_inject_failure(stage_name, "forward", iteration, microbatch_id=0):
+                raise PipelineIterationError(stage_name, "forward", 0)
             preds = self.dag.predecessors(stage_name)
             if not preds:
                 # Source stage
                 refs = []
                 for actor in group.actors:
-                    ref = actor.forward_step.remote(stage_name, StageOutputs(activations=data), labels)
+                    ref = actor.forward_step.remote(stage_name, StageOutputs(activations=data), labels, 0)
                     refs.append(ref)
             else:
                 pred_refs = stage_output_refs[preds[0]]
                 refs = []
                 for actor, pred_ref in zip(group.actors, pred_refs):
-                    ref = actor.forward_step.remote(stage_name, pred_ref, labels)
+                    ref = actor.forward_step.remote(stage_name, pred_ref, labels, 0)
                     refs.append(ref)
             stage_output_refs[stage_name] = refs
 
         # Backward: run all stages in reverse order on each actor (in-process, no serialization)
         reversed_stages = list(reversed(self.topo_order))
+        for stage_name in reversed_stages:
+            if self._should_inject_failure(stage_name, "backward", iteration, microbatch_id=0):
+                raise PipelineIterationError(stage_name, "backward", 0)
         backward_refs = []
         for actor in group.actors:
             ref = actor.run_full_backward.remote(reversed_stages, self._stage_successors)
@@ -192,118 +194,159 @@ class RayPipelineRunner:
         # stage_output_refs[stage_name][microbatch_id] = list of refs (one per actor)
         stage_output_refs: dict[str, dict[int, list]] = {}
         stage_grad_refs: dict[str, dict[int, list]] = {}
+        run_error: Exception | None = None
+        result: dict[str, Any] | None = None
 
-        for step in schedule:
-            group = self.plan.stage_to_actor_group[step.stage_name]
-            mb_id = step.microbatch_id
+        try:
+            for step in schedule:
+                group = self.plan.stage_to_actor_group[step.stage_name]
+                mb_id = step.microbatch_id
+                step_op = step.op.value
+                if self._should_inject_failure(step.stage_name, step_op, iteration, microbatch_id=mb_id):
+                    raise PipelineIterationError(step.stage_name, step_op, mb_id)
 
-            if step.op == OpType.FORWARD:
-                preds = self.dag.predecessors(step.stage_name)
-                succs = self.dag.successors(step.stage_name)
-                # Only use RDT/NCCL if any successor edge requires T2 transport
-                use_rdt = any(
-                    self.router.get_transport(step.stage_name, s) in ("t2", "mixed")
-                    for s in succs
-                )
+                if step.op == OpType.FORWARD:
+                    preds = self.dag.predecessors(step.stage_name)
+                    succs = self.dag.successors(step.stage_name)
+                    # Only use RDT/NCCL if any successor edge requires T2 transport
+                    use_rdt = any(
+                        self.router.get_transport(step.stage_name, s) in ("t2", "mixed")
+                        for s in succs
+                    )
 
-                if not preds:
-                    refs = [
-                        self._forward_remote(
-                            actor, step.stage_name,
-                            StageOutputs(activations=mb_data[mb_id]),
-                            mb_labels[mb_id], use_rdt,
-                        )
-                        for actor in group.actors
-                    ]
-                else:
-                    pred_name = preds[0]
-                    pred_refs = stage_output_refs[pred_name][mb_id]
-                    pred_group = self.plan.stage_to_actor_group[pred_name]
-                    routing = self.router.get_routing(pred_name, step.stage_name)
-
-                    refs = []
-                    for dst_rank, actor in enumerate(group.actors):
-                        src_rank = routing.dst_to_src[dst_rank]
-                        transport = self.router.get_actor_pair_transport(
-                            pred_name, step.stage_name, src_rank, dst_rank
-                        )
-
-                        if transport == "t1":
-                            # T1: CUDA IPC — get IPC handle from sender, reconstruct on receiver
-                            ipc_ref = pred_group.actors[src_rank].create_ipc_for_output.remote(pred_name)
-                            ref = actor.forward_from_ipc.remote(
-                                step.stage_name, ipc_ref, mb_labels[mb_id]
+                    if not preds:
+                        refs = [
+                            self._forward_remote(
+                                actor,
+                                step.stage_name,
+                                StageOutputs(activations=mb_data[mb_id]),
+                                mb_labels[mb_id],
+                                mb_id,
+                                use_rdt,
                             )
-                        else:
-                            pred_ref = pred_refs[src_rank]
-                            ref = self._forward_remote(
-                                actor, step.stage_name, pred_ref, mb_labels[mb_id],
-                                use_rdt=(transport == "t2"),
+                            for actor in group.actors
+                        ]
+                    else:
+                        pred_name = preds[0]
+                        pred_refs = stage_output_refs[pred_name][mb_id]
+                        pred_group = self.plan.stage_to_actor_group[pred_name]
+                        routing = self.router.get_routing(pred_name, step.stage_name)
+
+                        refs = []
+                        for dst_rank, actor in enumerate(group.actors):
+                            src_rank = routing.dst_to_src[dst_rank]
+                            transport = self.router.get_actor_pair_transport(
+                                pred_name, step.stage_name, src_rank, dst_rank
                             )
-                        refs.append(ref)
 
-                stage_output_refs.setdefault(step.stage_name, {})[mb_id] = refs
+                            if transport == "t1":
+                                # T1: CUDA IPC — get IPC handle for (stage, microbatch), reconstruct on receiver
+                                ipc_ref = pred_group.actors[src_rank].create_ipc_for_output.remote(pred_name, mb_id)
+                                ref = actor.forward_from_ipc.remote(
+                                    step.stage_name, ipc_ref, mb_labels[mb_id], mb_id
+                                )
+                            else:
+                                pred_ref = pred_refs[src_rank]
+                                ref = self._forward_remote(
+                                    actor,
+                                    step.stage_name,
+                                    pred_ref,
+                                    mb_labels[mb_id],
+                                    mb_id,
+                                    use_rdt=(transport == "t2"),
+                                )
+                            refs.append(ref)
 
-            elif step.op == OpType.BACKWARD:
-                succs_of = self.dag.successors(step.stage_name)
-                preds_of = self.dag.predecessors(step.stage_name)
-                use_rdt_upstream = any(
-                    self.router.get_transport(p, step.stage_name) in ("t2", "mixed")
-                    for p in preds_of
-                )
+                    stage_output_refs.setdefault(step.stage_name, {})[mb_id] = refs
 
-                if not succs_of:
-                    refs = [
-                        self._backward_remote(actor, step.stage_name, None, use_rdt_upstream)
-                        for actor in group.actors
-                    ]
-                else:
-                    succ_name = succs_of[0]
-                    succ_grad_refs = stage_grad_refs.get(succ_name, {}).get(mb_id, [])
-                    succ_group = self.plan.stage_to_actor_group[succ_name]
-                    routing = self.router.get_routing(step.stage_name, succ_name)
+                elif step.op == OpType.BACKWARD:
+                    succs_of = self.dag.successors(step.stage_name)
+                    preds_of = self.dag.predecessors(step.stage_name)
+                    use_rdt_upstream = any(
+                        self.router.get_transport(p, step.stage_name) in ("t2", "mixed")
+                        for p in preds_of
+                    )
 
-                    refs = []
-                    for src_rank, actor in enumerate(group.actors):
-                        dst_ranks = routing.src_to_dst[src_rank]
-                        grad_ref = self._gather_grad_refs_with_transport(
-                            actor, step.stage_name, succ_name, succ_group,
-                            succ_grad_refs, dst_ranks, src_rank,
-                        )
-                        ref = self._backward_remote(actor, step.stage_name, grad_ref, use_rdt_upstream)
-                        refs.append(ref)
+                    if not succs_of:
+                        refs = [
+                            self._backward_remote(actor, step.stage_name, None, mb_id, use_rdt_upstream)
+                            for actor in group.actors
+                        ]
+                    else:
+                        succ_name = succs_of[0]
+                        succ_grad_refs = stage_grad_refs.get(succ_name, {}).get(mb_id, [])
+                        succ_group = self.plan.stage_to_actor_group[succ_name]
+                        routing = self.router.get_routing(step.stage_name, succ_name)
 
-                stage_grad_refs.setdefault(step.stage_name, {})[mb_id] = refs
+                        refs = []
+                        for src_rank, actor in enumerate(group.actors):
+                            dst_ranks = routing.src_to_dst[src_rank]
+                            grad_ref = self._gather_grad_refs_with_transport(
+                                actor,
+                                step.stage_name,
+                                succ_name,
+                                succ_group,
+                                succ_grad_refs,
+                                dst_ranks,
+                                src_rank,
+                                mb_id,
+                            )
+                            ref = self._backward_remote(actor, step.stage_name, grad_ref, mb_id, use_rdt_upstream)
+                            refs.append(ref)
 
-        # Loss (scalar only — safe for ray.get; actor task ordering ensures backward is done)
-        loss_value = None
-        for stage_cfg in self.pipeline.stages:
-            if stage_cfg.is_terminal:
-                group = self.plan.stage_to_actor_group[stage_cfg.name]
-                loss_value = ray.get(group.actors[0].get_last_loss.remote(stage_cfg.name))
+                    stage_grad_refs.setdefault(step.stage_name, {})[mb_id] = refs
 
-        # Grad norm (scalar only)
-        total_norm_sq = 0.0
-        for name in self.topo_order:
-            group = self.plan.stage_to_actor_group[name]
-            norm_sq = ray.get(group.actors[0].compute_grad_norm_sq.remote(name))
-            total_norm_sq += norm_sq
-        global_grad_norm = math.sqrt(total_norm_sq)
+            # Loss (scalar only — safe for ray.get; actor task ordering ensures backward is done)
+            loss_value = None
+            for stage_cfg in self.pipeline.stages:
+                if stage_cfg.is_terminal:
+                    group = self.plan.stage_to_actor_group[stage_cfg.name]
+                    loss_value = ray.get(group.actors[0].get_last_loss.remote(stage_cfg.name))
 
-        # Optimizer step
-        opt_refs = []
-        for name in self.topo_order:
-            group = self.plan.stage_to_actor_group[name]
-            for actor in group.actors:
-                ref = actor.optimizer_step.remote(
-                    name,
-                    global_grad_norm=global_grad_norm if max_norm else None,
-                    max_norm=max_norm or 1.0,
-                )
-                opt_refs.append(ref)
-        ray.get(opt_refs)
+            # Grad norm (scalar only)
+            total_norm_sq = 0.0
+            for name in self.topo_order:
+                group = self.plan.stage_to_actor_group[name]
+                norm_sq = ray.get(group.actors[0].compute_grad_norm_sq.remote(name))
+                total_norm_sq += norm_sq
+            global_grad_norm = math.sqrt(total_norm_sq)
 
-        return {"loss": loss_value, "global_grad_norm": global_grad_norm}
+            # Optimizer step
+            opt_refs = []
+            for name in self.topo_order:
+                group = self.plan.stage_to_actor_group[name]
+                for actor in group.actors:
+                    ref = actor.optimizer_step.remote(
+                        name,
+                        global_grad_norm=global_grad_norm if max_norm else None,
+                        max_norm=max_norm or 1.0,
+                    )
+                    opt_refs.append(ref)
+            ray.get(opt_refs)
+
+            result = {"loss": loss_value, "global_grad_norm": global_grad_norm}
+        except Exception as exc:  # noqa: PERF203
+            run_error = exc
+        finally:
+            cleanup_error = None
+            if self._has_t1:
+                try:
+                    self._clear_t1_ipc_cache(iteration)
+                except Exception as exc:  # noqa: PERF203
+                    cleanup_error = exc
+
+            if cleanup_error is not None:
+                if run_error is None:
+                    raise self._wrap_iteration_exception(cleanup_error) from cleanup_error
+                logger.error(f"Failed to clear T1 IPC cache after iteration error: {cleanup_error}")
+
+        if run_error is not None:
+            if isinstance(run_error, PipelineIterationError):
+                raise run_error
+            raise self._wrap_iteration_exception(run_error) from run_error
+
+        assert result is not None
+        return result
 
     @staticmethod
     def _split_batch(
@@ -323,18 +366,18 @@ class RayPipelineRunner:
         return mb_data, mb_labels
 
     @staticmethod
-    def _forward_remote(actor, stage_name, inputs, labels, use_rdt: bool):
+    def _forward_remote(actor, stage_name, inputs, labels, microbatch_id: int, use_rdt: bool):
         """Dispatch forward_step, optionally using RDT/NCCL for the return value."""
         if use_rdt:
-            return actor.forward_step.options(tensor_transport="nccl").remote(stage_name, inputs, labels)
-        return actor.forward_step.remote(stage_name, inputs, labels)
+            return actor.forward_step.options(tensor_transport="nccl").remote(stage_name, inputs, labels, microbatch_id)
+        return actor.forward_step.remote(stage_name, inputs, labels, microbatch_id)
 
     @staticmethod
-    def _backward_remote(actor, stage_name, downstream_grad, use_rdt: bool):
+    def _backward_remote(actor, stage_name, downstream_grad, microbatch_id: int, use_rdt: bool):
         """Dispatch backward_step, optionally using RDT/NCCL for the return value."""
         if use_rdt:
-            return actor.backward_step.options(tensor_transport="nccl").remote(stage_name, downstream_grad)
-        return actor.backward_step.remote(stage_name, downstream_grad)
+            return actor.backward_step.options(tensor_transport="nccl").remote(stage_name, downstream_grad, microbatch_id)
+        return actor.backward_step.remote(stage_name, downstream_grad, microbatch_id)
 
     @staticmethod
     def _gather_grad_refs(actor, succ_grad_refs, dst_ranks, use_rdt: bool):
@@ -362,6 +405,7 @@ class RayPipelineRunner:
         succ_grad_refs,
         dst_ranks,
         src_rank: int,
+        mb_id: int,
     ):
         """Gather gradient refs using per-actor-pair transport (T0/T1/T2).
 
@@ -376,7 +420,7 @@ class RayPipelineRunner:
             dst_rank = dst_ranks[0]
             transport = self.router.get_actor_pair_transport(src_stage, succ_stage, src_rank, dst_rank)
             if transport == "t1":
-                return succ_group.actors[dst_rank].create_ipc_for_grad.remote(succ_stage)
+                return succ_group.actors[dst_rank].create_ipc_for_grad.remote(succ_stage, mb_id)
             return succ_grad_refs[dst_rank]
 
         # Multiple successor actors → gather and aggregate sequentially.
@@ -387,7 +431,7 @@ class RayPipelineRunner:
         for dst_rank in dst_ranks:
             transport = self.router.get_actor_pair_transport(src_stage, succ_stage, src_rank, dst_rank)
             if transport == "t1":
-                gathered_refs.append(succ_group.actors[dst_rank].create_ipc_for_grad.remote(succ_stage))
+                gathered_refs.append(succ_group.actors[dst_rank].create_ipc_for_grad.remote(succ_stage, mb_id))
             else:
                 gathered_refs.append(succ_grad_refs[dst_rank])
 
@@ -397,14 +441,100 @@ class RayPipelineRunner:
             result_ref = actor.accumulate_gradient.remote(result_ref, ref)
         return result_ref
 
-    def _should_inject_failure(self, stage_name: str, op: str, iteration: int) -> bool:
+    def _iter_unique_actor_groups(self):
+        seen: set[int] = set()
+        for stage_name in self.topo_order:
+            group = self.plan.stage_to_actor_group[stage_name]
+            group_id = id(group)
+            if group_id in seen:
+                continue
+            seen.add(group_id)
+            yield group
+
+    def _clear_t1_ipc_cache(self, iteration: int) -> None:
+        cleanup_refs = []
+        actor_contexts: list[tuple[str, int, Any]] = []
+        for group in self._iter_unique_actor_groups():
+            for actor_rank, actor in enumerate(group.actors):
+                cleanup_refs.append(actor.clear_t1_ipc_cache.remote())
+                actor_contexts.append((group.resource_set_name, actor_rank, actor))
+
+        if not cleanup_refs:
+            self._last_t1_cache_cleanup_stats = []
+            return
+
+        cleanup_stats = ray.get(cleanup_refs)
+        self._last_t1_cache_cleanup_stats = []
+        for idx, stats in enumerate(cleanup_stats):
+            resource_set_name, actor_rank, _ = actor_contexts[idx]
+            entry = {"resource_set": resource_set_name, "actor_rank": actor_rank, "iteration": iteration}
+            entry.update(stats or {})
+            self._last_t1_cache_cleanup_stats.append(entry)
+
+        if not self._verify_t1_cleanup:
+            return
+
+        verify_refs = [actor.get_t1_ipc_cache_stats.remote() for _, _, actor in actor_contexts]
+        verify_stats = ray.get(verify_refs)
+        for idx, stats in enumerate(verify_stats):
+            if (stats or {}).get("forward_current_entries", 0) != 0 or (stats or {}).get("backward_current_entries", 0) != 0:
+                resource_set_name, actor_rank, _ = actor_contexts[idx]
+                raise RuntimeError(
+                    f"T1 cache cleanup verification failed at {resource_set_name}[{actor_rank}] "
+                    f"(iteration={iteration}): {stats}"
+                )
+
+    def _wrap_iteration_exception(self, exc: Exception) -> PipelineIterationError:
+        if isinstance(exc, PipelineIterationError):
+            return exc
+
+        text = str(exc)
+        stage_name = "unknown"
+        op = "iteration"
+        microbatch_id = -1
+
+        full_match = re.search(r"stage='([^']+)', microbatch=(\d+)", text)
+        if full_match:
+            stage_name = full_match.group(1)
+            microbatch_id = int(full_match.group(2))
+        else:
+            stage_match = re.search(r"stage='([^']+)'", text)
+            if stage_match:
+                stage_name = stage_match.group(1)
+
+        if "forward output" in text or "create_ipc_for_output" in text or "forward_from_ipc" in text:
+            op = "forward"
+        elif "backward grad" in text or "create_ipc_for_grad" in text or "backward_from_ipc" in text:
+            op = "backward"
+        elif "cleanup" in text:
+            op = "cleanup"
+
+        return PipelineIterationError(stage_name, op, microbatch_id, cause=exc)
+
+    def get_last_t1_cache_cleanup_stats(self) -> list[dict[str, Any]]:
+        """Return per-actor T1 cache stats captured during the last cleanup."""
+        return [dict(entry) for entry in self._last_t1_cache_cleanup_stats]
+
+    def _should_inject_failure(
+        self,
+        stage_name: str,
+        op: str,
+        iteration: int,
+        microbatch_id: int | None = None,
+    ) -> bool:
         if self.failure_injection is None:
             return False
-        return (
-            self.failure_injection.get("stage_name") == stage_name
-            and self.failure_injection.get("op") == op
-            and self.failure_injection.get("iteration") == iteration
-        )
+        if (
+            self.failure_injection.get("stage_name") != stage_name
+            or self.failure_injection.get("op") != op
+            or self.failure_injection.get("iteration") != iteration
+        ):
+            return False
+
+        injected_mb = self.failure_injection.get("microbatch_id")
+        if injected_mb is not None and microbatch_id is not None and injected_mb != microbatch_id:
+            return False
+        return True
 
     def shutdown(self) -> None:
         """Shut down the runner. Idempotent."""

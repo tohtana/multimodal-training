@@ -24,8 +24,8 @@ from examples.attn_moe_overlap.model_utils import (
     generate_dummy_batch,
 )
 from examples.attn_moe_overlap.step6_mps_overlap import (
-    BATCH_SIZE,
     BASE_LR,
+    BATCH_SIZE,
     DTYPE,
     NUM_CLASSES,
     NUM_MICROBATCHES,
@@ -40,7 +40,7 @@ from examples.attn_moe_overlap.step6_mps_overlap import (
 from python.pipeline.placement import PlacementManager
 from python.pipeline.ray_runner import RayPipelineRunner
 from python.pipeline.scheduler import OneFOneBScheduler
-from python.ray.payloads import StageGradients, StageOutputs
+from python.ray.payloads import StageOutputs
 
 
 class FusedIPCActor(BenchmarkMultiStageActor):
@@ -50,52 +50,19 @@ class FusedIPCActor(BenchmarkMultiStageActor):
     eliminating both the extra Ray call and the return-value serialization.
     """
 
-    def forward_step_ipc(self, stage_name, inputs=None, labels=None):
+    def forward_step_ipc(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
         """Forward + create IPC handle in one call. Returns IPC dict."""
-        super().forward_step(stage_name, inputs, labels)
-        # Create IPC handle from the just-computed output
-        result = self._last_forward_outputs.get(stage_name)
-        if result is None or result.activations is None or not result.activations.is_cuda:
-            return None
-        from python.ray.tensor_transfer import create_ipc_handle
-        handle, gpu_id, event_handle = create_ipc_handle(result.activations.detach())
-        return {
-            "__ipc__": True,
-            "ipc_handle": handle,
-            "gpu_id": gpu_id,
-            "event_handle": event_handle,
-            "meta": result.meta,
-        }
+        super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
+        return super().create_ipc_for_output(stage_name, microbatch_id=microbatch_id)
 
-    def backward_step_ipc(self, stage_name, downstream_grad=None):
+    def backward_step_ipc(self, stage_name, downstream_grad=None, microbatch_id: int | None = None):
         """Backward + create IPC handle for upstream grad in one call."""
-        super().backward_step(stage_name, downstream_grad)
-        # Create IPC handle from the just-computed gradient
-        result = self._last_backward_grads.get(stage_name)
-        if result is None or result.grad is None or not result.grad.is_cuda:
-            return None
-        from python.ray.tensor_transfer import create_ipc_handle
-        handle, gpu_id, event_handle = create_ipc_handle(result.grad)
-        return {
-            "__ipc__": True,
-            "ipc_handle": handle,
-            "gpu_id": gpu_id,
-            "event_handle": event_handle,
-            "meta": result.meta,
-        }
+        super().backward_step(stage_name, downstream_grad, microbatch_id=microbatch_id)
+        return super().create_ipc_for_grad(stage_name, microbatch_id=microbatch_id)
 
-    def backward_from_ipc(self, stage_name, ipc_data):
+    def backward_from_ipc(self, stage_name, ipc_data, microbatch_id: int | None = None):
         """Reconstruct grad from IPC and run backward. Return True (void)."""
-        from python.ray.tensor_transfer import reconstruct_tensor_from_ipc
-        from python.ray.utils import get_physical_gpu_id
-        tensor = reconstruct_tensor_from_ipc(
-            ipc_data["ipc_handle"],
-            get_physical_gpu_id(),
-            ipc_data["gpu_id"],
-            ipc_data.get("event_handle"),
-        )
-        grad = StageGradients(grad=tensor, meta=ipc_data.get("meta"))
-        super().backward_step(stage_name, grad)
+        super().backward_from_ipc(stage_name, ipc_data, microbatch_id=microbatch_id)
         return True  # void return — no tensor serialization
 
 
@@ -116,10 +83,12 @@ def run_fused_variant(name, config, attn_sd, moe_sd, data, labels):
 
         attn_actor = plan.stage_to_actor_group["attn"].actors[0]
         moe_actor = plan.stage_to_actor_group["moe"].actors[0]
-        ray.get([
-            a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for a in plan.stage_to_actor_group["attn"].actors
-        ])
+        ray.get(
+            [
+                a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
+                for a in plan.stage_to_actor_group["attn"].actors
+            ]
+        )
 
         dummy_mb = torch.zeros(1, 1, 1, dtype=DTYPE)
         mb_labels_list = list(labels.chunk(NUM_MICROBATCHES, dim=0))
@@ -129,11 +98,11 @@ def run_fused_variant(name, config, attn_sd, moe_sd, data, labels):
             for mb_i in range(NUM_MICROBATCHES):
                 # 4 calls per microbatch (fused IPC)
                 ipc_ref = attn_actor.forward_step_ipc.remote(
-                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i]
+                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i], mb_i
                 )
-                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i])
-                grad_ipc_ref = moe_actor.backward_step_ipc.remote("moe", None)
-                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref)
+                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i], mb_i)
+                grad_ipc_ref = moe_actor.backward_step_ipc.remote("moe", None, mb_i)
+                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref, mb_i)
 
             # Post-schedule: loss, grad_norm, optimizer
             ray.get(moe_actor.get_last_loss.remote("moe"))
@@ -150,11 +119,11 @@ def run_fused_variant(name, config, attn_sd, moe_sd, data, labels):
 
             for mb_i in range(NUM_MICROBATCHES):
                 ipc_ref = attn_actor.forward_step_ipc.remote(
-                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i]
+                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i], mb_i
                 )
-                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i])
-                grad_ipc_ref = moe_actor.backward_step_ipc.remote("moe", None)
-                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref)
+                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i], mb_i)
+                grad_ipc_ref = moe_actor.backward_step_ipc.remote("moe", None, mb_i)
+                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref, mb_i)
 
             loss = ray.get(moe_actor.get_last_loss.remote("moe"))
             ray.get(attn_actor.compute_grad_norm_sq.remote("attn"))
@@ -192,10 +161,12 @@ def run_void_variant(name, config, attn_sd, moe_sd, data, labels):
 
         attn_actor = plan.stage_to_actor_group["attn"].actors[0]
         moe_actor = plan.stage_to_actor_group["moe"].actors[0]
-        ray.get([
-            a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for a in plan.stage_to_actor_group["attn"].actors
-        ])
+        ray.get(
+            [
+                a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
+                for a in plan.stage_to_actor_group["attn"].actors
+            ]
+        )
 
         dummy_mb = torch.zeros(1, 1, 1, dtype=DTYPE)
         mb_labels_list = list(labels.chunk(NUM_MICROBATCHES, dim=0))
@@ -205,13 +176,13 @@ def run_void_variant(name, config, attn_sd, moe_sd, data, labels):
             for mb_i in range(NUM_MICROBATCHES):
                 # 6 calls per microbatch (separate IPC, void returns)
                 attn_actor.forward_step_ipc.remote(
-                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i]
+                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i], mb_i
                 )  # returns IPC dict (small) but we don't use this ref
-                ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i])
-                moe_actor.backward_step_ipc.remote("moe", None)
-                grad_ipc_ref = moe_actor.create_ipc_for_grad.remote("moe")
-                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref)
+                ipc_ref = attn_actor.create_ipc_for_output.remote("attn", mb_i)
+                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i], mb_i)
+                moe_actor.backward_step_ipc.remote("moe", None, mb_i)
+                grad_ipc_ref = moe_actor.create_ipc_for_grad.remote("moe", mb_i)
+                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref, mb_i)
 
             ray.get(moe_actor.get_last_loss.remote("moe"))
             ray.get(attn_actor.compute_grad_norm_sq.remote("attn"))
@@ -226,13 +197,13 @@ def run_void_variant(name, config, attn_sd, moe_sd, data, labels):
 
             for mb_i in range(NUM_MICROBATCHES):
                 attn_actor.forward_step_ipc.remote(
-                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i]
+                    "attn", StageOutputs(activations=dummy_mb), mb_labels_list[mb_i], mb_i
                 )
-                ipc_ref = attn_actor.create_ipc_for_output.remote("attn")
-                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i])
-                moe_actor.backward_step_ipc.remote("moe", None)
-                grad_ipc_ref = moe_actor.create_ipc_for_grad.remote("moe")
-                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref)
+                ipc_ref = attn_actor.create_ipc_for_output.remote("attn", mb_i)
+                moe_actor.forward_from_ipc.remote("moe", ipc_ref, mb_labels_list[mb_i], mb_i)
+                moe_actor.backward_step_ipc.remote("moe", None, mb_i)
+                grad_ipc_ref = moe_actor.create_ipc_for_grad.remote("moe", mb_i)
+                attn_actor.backward_from_ipc.remote("attn", grad_ipc_ref, mb_i)
 
             loss = ray.get(moe_actor.get_last_loss.remote("moe"))
             ray.get(attn_actor.compute_grad_norm_sq.remote("attn"))
@@ -270,13 +241,23 @@ def main():
     # --- Fused IPC (4 calls/mb) ---
     print("\n=== Fused IPC (4 calls/microbatch) ===")
     times_fused, losses_fused = run_fused_variant(
-        "fused", config, attn_sd, moe_sd, data, labels,
+        "fused",
+        config,
+        attn_sd,
+        moe_sd,
+        data,
+        labels,
     )
 
     # --- Separate IPC (6 calls/mb) ---
     print("\n=== Separate IPC (6 calls/microbatch) ===")
     times_separate, losses_separate = run_void_variant(
-        "separate", config, attn_sd, moe_sd, data, labels,
+        "separate",
+        config,
+        attn_sd,
+        moe_sd,
+        data,
+        labels,
     )
 
     # --- Report ---

@@ -20,8 +20,8 @@ from examples.attn_moe_overlap.model_utils import (
     generate_dummy_batch,
 )
 from examples.attn_moe_overlap.step6_mps_overlap import (
-    BATCH_SIZE,
     BASE_LR,
+    BATCH_SIZE,
     DTYPE,
     NUM_CLASSES,
     NUM_MICROBATCHES,
@@ -38,19 +38,19 @@ from python.ray.payloads import StageOutputs
 class InstrumentedActor(BenchmarkMultiStageActor):
     """Actor with void variants of forward/backward that skip return serialization."""
 
-    def forward_step_void(self, stage_name, inputs=None, labels=None):
+    def forward_step_void(self, stage_name, inputs=None, labels=None, microbatch_id: int | None = None):
         """Run forward but return True instead of the full tensor."""
-        super().forward_step(stage_name, inputs, labels)
+        super().forward_step(stage_name, inputs, labels, microbatch_id=microbatch_id)
         return True
 
-    def backward_step_void(self, stage_name, downstream_grad=None):
+    def backward_step_void(self, stage_name, downstream_grad=None, microbatch_id: int | None = None):
         """Run backward but return True instead of the full gradient."""
-        super().backward_step(stage_name, downstream_grad)
+        super().backward_step(stage_name, downstream_grad, microbatch_id=microbatch_id)
         return True
 
-    def create_ipc_and_forward_void(self, stage_name, ipc_data, labels=None):
+    def create_ipc_and_forward_void(self, stage_name, ipc_data, labels=None, microbatch_id: int | None = None):
         """forward_from_ipc but return True."""
-        super().forward_from_ipc(stage_name, ipc_data, labels)
+        super().forward_from_ipc(stage_name, ipc_data, labels, microbatch_id=microbatch_id)
         return True
 
     def noop(self):
@@ -92,19 +92,21 @@ def main():
 
         attn_actor = plan.stage_to_actor_group["attn"].actors[0]
         moe_actor = plan.stage_to_actor_group["moe"].actors[0]
-        ray.get([
-            a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
-            for a in plan.stage_to_actor_group["attn"].actors
-        ])
+        ray.get(
+            [
+                a.preload_data.remote("attn", data, labels, NUM_MICROBATCHES)
+                for a in plan.stage_to_actor_group["attn"].actors
+            ]
+        )
 
         # Warmup (run full chain a few times)
         for _ in range(5):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
-            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
-            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc, mb_labels))
-            ray.get(moe_actor.backward_step.remote("moe", None))
-            ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
-            ray.get(attn_actor.backward_step.remote("attn", ipc_g))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
+            ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
+            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc, mb_labels, 0))
+            ray.get(moe_actor.backward_step.remote("moe", None, 0))
+            ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
+            ray.get(attn_actor.backward_step.remote("attn", ipc_g, 0))
 
         results = {}
 
@@ -125,38 +127,38 @@ def main():
         # Normal: returns StageOutputs with (1, 8192, 2048) bf16 = 33.6 MB
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
+            ray.get(attn_actor.forward_step.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
         t1 = time.perf_counter()
         results["attn.forward (returns 33.6MB)"] = (t1 - t0) / N * 1000
 
         # Void: same compute, returns True
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.forward_step_void.remote("attn", StageOutputs(activations=dummy_mb), mb_labels))
+            ray.get(attn_actor.forward_step_void.remote("attn", StageOutputs(activations=dummy_mb), mb_labels, 0))
         t1 = time.perf_counter()
         results["attn.forward_void (returns True)"] = (t1 - t0) / N * 1000
 
         # === IPC: create handle ===
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.create_ipc_for_output.remote("attn"))
+            ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
         t1 = time.perf_counter()
         results["attn.create_ipc_for_output"] = (t1 - t0) / N * 1000
 
         # === FORWARD: moe (from IPC) ===
-        ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn"))
+        ipc = ray.get(attn_actor.create_ipc_for_output.remote("attn", 0))
 
         # Normal: returns StageOutputs with (1, 10) bf16 = 20 bytes (tiny — moe output is logits)
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc, mb_labels))
+            ray.get(moe_actor.forward_from_ipc.remote("moe", ipc, mb_labels, 0))
         t1 = time.perf_counter()
         results["moe.forward_from_ipc (returns logits)"] = (t1 - t0) / N * 1000
 
         # Void: same compute, returns True
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.create_ipc_and_forward_void.remote("moe", ipc, mb_labels))
+            ray.get(moe_actor.create_ipc_and_forward_void.remote("moe", ipc, mb_labels, 0))
         t1 = time.perf_counter()
         results["moe.forward_void (returns True)"] = (t1 - t0) / N * 1000
 
@@ -164,38 +166,38 @@ def main():
         # Normal: returns StageGradients with grad (1, 8192, 2048) bf16 = 33.6 MB
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.backward_step.remote("moe", None))
+            ray.get(moe_actor.backward_step.remote("moe", None, 0))
         t1 = time.perf_counter()
         results["moe.backward (returns 33.6MB grad)"] = (t1 - t0) / N * 1000
 
         # Void: same compute, returns True
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.backward_step_void.remote("moe", None))
+            ray.get(moe_actor.backward_step_void.remote("moe", None, 0))
         t1 = time.perf_counter()
         results["moe.backward_void (returns True)"] = (t1 - t0) / N * 1000
 
         # === IPC: create grad handle ===
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
+            ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
         t1 = time.perf_counter()
         results["moe.create_ipc_for_grad"] = (t1 - t0) / N * 1000
 
         # === BACKWARD: attn (non-terminal, receives IPC grad) ===
-        ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe"))
+        ipc_g = ray.get(moe_actor.create_ipc_for_grad.remote("moe", 0))
 
         # Normal: returns StageGradients with grad (1, 8192, 2048) bf16 = 33.6 MB
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.backward_step.remote("attn", ipc_g))
+            ray.get(attn_actor.backward_step.remote("attn", ipc_g, 0))
         t1 = time.perf_counter()
         results["attn.backward (returns 33.6MB grad)"] = (t1 - t0) / N * 1000
 
         # Void: same compute, returns True
         t0 = time.perf_counter()
         for _ in range(N):
-            ray.get(attn_actor.backward_step_void.remote("attn", ipc_g))
+            ray.get(attn_actor.backward_step_void.remote("attn", ipc_g, 0))
         t1 = time.perf_counter()
         results["attn.backward_void (returns True)"] = (t1 - t0) / N * 1000
 
