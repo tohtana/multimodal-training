@@ -214,7 +214,9 @@ def _worker_main(
         first_nonfinite: dict[str, Any] | None = None
         all_finite = True
 
-        cuda_ms_values: list[float] = []
+        # `cuda` is intentionally forward-only for table comparability with same-process harness.
+        fwd_cuda_ms_values: list[float] = []
+        total_cuda_ms_values: list[float] = []
         step_ms_values: list[float] = []
         timed_phase_enqueue_start: float | None = None
         timed_phase_enqueue_end: float | None = None
@@ -231,14 +233,18 @@ def _worker_main(
             seed_everything(int(payload["iter_seed_base"]) + iter_idx)
             model.zero_grad(set_to_none=True)
 
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            total_start_event = torch.cuda.Event(enable_timing=True)
+            total_end_event = torch.cuda.Event(enable_timing=True)
+            fwd_start_event = torch.cuda.Event(enable_timing=True)
+            fwd_end_event = torch.cuda.Event(enable_timing=True)
 
             iter_start = time.perf_counter()
             enqueue_start = time.perf_counter()
-            start_event.record()
+            total_start_event.record()
 
+            fwd_start_event.record()
             output = model(hidden_states)
+            fwd_end_event.record()
             if role == "attn":
                 loss = output.float().mean()
             else:
@@ -246,14 +252,15 @@ def _worker_main(
                 loss = loss_fn(output.float(), labels)
             loss.backward()
 
-            end_event.record()
+            total_end_event.record()
             enqueue_end = time.perf_counter()
             torch.cuda.synchronize(gpu_id)
             iter_end = time.perf_counter()
 
             if iter_idx >= warmup_iters:
                 step_ms_values.append((iter_end - iter_start) * 1000.0)
-                cuda_ms_values.append(float(start_event.elapsed_time(end_event)))
+                fwd_cuda_ms_values.append(float(fwd_start_event.elapsed_time(fwd_end_event)))
+                total_cuda_ms_values.append(float(total_start_event.elapsed_time(total_end_event)))
                 if timed_phase_enqueue_start is None:
                     timed_phase_enqueue_start = enqueue_start
                 timed_phase_enqueue_end = enqueue_end
@@ -289,7 +296,13 @@ def _worker_main(
                 },
                 "timing_ms": {
                     "step_total": float(sum(step_ms_values) / len(step_ms_values)) if step_ms_values else None,
-                    "cuda": float(sum(cuda_ms_values) / len(cuda_ms_values)) if cuda_ms_values else None,
+                    "cuda": float(sum(fwd_cuda_ms_values) / len(fwd_cuda_ms_values)) if fwd_cuda_ms_values else None,
+                    "cuda_forward": float(sum(fwd_cuda_ms_values) / len(fwd_cuda_ms_values))
+                    if fwd_cuda_ms_values
+                    else None,
+                    "cuda_total": float(sum(total_cuda_ms_values) / len(total_cuda_ms_values))
+                    if total_cuda_ms_values
+                    else None,
                 },
                 "enqueue_start": timed_phase_enqueue_start,
                 "enqueue_end": timed_phase_enqueue_end,
