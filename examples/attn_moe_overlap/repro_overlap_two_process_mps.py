@@ -239,12 +239,13 @@ def _worker_main(
             fwd_end_event = torch.cuda.Event(enable_timing=True)
 
             iter_start = time.perf_counter()
-            enqueue_start = time.perf_counter()
             total_start_event.record()
 
+            enqueue_start = time.perf_counter()
             fwd_start_event.record()
             output = model(hidden_states)
             fwd_end_event.record()
+            enqueue_end = time.perf_counter()
             if role == "attn":
                 loss = output.float().mean()
             else:
@@ -253,7 +254,6 @@ def _worker_main(
             loss.backward()
 
             total_end_event.record()
-            enqueue_end = time.perf_counter()
             torch.cuda.synchronize(gpu_id)
             iter_end = time.perf_counter()
 
