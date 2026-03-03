@@ -17,36 +17,9 @@ from typing import Any
 
 import torch
 
-from examples.attn_moe_overlap.megatron_overlap_schema import (
-    build_case_id,
-    build_case_payload,
-    build_invalid_environment_payload,
-    build_matrix_summary,
-    canonical_nccl_tuple,
-    case_output_path,
-    compute_host_enqueue_overlap_ms,
-    compute_speedup,
-    evaluate_stage_diff,
-    is_terminal_status,
-    normalize_dtype_name,
-    parse_dtypes,
-    parse_gpu_ids,
-    parse_nccl_tuples,
-    parse_seq_lens,
-    should_retry,
-    should_skip_existing,
-    tolerance_for_dtype,
-    validate_case_payload,
-    write_case_json,
-    write_json_atomic,
-    write_matrix_summary,
-    write_matrix_summary_markdown,
-    load_case_payload,
-)
 
-
-def _bootstrap_local_pythonpath() -> list[str]:
-    """Add sibling repo roots (Megatron-LM/ms-swift) when available."""
+def _early_bootstrap_local_pythonpath() -> list[str]:
+    """Ensure sibling repo roots are importable during spawn-time module re-import."""
     project_root = Path(__file__).resolve().parents[3]
     candidates = [
         project_root / "multimodal-training",
@@ -69,6 +42,71 @@ def _bootstrap_local_pythonpath() -> list[str]:
             merged_parts.append(existing)
         os.environ["PYTHONPATH"] = ":".join(merged_parts)
     return added_paths
+
+
+# Spawn workers re-import this module before calling main(); bootstrap early so the
+# imports below resolve in child processes as well.
+_early_bootstrap_local_pythonpath()
+
+try:
+    from examples.attn_moe_overlap.megatron_overlap_schema import (
+        build_case_id,
+        build_case_payload,
+        build_invalid_environment_payload,
+        build_matrix_summary,
+        canonical_nccl_tuple,
+        case_output_path,
+        compute_host_enqueue_overlap_ms,
+        compute_speedup,
+        evaluate_stage_diff,
+        is_terminal_status,
+        normalize_dtype_name,
+        parse_dtypes,
+        parse_gpu_ids,
+        parse_nccl_tuples,
+        parse_seq_lens,
+        should_retry,
+        should_skip_existing,
+        tolerance_for_dtype,
+        validate_case_payload,
+        write_case_json,
+        write_json_atomic,
+        write_matrix_summary,
+        write_matrix_summary_markdown,
+        load_case_payload,
+    )
+except ModuleNotFoundError:
+    from megatron_overlap_schema import (  # type: ignore[no-redef]
+        build_case_id,
+        build_case_payload,
+        build_invalid_environment_payload,
+        build_matrix_summary,
+        canonical_nccl_tuple,
+        case_output_path,
+        compute_host_enqueue_overlap_ms,
+        compute_speedup,
+        evaluate_stage_diff,
+        is_terminal_status,
+        normalize_dtype_name,
+        parse_dtypes,
+        parse_gpu_ids,
+        parse_nccl_tuples,
+        parse_seq_lens,
+        should_retry,
+        should_skip_existing,
+        tolerance_for_dtype,
+        validate_case_payload,
+        write_case_json,
+        write_json_atomic,
+        write_matrix_summary,
+        write_matrix_summary_markdown,
+        load_case_payload,
+    )
+
+
+def _bootstrap_local_pythonpath() -> list[str]:
+    """Add sibling repo roots (Megatron-LM/ms-swift) when available."""
+    return _early_bootstrap_local_pythonpath()
 
 
 def _find_free_port() -> int:
@@ -375,12 +413,20 @@ def _worker_main(
     mps_env: dict[str, str],
     result_queue: mp.Queue,
 ) -> None:
-    from examples.attn_moe_overlap.megatron_layer_runtime import (
-        RuntimeConfig,
-        MegatronSingleLayerRuntime,
-        cleanup_distributed_state,
-        classify_exception,
-    )
+    try:
+        from examples.attn_moe_overlap.megatron_layer_runtime import (
+            RuntimeConfig,
+            MegatronSingleLayerRuntime,
+            cleanup_distributed_state,
+            classify_exception,
+        )
+    except ModuleNotFoundError:
+        from megatron_layer_runtime import (  # type: ignore[no-redef]
+            RuntimeConfig,
+            MegatronSingleLayerRuntime,
+            cleanup_distributed_state,
+            classify_exception,
+        )
 
     status = "ok"
     payload: dict[str, Any] = {}
@@ -443,6 +489,10 @@ def _launch_workers(
     timeout_s: float,
     mps_env: dict[str, str],
 ) -> dict[str, Any]:
+    # Pre-spawn sys.path is what child processes inherit; restore local roots in case
+    # imports done earlier (e.g., swift.megatron) rewrote path ordering.
+    _bootstrap_local_pythonpath()
+
     result_queue: mp.Queue = mp.Queue()
     processes: list[mp.Process] = []
     expected = 0

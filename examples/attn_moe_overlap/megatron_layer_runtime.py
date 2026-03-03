@@ -10,10 +10,16 @@ from typing import Any
 
 import torch
 
-from examples.attn_moe_overlap.megatron_overlap_schema import (
-    normalize_dtype_name,
-    tensor_signature,
-)
+try:
+    from examples.attn_moe_overlap.megatron_overlap_schema import (
+        normalize_dtype_name,
+        tensor_signature,
+    )
+except ModuleNotFoundError:
+    from megatron_overlap_schema import (  # type: ignore[no-redef]
+        normalize_dtype_name,
+        tensor_signature,
+    )
 
 
 def _trainer_dtype_name(dtype: str) -> str:
@@ -266,4 +272,3 @@ def classify_exception(exc: BaseException) -> tuple[str, dict[str, Any]]:
             "traceback": traceback.format_exc(),
         },
     )
-
