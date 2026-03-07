@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 from threading import BrokenBarrierError
@@ -172,6 +173,9 @@ class MegatronSingleLayerRuntime:
         warmup_iters: int,
         timed_iters: int,
         iteration_barrier: Any | None = None,
+        profiler_trace_dir: str | None = None,
+        profiler_worker_name: str | None = None,
+        profiler_active_timed_iters: int | None = None,
     ) -> dict[str, Any]:
         if self.layer is None or self.hidden_states is None or self.attention_mask is None:
             self.initialize()
@@ -191,56 +195,94 @@ class MegatronSingleLayerRuntime:
         timed_end_s: float | None = None
         first_nonfinite: dict[str, Any] | None = None
         output_tensor: torch.Tensor | None = None
+        profiler: Any | None = None
 
         import torch.distributed as dist
 
-        for iter_idx in range(total_iters):
-            # Keep attn/MoE in lockstep across iterations so the next iteration
-            # does not begin until all workers from the current iteration finish.
-            if iteration_barrier is not None:
-                try:
-                    iteration_barrier.wait()
-                except BrokenBarrierError as exc:
-                    raise RuntimeError("Iteration barrier broke before iteration start") from exc
+        try:
+            if profiler_trace_dir is not None:
+                os.makedirs(profiler_trace_dir, exist_ok=True)
+                active_timed_iters = int(profiler_active_timed_iters or timed_iters)
+                active_timed_iters = max(1, min(int(timed_iters), active_timed_iters))
+                profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    schedule=torch.profiler.schedule(
+                        wait=int(warmup_iters),
+                        warmup=0,
+                        active=active_timed_iters,
+                        repeat=1,
+                    ),
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                        profiler_trace_dir,
+                        worker_name=profiler_worker_name,
+                    ),
+                    record_shapes=True,
+                    with_stack=False,
+                )
+                profiler.__enter__()
 
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
+            for iter_idx in range(total_iters):
+                # Keep attn/MoE in lockstep across iterations so the next iteration
+                # does not begin until all workers from the current iteration finish.
+                if iteration_barrier is not None:
+                    try:
+                        iteration_barrier.wait()
+                    except BrokenBarrierError as exc:
+                        raise RuntimeError("Iteration barrier broke before iteration start") from exc
 
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
 
-            step_start = time.perf_counter()
-            start_event.record()
-            enqueue_start = time.perf_counter()
-            with torch.no_grad():
-                if self.config.stage_role == "attn":
-                    output_tensor, _ = self.layer._forward_attention(
-                        self.hidden_states,
-                        attention_mask=self.attention_mask,
-                    )
-                else:
-                    output_tensor = self.layer._forward_mlp(self.hidden_states, inference_context=None)
-            enqueue_end = time.perf_counter()
-            end_event.record()
-            torch.cuda.synchronize(self.device)
-            step_end = time.perf_counter()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
 
-            if iter_idx >= warmup_iters:
-                if timed_start_s is None:
-                    timed_start_s = step_start
-                cuda_ms.append(float(start_event.elapsed_time(end_event)))
-                step_ms.append((step_end - step_start) * 1000.0)
-                enqueue_windows.append((enqueue_start, enqueue_end))
-                timed_end_s = step_end
+                step_start = time.perf_counter()
+                start_event.record()
+                enqueue_start = time.perf_counter()
+                record_ctx = (
+                    torch.profiler.record_function(f"{self.config.stage_role}.iter_{iter_idx:04d}")
+                    if profiler is not None
+                    else nullcontext()
+                )
+                with record_ctx:
+                    with torch.no_grad():
+                        if self.config.stage_role == "attn":
+                            output_tensor, _ = self.layer._forward_attention(
+                                self.hidden_states,
+                                attention_mask=self.attention_mask,
+                            )
+                        else:
+                            output_tensor = self.layer._forward_mlp(self.hidden_states, inference_context=None)
+                enqueue_end = time.perf_counter()
+                end_event.record()
+                torch.cuda.synchronize(self.device)
+                step_end = time.perf_counter()
 
-            if first_nonfinite is None and output_tensor is not None and torch.is_floating_point(output_tensor):
-                if not torch.isfinite(output_tensor).all():
-                    first_nonfinite = {
-                        "module": f"{self.config.stage_role}_layer",
-                        "phase": "forward",
-                        "tensor": "output",
-                        "iter": int(iter_idx),
-                    }
+                if iter_idx >= warmup_iters:
+                    if timed_start_s is None:
+                        timed_start_s = step_start
+                    cuda_ms.append(float(start_event.elapsed_time(end_event)))
+                    step_ms.append((step_end - step_start) * 1000.0)
+                    enqueue_windows.append((enqueue_start, enqueue_end))
+                    timed_end_s = step_end
+
+                if first_nonfinite is None and output_tensor is not None and torch.is_floating_point(output_tensor):
+                    if not torch.isfinite(output_tensor).all():
+                        first_nonfinite = {
+                            "module": f"{self.config.stage_role}_layer",
+                            "phase": "forward",
+                            "tensor": "output",
+                            "iter": int(iter_idx),
+                        }
+
+                if profiler is not None:
+                    profiler.step()
+        finally:
+            if profiler is not None:
+                profiler.__exit__(None, None, None)
 
         mean_cuda_ms = float(sum(cuda_ms) / len(cuda_ms)) if cuda_ms else None
         mean_step_ms = float(sum(step_ms) / len(step_ms)) if step_ms else None

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import os
-import queue
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +114,17 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
         return int(sock.getsockname()[1])
+
+
+def _worker_result_path(worker_result_dir: Path, role: str, rank: int) -> Path:
+    return worker_result_dir / f"{role}_rank{rank}.json"
+
+
+def _load_worker_results(worker_result_dir: Path) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for path in sorted(worker_result_dir.glob("*.json")):
+        results.append(json.loads(path.read_text()))
+    return results
 
 
 def _classify_error_message(message: str) -> str:
@@ -265,6 +277,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-experts", type=int, default=None)
     parser.add_argument("--capture-nsys", choices=["on", "off"], default="off")
     parser.add_argument("--nsys-bin", type=str, default="nsys")
+    parser.add_argument("--capture-torch-profiler", choices=["on", "off"], default="off")
+    parser.add_argument("--torch-profiler-active-iters", type=int, default=5)
+    parser.add_argument("--torch-profiler-trace-dir", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-mode", choices=["serial", "overlap"], default=None)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--rerun-existing", action="store_true")
@@ -412,7 +427,9 @@ def _worker_main(
     nccl_tuple: tuple[int, int, int],
     mps_env: dict[str, str],
     iteration_barrier: Any | None,
-    result_queue: mp.Queue,
+    profiler_trace_root: str | None,
+    profiler_active_timed_iters: int | None,
+    worker_result_dir: str,
 ) -> None:
     try:
         from examples.attn_moe_overlap.megatron_layer_runtime import (
@@ -463,6 +480,9 @@ def _worker_main(
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
             iteration_barrier=iteration_barrier,
+            profiler_trace_dir=str(Path(profiler_trace_root)) if profiler_trace_root is not None else None,
+            profiler_worker_name=f"{role}_rank{rank}_gpu{gpu_id}",
+            profiler_active_timed_iters=profiler_active_timed_iters,
         )
         status = payload.get("status", "runtime_error")
     except Exception as exc:
@@ -478,13 +498,14 @@ def _worker_main(
         }
     finally:
         cleanup_distributed_state()
-        result_queue.put(
+        write_json_atomic(
+            _worker_result_path(Path(worker_result_dir), role, rank),
             {
                 "role": role,
                 "rank": rank,
                 "status": status,
                 **payload,
-            }
+            },
         )
 
 
@@ -499,73 +520,84 @@ def _launch_workers(
     # imports done earlier (e.g., swift.megatron) rewrote path ordering.
     _bootstrap_local_pythonpath()
 
-    result_queue: mp.Queue = mp.Queue()
     processes: list[mp.Process] = []
+    worker_result_dir = Path(tempfile.mkdtemp(prefix="step7_worker_results_"))
     expected = 0
     for spec in stage_specs:
         expected += len(spec["gpu_ids"])
     iteration_barrier = mp.Barrier(expected) if expected > 0 else None
-    for spec in stage_specs:
-        for rank, gpu_id in enumerate(spec["gpu_ids"]):
-            process = mp.Process(
-                target=_worker_main,
-                kwargs={
-                    "role": spec["role"],
-                    "rank": rank,
-                    "world_size": spec["world_size"],
-                    "gpu_id": gpu_id,
-                    "master_addr": "127.0.0.1",
-                    "master_port": spec["master_port"],
-                    "model_name": common_config["model_name"],
-                    "model_type": common_config["model_type"],
-                    "dtype": common_config["dtype"],
-                    "seq_len": common_config["seq_len"],
-                    "batch_size": common_config["batch_size"],
-                    "seed": common_config["seed"],
-                    "warmup_iters": common_config["warmup_iters"],
-                    "timed_iters": common_config["timed_iters"],
-                    "moe_ep_size": common_config["moe_ep_size"],
-                    "num_experts": common_config["num_experts"],
-                    "nccl_tuple": common_config["nccl_tuple"],
-                    "mps_env": mps_env,
-                    "iteration_barrier": iteration_barrier,
-                    "result_queue": result_queue,
-                },
-            )
-            process.start()
-            processes.append(process)
+    try:
+        for spec in stage_specs:
+            for rank, gpu_id in enumerate(spec["gpu_ids"]):
+                process = mp.Process(
+                    target=_worker_main,
+                    kwargs={
+                        "role": spec["role"],
+                        "rank": rank,
+                        "world_size": spec["world_size"],
+                        "gpu_id": gpu_id,
+                        "master_addr": "127.0.0.1",
+                        "master_port": spec["master_port"],
+                        "model_name": common_config["model_name"],
+                        "model_type": common_config["model_type"],
+                        "dtype": common_config["dtype"],
+                        "seq_len": common_config["seq_len"],
+                        "batch_size": common_config["batch_size"],
+                        "seed": common_config["seed"],
+                        "warmup_iters": common_config["warmup_iters"],
+                        "timed_iters": common_config["timed_iters"],
+                        "moe_ep_size": common_config["moe_ep_size"],
+                        "num_experts": common_config["num_experts"],
+                        "nccl_tuple": common_config["nccl_tuple"],
+                        "mps_env": mps_env,
+                        "iteration_barrier": iteration_barrier,
+                        "profiler_trace_root": common_config.get("profiler_trace_root"),
+                        "profiler_active_timed_iters": common_config.get("profiler_active_timed_iters"),
+                        "worker_result_dir": str(worker_result_dir),
+                    },
+                )
+                process.start()
+                processes.append(process)
 
-    results: list[dict[str, Any]] = []
-    deadline = time.time() + timeout_s
-    while len(results) < expected and time.time() < deadline:
-        remaining = max(0.1, deadline - time.time())
-        try:
-            results.append(result_queue.get(timeout=remaining))
-        except queue.Empty:
-            continue
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            results = _load_worker_results(worker_result_dir)
+            if len(results) >= expected:
+                break
+            if processes and all(not process.is_alive() for process in processes):
+                break
+            time.sleep(0.1)
 
-    timed_out = len(results) < expected
-    if timed_out:
+        results = _load_worker_results(worker_result_dir)
+        timed_out = len(results) < expected and any(process.is_alive() for process in processes)
+        if timed_out:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+
         for process in processes:
+            process.join(timeout=3)
             if process.is_alive():
-                process.terminate()
+                process.kill()
 
-    for process in processes:
-        process.join(timeout=3)
-        if process.is_alive():
-            process.kill()
-
-    if timed_out:
-        return {
-            "status": "timeout",
-            "error": {
-                "code": "timeout",
-                "message": f"Timed out waiting for worker results ({len(results)}/{expected})",
-                "traceback": None,
-            },
-            "results": results,
-        }
-    return {"status": "ok", "results": results}
+        results = _load_worker_results(worker_result_dir)
+        if len(results) < expected:
+            exitcodes = {str(process.pid): process.exitcode for process in processes}
+            status = "timeout" if timed_out else "runtime_error"
+            return {
+                "status": status,
+                "error": {
+                    "code": status,
+                    "message": (
+                        f"Missing worker results ({len(results)}/{expected}); exitcodes={exitcodes}"
+                    ),
+                    "traceback": None,
+                },
+                "results": results,
+            }
+        return {"status": "ok", "results": results}
+    finally:
+        shutil.rmtree(worker_result_dir, ignore_errors=True)
 
 
 def _aggregate_stage_results(role: str, results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -987,6 +1019,125 @@ def _run_nsys_capture(
     return "ok"
 
 
+def _select_torch_profiler_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    serial_case = next((row for row in cases if row.get("mode") == "serial" and row.get("status") == "ok"), None)
+    overlap_case = next((row for row in cases if row.get("mode") == "overlap" and row.get("status") == "ok"), None)
+    if serial_case is not None:
+        selected.append(serial_case)
+    if overlap_case is not None:
+        selected.append(overlap_case)
+    return selected
+
+
+def _run_torch_profiler_capture(
+    *,
+    args: argparse.Namespace,
+    cases: list[dict[str, Any]],
+    attn_gpu_ids: list[int],
+    moe_gpu_ids: list[int],
+) -> str:
+    if args.capture_torch_profiler != "on":
+        return "off"
+
+    selected = _select_torch_profiler_cases(cases)
+    if not selected:
+        return "off"
+
+    profiler_root = Path(args.output_dir) / "torch_profiler"
+    profiler_root.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    step7_script = str(Path(__file__).resolve())
+    for row in selected:
+        trace_dir = profiler_root / row["case_id"]
+        rerun_output_dir = profiler_root / f"rerun_{row['case_id']}"
+        cmd = [
+            sys.executable,
+            step7_script,
+            "--model-name",
+            args.model_name,
+            "--model-type",
+            args.model_type,
+            "--attn-gpu-ids",
+            ",".join(str(gpu_id) for gpu_id in attn_gpu_ids),
+            "--moe-gpu-ids",
+            ",".join(str(gpu_id) for gpu_id in moe_gpu_ids),
+            "--attn-dp-size",
+            str(args.attn_dp_size),
+            "--moe-ep-size",
+            str(args.moe_ep_size),
+            "--seq-lens",
+            str(row["seq_len"]),
+            "--dtypes",
+            str(row["dtype"]),
+            "--single-mode",
+            str(row["mode"]),
+            "--nccl-tuples",
+            str(row["nccl"]["tuple"]),
+            "--seed",
+            str(args.seed),
+            "--batch-size",
+            str(args.batch_size),
+            "--warmup-iters",
+            str(args.warmup_iters),
+            "--timed-iters",
+            str(args.timed_iters),
+            "--worker-timeout-s",
+            str(args.worker_timeout_s),
+            "--output-dir",
+            str(rerun_output_dir),
+            "--capture-nsys",
+            "off",
+            "--capture-torch-profiler",
+            "off",
+            "--torch-profiler-trace-dir",
+            str(trace_dir),
+            "--torch-profiler-active-iters",
+            str(args.torch_profiler_active_iters),
+            "--rerun-existing",
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        trace_files = [str(path) for path in sorted(trace_dir.rglob("*.pt.trace.json"))]
+        entries.append(
+            {
+                "case_id": row["case_id"],
+                "mode": row["mode"],
+                "command": cmd,
+                "returncode": completed.returncode,
+                "stdout_tail": completed.stdout[-2000:],
+                "stderr_tail": completed.stderr[-2000:],
+                "trace_dir": str(trace_dir),
+                "trace_files": trace_files,
+                "tensorboard_logdir": str(trace_dir),
+                "rerun_output_dir": str(rerun_output_dir),
+            }
+        )
+        if completed.returncode != 0:
+            write_json_atomic(
+                profiler_root / "trace_index.json",
+                {
+                    "status": "torch_profiler_capture_failed",
+                    "active_timed_iters": int(args.torch_profiler_active_iters),
+                    "entries": entries,
+                },
+            )
+            return "torch_profiler_capture_failed"
+
+    write_json_atomic(
+        profiler_root / "trace_index.json",
+        {
+            "status": "ok",
+            "active_timed_iters": int(args.torch_profiler_active_iters),
+            "viewer": {
+                "type": "tensorboard",
+                "logdir": str(profiler_root),
+            },
+            "entries": entries,
+        },
+    )
+    return "ok"
+
+
 def main() -> int:
     args = _parse_args()
     mp.set_start_method("spawn", force=True)
@@ -1098,6 +1249,8 @@ def main() -> int:
                     "moe_ep_size": args.moe_ep_size,
                     "num_experts": args.num_experts,
                     "nccl_tuple": nccl_tuple,
+                    "profiler_trace_root": args.torch_profiler_trace_dir,
+                    "profiler_active_timed_iters": args.torch_profiler_active_iters,
                 }
 
                 attempt_count = 1
@@ -1210,6 +1363,12 @@ def main() -> int:
         attn_gpu_ids=attn_gpu_ids,
         moe_gpu_ids=moe_gpu_ids,
     )
+    torch_profiler_status = _run_torch_profiler_capture(
+        args=args,
+        cases=all_case_payloads,
+        attn_gpu_ids=attn_gpu_ids,
+        moe_gpu_ids=moe_gpu_ids,
+    )
     if nsys_status == "nsys_capture_failed":
         failed_case = build_case_payload(
             case_id="nsys_capture_failed",
@@ -1249,12 +1408,19 @@ def main() -> int:
         "batch_size": args.batch_size,
         "capture_nsys": args.capture_nsys,
         "nsys_status": nsys_status,
+        "capture_torch_profiler": args.capture_torch_profiler,
+        "torch_profiler_active_iters": args.torch_profiler_active_iters,
+        "torch_profiler_status": torch_profiler_status,
     }
     summary = build_matrix_summary(run_config=run_config, cases=all_case_payloads, total_points=total_points)
     write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
     write_matrix_summary_markdown(args.output_dir, summary)
 
-    return 1 if nsys_status == "nsys_capture_failed" else 0
+    if nsys_status == "nsys_capture_failed":
+        return 1
+    if torch_profiler_status == "torch_profiler_capture_failed":
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

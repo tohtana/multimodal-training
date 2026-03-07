@@ -1,7 +1,9 @@
 """CPU-only tests for step7 Megatron EP overlap schema utilities."""
 
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,7 +25,11 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     validate_case_payload,
     validate_matrix_summary,
 )
-from examples.attn_moe_overlap.step7_megatron_ep_overlap import _collapse_timed_window_s
+from examples.attn_moe_overlap.step7_megatron_ep_overlap import (
+    _collapse_timed_window_s,
+    _run_torch_profiler_capture,
+    _select_torch_profiler_cases,
+)
 
 pytestmark = [pytest.mark.cpu_only]
 
@@ -87,6 +93,67 @@ def test_collapse_timed_window_spans_earliest_start_to_latest_end():
     assert window["start_s"] == pytest.approx(10.0)
     assert window["end_s"] == pytest.approx(11.0)
     assert window["duration_ms"] == pytest.approx(1000.0)
+
+
+def test_select_torch_profiler_cases_prefers_passing_serial_and_overlap():
+    serial = _sample_case_payload("case-serial", "serial", status="ok")
+    overlap = _sample_case_payload("case-overlap", "overlap", status="ok")
+    failed_overlap = _sample_case_payload("case-overlap-bad", "overlap", status="runtime_error")
+    selected = _select_torch_profiler_cases([failed_overlap, serial, overlap])
+    assert [row["case_id"] for row in selected] == ["case-serial", "case-overlap"]
+
+
+def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, capture_output, text):
+        del capture_output, text
+        calls.append(list(cmd))
+        trace_dir = Path(cmd[cmd.index("--torch-profiler-trace-dir") + 1])
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        (trace_dir / "worker0.pt.trace.json").write_text("{}")
+        return _Completed()
+
+    monkeypatch.setattr("examples.attn_moe_overlap.step7_megatron_ep_overlap.subprocess.run", _fake_run)
+
+    args = SimpleNamespace(
+        capture_torch_profiler="on",
+        output_dir=str(tmp_path / "out"),
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        attn_dp_size=4,
+        moe_ep_size=4,
+        seed=1234,
+        batch_size=1,
+        warmup_iters=1,
+        timed_iters=3,
+        worker_timeout_s=180.0,
+        torch_profiler_active_iters=2,
+    )
+    serial = _sample_case_payload("case-serial", "serial", status="ok")
+    overlap = _sample_case_payload("case-overlap", "overlap", status="ok")
+
+    status = _run_torch_profiler_capture(
+        args=args,
+        cases=[serial, overlap],
+        attn_gpu_ids=[0, 1, 2, 3],
+        moe_gpu_ids=[0, 1, 2, 3],
+    )
+
+    assert status == "ok"
+    assert len(calls) == 2
+    assert calls[0][0] == sys.executable
+    assert calls[0][1] == str((REPO_ROOT / "examples/attn_moe_overlap/step7_megatron_ep_overlap.py").resolve())
+    assert "-m" not in calls[0]
+
+    trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
+    assert trace_index["status"] == "ok"
+    assert all(entry["trace_files"] == [f"{entry['trace_dir']}/worker0.pt.trace.json"] for entry in trace_index["entries"])
 
 
 def test_case_id_is_deterministic_and_sensitive_to_nccl_tuple():
