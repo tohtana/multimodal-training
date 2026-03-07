@@ -411,7 +411,7 @@ def _worker_main(
     num_experts: int | None,
     nccl_tuple: tuple[int, int, int],
     mps_env: dict[str, str],
-    timed_start_barrier: Any | None,
+    iteration_barrier: Any | None,
     result_queue: mp.Queue,
 ) -> None:
     try:
@@ -462,7 +462,7 @@ def _worker_main(
         payload = runtime.run_stage(
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
-            timed_start_barrier=timed_start_barrier,
+            iteration_barrier=iteration_barrier,
         )
         status = payload.get("status", "runtime_error")
     except Exception as exc:
@@ -504,7 +504,7 @@ def _launch_workers(
     expected = 0
     for spec in stage_specs:
         expected += len(spec["gpu_ids"])
-    timed_start_barrier = mp.Barrier(expected) if expected > 0 else None
+    iteration_barrier = mp.Barrier(expected) if expected > 0 else None
     for spec in stage_specs:
         for rank, gpu_id in enumerate(spec["gpu_ids"]):
             process = mp.Process(
@@ -528,7 +528,7 @@ def _launch_workers(
                     "num_experts": common_config["num_experts"],
                     "nccl_tuple": common_config["nccl_tuple"],
                     "mps_env": mps_env,
-                    "timed_start_barrier": timed_start_barrier,
+                    "iteration_barrier": iteration_barrier,
                     "result_queue": result_queue,
                 },
             )

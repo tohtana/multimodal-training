@@ -171,7 +171,7 @@ class MegatronSingleLayerRuntime:
         *,
         warmup_iters: int,
         timed_iters: int,
-        timed_start_barrier: Any | None = None,
+        iteration_barrier: Any | None = None,
     ) -> dict[str, Any]:
         if self.layer is None or self.hidden_states is None or self.attention_mask is None:
             self.initialize()
@@ -195,11 +195,13 @@ class MegatronSingleLayerRuntime:
         import torch.distributed as dist
 
         for iter_idx in range(total_iters):
-            if iter_idx == warmup_iters and timed_start_barrier is not None:
+            # Keep attn/MoE in lockstep across iterations so the next iteration
+            # does not begin until all workers from the current iteration finish.
+            if iteration_barrier is not None:
                 try:
-                    timed_start_barrier.wait()
+                    iteration_barrier.wait()
                 except BrokenBarrierError as exc:
-                    raise RuntimeError("Timed-start barrier broke before timed iterations") from exc
+                    raise RuntimeError("Iteration barrier broke before iteration start") from exc
 
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
