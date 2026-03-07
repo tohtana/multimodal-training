@@ -25,6 +25,7 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     validate_case_payload,
     validate_matrix_summary,
 )
+from examples.attn_moe_overlap.megatron_layer_runtime import _resolve_profiler_schedule
 from examples.attn_moe_overlap.step7_megatron_ep_overlap import (
     _collapse_timed_window_s,
     _run_torch_profiler_capture,
@@ -103,6 +104,28 @@ def test_select_torch_profiler_cases_prefers_passing_serial_and_overlap():
     assert [row["case_id"] for row in selected] == ["case-serial", "case-overlap"]
 
 
+def test_resolve_profiler_schedule_defaults_wait_to_warmup():
+    wait_iters, active_iters = _resolve_profiler_schedule(
+        warmup_iters=100,
+        timed_iters=100,
+        profiler_wait_iters=None,
+        profiler_active_timed_iters=5,
+    )
+    assert wait_iters == 100
+    assert active_iters == 5
+
+
+def test_resolve_profiler_schedule_supports_independent_wait_iters():
+    wait_iters, active_iters = _resolve_profiler_schedule(
+        warmup_iters=100,
+        timed_iters=100,
+        profiler_wait_iters=12,
+        profiler_active_timed_iters=7,
+    )
+    assert wait_iters == 12
+    assert active_iters == 7
+
+
 def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypatch):
     calls: list[list[str]] = []
 
@@ -133,6 +156,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         warmup_iters=1,
         timed_iters=3,
         worker_timeout_s=180.0,
+        torch_profiler_wait_iters=11,
         torch_profiler_active_iters=2,
     )
     serial = _sample_case_payload("case-serial", "serial", status="ok")
@@ -150,6 +174,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert calls[0][0] == sys.executable
     assert calls[0][1] == str((REPO_ROOT / "examples/attn_moe_overlap/step7_megatron_ep_overlap.py").resolve())
     assert "-m" not in calls[0]
+    assert calls[0][calls[0].index("--torch-profiler-wait-iters") + 1] == "11"
 
     trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
     assert trace_index["status"] == "ok"

@@ -46,6 +46,22 @@ def _torch_dtype(dtype: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
+def _resolve_profiler_schedule(
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    profiler_wait_iters: int | None,
+    profiler_active_timed_iters: int | None,
+) -> tuple[int, int]:
+    wait_iters = int(warmup_iters if profiler_wait_iters is None else profiler_wait_iters)
+    if wait_iters < 0:
+        raise ValueError("profiler_wait_iters must be >= 0")
+
+    active_timed_iters = int(profiler_active_timed_iters or timed_iters)
+    active_timed_iters = max(1, min(int(timed_iters), active_timed_iters))
+    return wait_iters, active_timed_iters
+
+
 @dataclass
 class RuntimeConfig:
     model_name: str
@@ -175,6 +191,7 @@ class MegatronSingleLayerRuntime:
         iteration_barrier: Any | None = None,
         profiler_trace_dir: str | None = None,
         profiler_worker_name: str | None = None,
+        profiler_wait_iters: int | None = None,
         profiler_active_timed_iters: int | None = None,
     ) -> dict[str, Any]:
         if self.layer is None or self.hidden_states is None or self.attention_mask is None:
@@ -202,15 +219,19 @@ class MegatronSingleLayerRuntime:
         try:
             if profiler_trace_dir is not None:
                 os.makedirs(profiler_trace_dir, exist_ok=True)
-                active_timed_iters = int(profiler_active_timed_iters or timed_iters)
-                active_timed_iters = max(1, min(int(timed_iters), active_timed_iters))
+                wait_iters, active_timed_iters = _resolve_profiler_schedule(
+                    warmup_iters=int(warmup_iters),
+                    timed_iters=int(timed_iters),
+                    profiler_wait_iters=profiler_wait_iters,
+                    profiler_active_timed_iters=profiler_active_timed_iters,
+                )
                 profiler = torch.profiler.profile(
                     activities=[
                         torch.profiler.ProfilerActivity.CPU,
                         torch.profiler.ProfilerActivity.CUDA,
                     ],
                     schedule=torch.profiler.schedule(
-                        wait=int(warmup_iters),
+                        wait=wait_iters,
                         warmup=0,
                         active=active_timed_iters,
                         repeat=1,

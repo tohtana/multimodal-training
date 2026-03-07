@@ -278,6 +278,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-nsys", choices=["on", "off"], default="off")
     parser.add_argument("--nsys-bin", type=str, default="nsys")
     parser.add_argument("--capture-torch-profiler", choices=["on", "off"], default="off")
+    parser.add_argument(
+        "--torch-profiler-wait-iters",
+        type=int,
+        default=None,
+        help="Iterations to skip before profiler capture starts; defaults to warmup-iters when unset.",
+    )
     parser.add_argument("--torch-profiler-active-iters", type=int, default=5)
     parser.add_argument("--torch-profiler-trace-dir", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-mode", choices=["serial", "overlap"], default=None)
@@ -428,6 +434,7 @@ def _worker_main(
     mps_env: dict[str, str],
     iteration_barrier: Any | None,
     profiler_trace_root: str | None,
+    profiler_wait_iters: int | None,
     profiler_active_timed_iters: int | None,
     worker_result_dir: str,
 ) -> None:
@@ -482,6 +489,7 @@ def _worker_main(
             iteration_barrier=iteration_barrier,
             profiler_trace_dir=str(Path(profiler_trace_root)) if profiler_trace_root is not None else None,
             profiler_worker_name=f"{role}_rank{rank}_gpu{gpu_id}",
+            profiler_wait_iters=profiler_wait_iters,
             profiler_active_timed_iters=profiler_active_timed_iters,
         )
         status = payload.get("status", "runtime_error")
@@ -552,6 +560,7 @@ def _launch_workers(
                         "mps_env": mps_env,
                         "iteration_barrier": iteration_barrier,
                         "profiler_trace_root": common_config.get("profiler_trace_root"),
+                        "profiler_wait_iters": common_config.get("profiler_wait_iters"),
                         "profiler_active_timed_iters": common_config.get("profiler_active_timed_iters"),
                         "worker_result_dir": str(worker_result_dir),
                     },
@@ -1092,6 +1101,8 @@ def _run_torch_profiler_capture(
             "off",
             "--torch-profiler-trace-dir",
             str(trace_dir),
+            "--torch-profiler-wait-iters",
+            str(args.torch_profiler_wait_iters if args.torch_profiler_wait_iters is not None else args.warmup_iters),
             "--torch-profiler-active-iters",
             str(args.torch_profiler_active_iters),
             "--rerun-existing",
@@ -1250,6 +1261,7 @@ def main() -> int:
                     "num_experts": args.num_experts,
                     "nccl_tuple": nccl_tuple,
                     "profiler_trace_root": args.torch_profiler_trace_dir,
+                    "profiler_wait_iters": args.torch_profiler_wait_iters,
                     "profiler_active_timed_iters": args.torch_profiler_active_iters,
                 }
 
@@ -1409,6 +1421,7 @@ def main() -> int:
         "capture_nsys": args.capture_nsys,
         "nsys_status": nsys_status,
         "capture_torch_profiler": args.capture_torch_profiler,
+        "torch_profiler_wait_iters": args.torch_profiler_wait_iters,
         "torch_profiler_active_iters": args.torch_profiler_active_iters,
         "torch_profiler_status": torch_profiler_status,
     }
