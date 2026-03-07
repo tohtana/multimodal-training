@@ -23,6 +23,7 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     validate_case_payload,
     validate_matrix_summary,
 )
+from examples.attn_moe_overlap.step7_megatron_ep_overlap import _collapse_timed_window_s
 
 pytestmark = [pytest.mark.cpu_only]
 
@@ -56,7 +57,7 @@ def _sample_case_payload(case_id: str, mode: str, status: str = "ok") -> dict:
         seed=1234,
         topology=_sample_topology(),
         nccl_env=_sample_nccl(),
-        timing_ms={"total": 10.0, "attn": 4.0, "moe": 6.0},
+        timing_ms={"total": 10.0, "timed_wall": 8.0, "attn": 4.0, "moe": 6.0},
         overlap_ms=1.5,
         finite={"all_finite": True, "first_nonfinite": None},
         stage_signatures={
@@ -73,6 +74,19 @@ def _sample_case_payload(case_id: str, mode: str, status: str = "ok") -> dict:
         retry_trigger="none",
         artifact_path=f"/tmp/{case_id}.json",
     )
+
+
+def test_collapse_timed_window_spans_earliest_start_to_latest_end():
+    window = _collapse_timed_window_s(
+        [
+            {"start_s": 10.25, "end_s": 10.75},
+            {"start_s": 10.0, "end_s": 11.0},
+            {"start_s": None, "end_s": None},
+        ]
+    )
+    assert window["start_s"] == pytest.approx(10.0)
+    assert window["end_s"] == pytest.approx(11.0)
+    assert window["duration_ms"] == pytest.approx(1000.0)
 
 
 def test_case_id_is_deterministic_and_sensitive_to_nccl_tuple():
@@ -185,4 +199,3 @@ def test_resume_skip_behavior_honors_rerun_flag():
     payload = _sample_case_payload("case-existing", "serial", status="runtime_error")
     assert should_skip_existing(payload, rerun_existing=False) is True
     assert should_skip_existing(payload, rerun_existing=True) is False
-

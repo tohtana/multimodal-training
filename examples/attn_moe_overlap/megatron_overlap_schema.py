@@ -359,10 +359,13 @@ def build_case_payload(
         "seed": int(seed),
         "topology": topology,
         "nccl": nccl_env,
-        "timing_ms": timing_ms if timing_ms is not None else {"total": None, "attn": None, "moe": None},
+        "timing_ms": timing_ms
+        if timing_ms is not None
+        else {"total": None, "timed_wall": None, "attn": None, "moe": None},
         "overlap": {
             "host_enqueue_overlap_ms": float(overlap_ms) if overlap_ms is not None else 0.0,
             "speedup_vs_serial": None,
+            "timed_speedup_vs_serial": None,
         },
         "finite": finite
         if finite is not None
@@ -454,7 +457,7 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     if not isinstance(timing_ms, dict):
         errors.append("timing_ms must be an object")
     else:
-        for key in ("total", "attn", "moe"):
+        for key in ("total", "timed_wall", "attn", "moe"):
             if key not in timing_ms:
                 errors.append(f"timing_ms.{key} missing")
 
@@ -466,6 +469,8 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
             errors.append("overlap.host_enqueue_overlap_ms missing")
         if "speedup_vs_serial" not in overlap:
             errors.append("overlap.speedup_vs_serial missing")
+        if "timed_speedup_vs_serial" not in overlap:
+            errors.append("overlap.timed_speedup_vs_serial missing")
 
     finite = payload.get("finite")
     if not isinstance(finite, dict):
@@ -685,4 +690,3 @@ def write_matrix_summary_markdown(output_dir: str | Path, summary: dict[str, Any
     path = Path(output_dir) / "matrix_summary.md"
     _write_text_atomic(path, render_matrix_summary_markdown(summary))
     return path
-

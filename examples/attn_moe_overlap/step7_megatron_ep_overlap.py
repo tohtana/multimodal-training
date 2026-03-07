@@ -411,6 +411,7 @@ def _worker_main(
     num_experts: int | None,
     nccl_tuple: tuple[int, int, int],
     mps_env: dict[str, str],
+    timed_start_barrier: Any | None,
     result_queue: mp.Queue,
 ) -> None:
     try:
@@ -458,13 +459,18 @@ def _worker_main(
                 num_experts=num_experts,
             )
         )
-        payload = runtime.run_stage(warmup_iters=warmup_iters, timed_iters=timed_iters)
+        payload = runtime.run_stage(
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+            timed_start_barrier=timed_start_barrier,
+        )
         status = payload.get("status", "runtime_error")
     except Exception as exc:
         status, error = classify_exception(exc)
         payload = {
             "status": status,
-            "timing_ms": {"cuda": None, "step_total": None},
+            "timing_ms": {"cuda": None, "step_total": None, "timed_wall": None},
+            "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
             "enqueue_windows": [],
             "finite": {"all_finite": False, "first_nonfinite": None},
             "output_signature": None,
@@ -497,6 +503,9 @@ def _launch_workers(
     processes: list[mp.Process] = []
     expected = 0
     for spec in stage_specs:
+        expected += len(spec["gpu_ids"])
+    timed_start_barrier = mp.Barrier(expected) if expected > 0 else None
+    for spec in stage_specs:
         for rank, gpu_id in enumerate(spec["gpu_ids"]):
             process = mp.Process(
                 target=_worker_main,
@@ -519,12 +528,12 @@ def _launch_workers(
                     "num_experts": common_config["num_experts"],
                     "nccl_tuple": common_config["nccl_tuple"],
                     "mps_env": mps_env,
+                    "timed_start_barrier": timed_start_barrier,
                     "result_queue": result_queue,
                 },
             )
             process.start()
             processes.append(process)
-            expected += 1
 
     results: list[dict[str, Any]] = []
     deadline = time.time() + timeout_s
@@ -566,6 +575,7 @@ def _aggregate_stage_results(role: str, results: list[dict[str, Any]]) -> dict[s
             "status": "runtime_error",
             "error": {"code": "runtime_error", "message": f"No results for role={role}", "traceback": None},
             "timing_ms": None,
+            "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
             "enqueue_windows": [],
             "output_signature": None,
             "finite": {"all_finite": False, "first_nonfinite": None},
@@ -583,11 +593,13 @@ def _aggregate_stage_results(role: str, results: list[dict[str, Any]]) -> dict[s
             "status": status,
             "error": error,
             "timing_ms": None,
+            "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
             "enqueue_windows": [],
             "output_signature": None,
             "finite": {"all_finite": False, "first_nonfinite": None},
         }
 
+    timed_window = _collapse_timed_window_s([item.get("timed_window_s") for item in role_results])
     rank0 = role_results[0]
     first_nonfinite = None
     all_finite = True
@@ -601,7 +613,12 @@ def _aggregate_stage_results(role: str, results: list[dict[str, Any]]) -> dict[s
     return {
         "status": "ok",
         "error": {"code": None, "message": None, "traceback": None},
-        "timing_ms": rank0.get("timing_ms"),
+        "timing_ms": {
+            "cuda": (rank0.get("timing_ms") or {}).get("cuda"),
+            "step_total": (rank0.get("timing_ms") or {}).get("step_total"),
+            "timed_wall": timed_window["duration_ms"],
+        },
+        "timed_window_s": timed_window,
         "enqueue_windows": rank0.get("enqueue_windows", []),
         "output_signature": rank0.get("output_signature"),
         "finite": {"all_finite": all_finite, "first_nonfinite": first_nonfinite},
@@ -628,6 +645,29 @@ def _stage_specs(attn_gpu_ids: list[int], moe_gpu_ids: list[int]) -> tuple[dict[
     return attn_spec, moe_spec
 
 
+def _collapse_timed_window_s(windows: list[dict[str, Any] | None]) -> dict[str, float | None]:
+    starts: list[float] = []
+    ends: list[float] = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        start_s = window.get("start_s")
+        end_s = window.get("end_s")
+        if start_s is None or end_s is None:
+            continue
+        starts.append(float(start_s))
+        ends.append(float(end_s))
+    if not starts or not ends:
+        return {"start_s": None, "end_s": None, "duration_ms": None}
+    start_s = min(starts)
+    end_s = max(ends)
+    return {
+        "start_s": start_s,
+        "end_s": end_s,
+        "duration_ms": max(0.0, (end_s - start_s) * 1000.0),
+    }
+
+
 def _run_case_attempt(
     *,
     mode: str,
@@ -638,6 +678,7 @@ def _run_case_attempt(
     mps_env: dict[str, str],
 ) -> dict[str, Any]:
     start_s = time.perf_counter()
+    case_timed_wall_ms: float | None = None
     if mode == "serial":
         attn_spec, moe_spec = _stage_specs(attn_gpu_ids, moe_gpu_ids)
         attn_launch = _launch_workers(
@@ -651,6 +692,7 @@ def _run_case_attempt(
                 "status": "timeout",
                 "error": attn_launch["error"],
                 "timing_ms": None,
+                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
                 "enqueue_windows": [],
                 "output_signature": None,
                 "finite": {"all_finite": False, "first_nonfinite": None},
@@ -663,6 +705,7 @@ def _run_case_attempt(
                     "traceback": None,
                 },
                 "timing_ms": None,
+                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
                 "enqueue_windows": [],
                 "output_signature": None,
                 "finite": {"all_finite": False, "first_nonfinite": None},
@@ -680,6 +723,7 @@ def _run_case_attempt(
                     "status": "timeout",
                     "error": moe_launch["error"],
                     "timing_ms": None,
+                    "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
                     "enqueue_windows": [],
                     "output_signature": None,
                     "finite": {"all_finite": False, "first_nonfinite": None},
@@ -687,6 +731,10 @@ def _run_case_attempt(
             else:
                 moe_stage = _aggregate_stage_results("moe", moe_launch["results"])
         host_overlap_ms = 0.0
+        attn_timed_wall_ms = (attn_stage.get("timing_ms") or {}).get("timed_wall")
+        moe_timed_wall_ms = (moe_stage.get("timing_ms") or {}).get("timed_wall")
+        if attn_timed_wall_ms is not None and moe_timed_wall_ms is not None:
+            case_timed_wall_ms = float(attn_timed_wall_ms) + float(moe_timed_wall_ms)
     else:
         attn_spec, moe_spec = _stage_specs(attn_gpu_ids, moe_gpu_ids)
         overlap_launch = _launch_workers(
@@ -701,6 +749,7 @@ def _run_case_attempt(
                 "status": "timeout",
                 "error": error,
                 "timing_ms": None,
+                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
                 "enqueue_windows": [],
                 "output_signature": None,
                 "finite": {"all_finite": False, "first_nonfinite": None},
@@ -709,6 +758,7 @@ def _run_case_attempt(
                 "status": "timeout",
                 "error": error,
                 "timing_ms": None,
+                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
                 "enqueue_windows": [],
                 "output_signature": None,
                 "finite": {"all_finite": False, "first_nonfinite": None},
@@ -721,6 +771,10 @@ def _run_case_attempt(
                 attn_stage.get("enqueue_windows", []),
                 moe_stage.get("enqueue_windows", []),
             )
+            case_timed_window = _collapse_timed_window_s(
+                [attn_stage.get("timed_window_s"), moe_stage.get("timed_window_s")]
+            )
+            case_timed_wall_ms = case_timed_window["duration_ms"]
 
     wall_ms = (time.perf_counter() - start_s) * 1000.0
     stage_statuses = [attn_stage["status"], moe_stage["status"]]
@@ -756,6 +810,7 @@ def _run_case_attempt(
         "error": error,
         "timing_ms": {
             "total": wall_ms,
+            "timed_wall": case_timed_wall_ms,
             "attn": attn_stage["timing_ms"]["cuda"] if attn_stage["timing_ms"] else None,
             "moe": moe_stage["timing_ms"]["cuda"] if moe_stage["timing_ms"] else None,
         },
@@ -796,6 +851,10 @@ def _apply_baseline_diff(overlap_payload: dict[str, Any], serial_payload: dict[s
     overlap_payload["overlap"]["speedup_vs_serial"] = compute_speedup(
         serial_payload["timing_ms"]["total"],
         overlap_payload["timing_ms"]["total"],
+    )
+    overlap_payload["overlap"]["timed_speedup_vs_serial"] = compute_speedup(
+        serial_payload["timing_ms"].get("timed_wall"),
+        overlap_payload["timing_ms"].get("timed_wall"),
     )
     if overlap_payload["status"] == "ok" and not all_within:
         overlap_payload["status"] = "numerical_mismatch"

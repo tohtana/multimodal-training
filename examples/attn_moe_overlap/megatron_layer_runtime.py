@@ -7,6 +7,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from typing import Any
+from threading import BrokenBarrierError
 
 import torch
 
@@ -165,7 +166,13 @@ class MegatronSingleLayerRuntime:
         mask = ~torch.tril(torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool))
         return mask.view(1, 1, seq_len, seq_len).expand(batch, 1, seq_len, seq_len)
 
-    def run_stage(self, *, warmup_iters: int, timed_iters: int) -> dict[str, Any]:
+    def run_stage(
+        self,
+        *,
+        warmup_iters: int,
+        timed_iters: int,
+        timed_start_barrier: Any | None = None,
+    ) -> dict[str, Any]:
         if self.layer is None or self.hidden_states is None or self.attention_mask is None:
             self.initialize()
 
@@ -180,12 +187,20 @@ class MegatronSingleLayerRuntime:
         cuda_ms: list[float] = []
         step_ms: list[float] = []
         enqueue_windows: list[tuple[float, float]] = []
+        timed_start_s: float | None = None
+        timed_end_s: float | None = None
         first_nonfinite: dict[str, Any] | None = None
         output_tensor: torch.Tensor | None = None
 
         import torch.distributed as dist
 
         for iter_idx in range(total_iters):
+            if iter_idx == warmup_iters and timed_start_barrier is not None:
+                try:
+                    timed_start_barrier.wait()
+                except BrokenBarrierError as exc:
+                    raise RuntimeError("Timed-start barrier broke before timed iterations") from exc
+
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
 
@@ -209,9 +224,12 @@ class MegatronSingleLayerRuntime:
             step_end = time.perf_counter()
 
             if iter_idx >= warmup_iters:
+                if timed_start_s is None:
+                    timed_start_s = step_start
                 cuda_ms.append(float(start_event.elapsed_time(end_event)))
                 step_ms.append((step_end - step_start) * 1000.0)
                 enqueue_windows.append((enqueue_start, enqueue_end))
+                timed_end_s = step_end
 
             if first_nonfinite is None and output_tensor is not None and torch.is_floating_point(output_tensor):
                 if not torch.isfinite(output_tensor).all():
@@ -224,12 +242,23 @@ class MegatronSingleLayerRuntime:
 
         mean_cuda_ms = float(sum(cuda_ms) / len(cuda_ms)) if cuda_ms else None
         mean_step_ms = float(sum(step_ms) / len(step_ms)) if step_ms else None
+        timed_wall_ms = (
+            float((timed_end_s - timed_start_s) * 1000.0)
+            if timed_start_s is not None and timed_end_s is not None
+            else None
+        )
         return {
             "status": "ok",
             "stage_role": self.config.stage_role,
             "timing_ms": {
                 "cuda": mean_cuda_ms,
                 "step_total": mean_step_ms,
+                "timed_wall": timed_wall_ms,
+            },
+            "timed_window_s": {
+                "start_s": timed_start_s,
+                "end_s": timed_end_s,
+                "duration_ms": timed_wall_ms,
             },
             "enqueue_windows": enqueue_windows,
             "finite": {
