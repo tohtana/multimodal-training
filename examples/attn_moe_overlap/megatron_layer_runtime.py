@@ -141,6 +141,7 @@ class RuntimeConfig:
     model_name: str
     model_type: str
     stage_role: str
+    attention_backend: str
     dtype: str
     seq_len: int
     batch_size: int
@@ -201,7 +202,7 @@ class MegatronSingleLayerRuntime:
             "sequence_parallel_size": 1,
             "pipeline_model_parallel_size": 1,
             "expert_model_parallel_size": int(self.config.expert_model_parallel_size),
-            "attention_backend": "unfused",
+            "attention_backend": str(self.config.attention_backend),
             "megatron_num_layers": 1,
             "load_weights": False,
             "use_cpu_initialization": True,
@@ -414,6 +415,7 @@ class MegatronSingleLayerRuntime:
         return {
             "status": "ok",
             "stage_role": self.config.stage_role,
+            "attention_backend": self.config.attention_backend,
             "timing_ms": {
                 "cuda": mean_cuda_ms,
                 "step_total": mean_step_ms,

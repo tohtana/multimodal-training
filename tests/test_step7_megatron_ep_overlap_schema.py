@@ -26,6 +26,7 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     validate_matrix_summary,
 )
 from examples.attn_moe_overlap.megatron_layer_runtime import (
+    RuntimeConfig,
     _resolve_profiler_schedule,
     _run_iteration_schedule,
 )
@@ -184,6 +185,7 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "rank": 0,
                     "status": "ok",
                     "failure_origin": False,
+                    "attention_backend": "auto",
                     "timing_ms": {"cuda": 1.25, "step_total": 1.5, "timed_wall": 400.0},
                     "timed_window_s": {"start_s": 10.1, "end_s": 10.5, "duration_ms": 400.0},
                     "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
@@ -196,6 +198,7 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "rank": 0,
                     "status": "ok",
                     "failure_origin": False,
+                    "attention_backend": "auto",
                     "timing_ms": {"cuda": 2.5, "step_total": 3.0, "timed_wall": 700.0},
                     "timed_window_s": {"start_s": 10.2, "end_s": 10.9, "duration_ms": 700.0},
                     "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
@@ -224,6 +227,7 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
             "timed_iters": 3,
             "moe_ep_size": 4,
             "num_experts": None,
+            "attention_backend": "auto",
             "nccl_tuple": (4, 16, 32),
             "profiler_trace_root": None,
             "profiler_wait_iters": None,
@@ -239,6 +243,7 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
     assert calls[0]["common_config"]["execution_schedule"] == "serial_lockstep"
     assert {spec["role"] for spec in calls[0]["stage_specs"]} == {"attn", "moe"}
     assert result["status"] == "ok"
+    assert result["attention_backend"] == {"requested": "auto", "attn": "auto", "moe": "auto"}
     assert result["timing_ms"]["timed_wall"] == pytest.approx(1000.0)
     assert result["timing_ms"]["attn"] == pytest.approx(1.25)
     assert result["timing_ms"]["moe"] == pytest.approx(2.5)
@@ -302,6 +307,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         warmup_iters=1,
         timed_iters=3,
         worker_timeout_s=180.0,
+        attention_backend="fused",
         torch_profiler_wait_iters=11,
         torch_profiler_active_iters=2,
     )
@@ -320,6 +326,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert calls[0][0] == sys.executable
     assert calls[0][1] == str((REPO_ROOT / "examples/attn_moe_overlap/step7_megatron_ep_overlap.py").resolve())
     assert "-m" not in calls[0]
+    assert calls[0][calls[0].index("--attention-backend") + 1] == "fused"
     assert calls[0][calls[0].index("--torch-profiler-wait-iters") + 1] == "11"
 
     trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
@@ -381,6 +388,26 @@ def test_retry_policy_allows_single_retry_only_for_oom_timeout():
     assert should_retry("timeout", 1) is True
     assert should_retry("runtime_error", 1) is False
     assert should_retry("oom", 2) is False
+
+
+def test_runtime_config_uses_auto_attention_backend_by_default():
+    runtime_config = RuntimeConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        stage_role="attn",
+        attention_backend="auto",
+        dtype="bf16",
+        seq_len=1024,
+        batch_size=1,
+        seed=1234,
+        expert_model_parallel_size=1,
+        num_experts=None,
+    )
+
+    from examples.attn_moe_overlap.megatron_layer_runtime import MegatronSingleLayerRuntime
+
+    trainer_config = MegatronSingleLayerRuntime(runtime_config)._build_trainer_config()
+    assert trainer_config["engine_config"]["attention_backend"] == "auto"
 
 
 def test_invalid_environment_payload_contract():

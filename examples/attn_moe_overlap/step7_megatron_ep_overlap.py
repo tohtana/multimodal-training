@@ -275,6 +275,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nccl-max-nchannels", type=int, default=None)
     parser.add_argument("--nccl-max-ctas", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
+    parser.add_argument(
+        "--attention-backend",
+        choices=["auto", "fused", "flash", "unfused"],
+        default="auto",
+        help="Megatron attention backend for the Step-7 single-layer runtime. "
+        "Defaults to Megatron's recommended backend selection (`auto`).",
+    )
     parser.add_argument("--capture-nsys", choices=["on", "off"], default="off")
     parser.add_argument("--nsys-bin", type=str, default="nsys")
     parser.add_argument("--capture-torch-profiler", choices=["on", "off"], default="off")
@@ -499,6 +506,7 @@ def _worker_main(
     timed_iters: int,
     moe_ep_size: int,
     num_experts: int | None,
+    attention_backend: str,
     nccl_tuple: tuple[int, int, int],
     mps_env: dict[str, str],
     execution_schedule: str,
@@ -550,6 +558,7 @@ def _worker_main(
                 model_name=model_name,
                 model_type=model_type,
                 stage_role=role,
+                attention_backend=attention_backend,
                 dtype=dtype,
                 seq_len=seq_len,
                 batch_size=batch_size,
@@ -600,6 +609,7 @@ def _worker_main(
                 "rank": rank,
                 "status": status,
                 "failure_origin": failure_origin,
+                "attention_backend": attention_backend,
                 **payload,
             },
         )
@@ -645,6 +655,7 @@ def _launch_workers(
                         "timed_iters": common_config["timed_iters"],
                         "moe_ep_size": common_config["moe_ep_size"],
                         "num_experts": common_config["num_experts"],
+                        "attention_backend": common_config["attention_backend"],
                         "nccl_tuple": common_config["nccl_tuple"],
                         "mps_env": mps_env,
                         "execution_schedule": common_config["execution_schedule"],
@@ -770,6 +781,7 @@ def _aggregate_stage_results(
     return {
         "status": "ok",
         "error": {"code": None, "message": None, "traceback": None},
+        "attention_backend": rank0.get("attention_backend"),
         "timing_ms": {
             "cuda": (rank0.get("timing_ms") or {}).get("cuda"),
             "step_total": (rank0.get("timing_ms") or {}).get("step_total"),
@@ -904,6 +916,11 @@ def _run_case_attempt(
     return {
         "status": status,
         "error": error,
+        "attention_backend": {
+            "requested": common_config["attention_backend"],
+            "attn": attn_stage.get("attention_backend"),
+            "moe": moe_stage.get("attention_backend"),
+        },
         "timing_ms": {
             "total": wall_ms,
             "timed_wall": case_timed_wall_ms,
@@ -1154,6 +1171,8 @@ def _run_torch_profiler_capture(
             "off",
             "--capture-torch-profiler",
             "off",
+            "--attention-backend",
+            str(args.attention_backend),
             "--torch-profiler-trace-dir",
             str(trace_dir),
             "--torch-profiler-wait-iters",
@@ -1271,6 +1290,7 @@ def main() -> int:
                 "dtypes": dtypes,
                 "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
                 "capture_nsys": args.capture_nsys,
+                "attention_backend": args.attention_backend,
             },
             cases=all_case_payloads,
             total_points=total_points,
@@ -1314,6 +1334,7 @@ def main() -> int:
                     "timed_iters": args.timed_iters,
                     "moe_ep_size": args.moe_ep_size,
                     "num_experts": args.num_experts,
+                    "attention_backend": args.attention_backend,
                     "nccl_tuple": nccl_tuple,
                     "profiler_trace_root": args.torch_profiler_trace_dir,
                     "profiler_wait_iters": args.torch_profiler_wait_iters,
@@ -1348,6 +1369,7 @@ def main() -> int:
                         attempt_count=attempt_count,
                         retry_trigger=retry_trigger,
                     )
+                    payload["attention_backend"] = attempt_result["attention_backend"]
 
                     if should_retry(payload["status"], attempt_count):
                         retry_trigger = payload["status"]
