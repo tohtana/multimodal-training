@@ -7,7 +7,7 @@ import time
 import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from threading import BrokenBarrierError
 
 import torch
@@ -60,6 +60,80 @@ def _resolve_profiler_schedule(
     active_timed_iters = int(profiler_active_timed_iters or timed_iters)
     active_timed_iters = max(1, min(int(timed_iters), active_timed_iters))
     return wait_iters, active_timed_iters
+
+
+def _timed_window_from_bounds(start_s: float | None, end_s: float | None) -> dict[str, float | None]:
+    if start_s is None or end_s is None:
+        return {"start_s": None, "end_s": None, "duration_ms": None}
+    return {
+        "start_s": start_s,
+        "end_s": end_s,
+        "duration_ms": max(0.0, (end_s - start_s) * 1000.0),
+    }
+
+
+class ScheduleAborted(RuntimeError):
+    """Raised when a peer failure aborts the shared launch schedule."""
+
+
+def _run_iteration_schedule(
+    *,
+    execution_schedule: str,
+    stage_role: str,
+    total_iters: int,
+    warmup_iters: int,
+    barrier_wait: Callable[[str, int], None],
+    run_forward: Callable[[str, int, bool], None],
+    profiler_step: Callable[[int], None] | None = None,
+    now: Callable[[], float] = time.perf_counter,
+) -> dict[str, dict[str, float | None]]:
+    if execution_schedule not in {"overlap", "serial_lockstep"}:
+        raise ValueError(f"Unsupported execution_schedule: {execution_schedule}")
+    if stage_role not in {"attn", "moe"}:
+        raise ValueError(f"Unsupported stage_role: {stage_role}")
+
+    stage_timed_start_s: float | None = None
+    stage_timed_end_s: float | None = None
+    schedule_timed_start_s: float | None = None
+    schedule_timed_end_s: float | None = None
+
+    def _run_active_phase(phase_role: str, phase_name: str, iter_idx: int, is_timed: bool) -> None:
+        nonlocal stage_timed_start_s, stage_timed_end_s
+        if stage_role != phase_role:
+            return
+        phase_start_s = now()
+        run_forward(phase_name, iter_idx, is_timed)
+        phase_end_s = now()
+        if is_timed:
+            if stage_timed_start_s is None:
+                stage_timed_start_s = phase_start_s
+            stage_timed_end_s = phase_end_s
+
+    for iter_idx in range(int(total_iters)):
+        is_timed = iter_idx >= int(warmup_iters)
+        if is_timed and schedule_timed_start_s is None:
+            schedule_timed_start_s = now()
+
+        if execution_schedule == "overlap":
+            barrier_wait("overlap_start", iter_idx)
+            _run_active_phase(stage_role, stage_role, iter_idx, is_timed)
+            barrier_wait("overlap_end", iter_idx)
+        else:
+            barrier_wait("serial_start", iter_idx)
+            _run_active_phase("attn", "attn", iter_idx, is_timed)
+            barrier_wait("serial_between", iter_idx)
+            _run_active_phase("moe", "moe", iter_idx, is_timed)
+            barrier_wait("serial_end", iter_idx)
+
+        if is_timed:
+            schedule_timed_end_s = now()
+        if profiler_step is not None:
+            profiler_step(iter_idx)
+
+    return {
+        "stage_timed_window_s": _timed_window_from_bounds(stage_timed_start_s, stage_timed_end_s),
+        "schedule_timed_window_s": _timed_window_from_bounds(schedule_timed_start_s, schedule_timed_end_s),
+    }
 
 
 @dataclass
@@ -188,7 +262,10 @@ class MegatronSingleLayerRuntime:
         *,
         warmup_iters: int,
         timed_iters: int,
+        execution_schedule: str = "overlap",
         iteration_barrier: Any | None = None,
+        abort_event: Any | None = None,
+        barrier_timeout_s: float | None = None,
         profiler_trace_dir: str | None = None,
         profiler_worker_name: str | None = None,
         profiler_wait_iters: int | None = None,
@@ -245,15 +322,30 @@ class MegatronSingleLayerRuntime:
                 )
                 profiler.__enter__()
 
-            for iter_idx in range(total_iters):
-                # Keep attn/MoE in lockstep across iterations so the next iteration
-                # does not begin until all workers from the current iteration finish.
-                if iteration_barrier is not None:
-                    try:
-                        iteration_barrier.wait()
-                    except BrokenBarrierError as exc:
-                        raise RuntimeError("Iteration barrier broke before iteration start") from exc
+            def _wait_for_schedule_phase(phase_name: str, iter_idx: int) -> None:
+                if abort_event is not None and abort_event.is_set():
+                    raise ScheduleAborted(
+                        f"Schedule aborted before {phase_name} at iter {iter_idx}"
+                    )
+                if iteration_barrier is None:
+                    return
+                try:
+                    iteration_barrier.wait(timeout=barrier_timeout_s)
+                except BrokenBarrierError as exc:
+                    if abort_event is not None and abort_event.is_set():
+                        raise ScheduleAborted(
+                            f"Schedule aborted during {phase_name} at iter {iter_idx}"
+                        ) from exc
+                    raise RuntimeError(
+                        f"Iteration barrier broke during {phase_name} at iter {iter_idx}"
+                    ) from exc
+                if abort_event is not None and abort_event.is_set():
+                    raise ScheduleAborted(
+                        f"Schedule aborted after {phase_name} at iter {iter_idx}"
+                    )
 
+            def _run_forward_phase(_phase_name: str, iter_idx: int, is_timed: bool) -> None:
+                nonlocal first_nonfinite, output_tensor, timed_start_s, timed_end_s
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
 
@@ -282,7 +374,7 @@ class MegatronSingleLayerRuntime:
                 torch.cuda.synchronize(self.device)
                 step_end = time.perf_counter()
 
-                if iter_idx >= warmup_iters:
+                if is_timed:
                     if timed_start_s is None:
                         timed_start_s = step_start
                     cuda_ms.append(float(start_event.elapsed_time(end_event)))
@@ -299,8 +391,15 @@ class MegatronSingleLayerRuntime:
                             "iter": int(iter_idx),
                         }
 
-                if profiler is not None:
-                    profiler.step()
+            schedule_windows = _run_iteration_schedule(
+                execution_schedule=execution_schedule,
+                stage_role=self.config.stage_role,
+                total_iters=total_iters,
+                warmup_iters=int(warmup_iters),
+                barrier_wait=_wait_for_schedule_phase,
+                run_forward=_run_forward_phase,
+                profiler_step=(lambda _iter_idx: profiler.step()) if profiler is not None else None,
+            )
         finally:
             if profiler is not None:
                 profiler.__exit__(None, None, None)
@@ -321,10 +420,9 @@ class MegatronSingleLayerRuntime:
                 "timed_wall": timed_wall_ms,
             },
             "timed_window_s": {
-                "start_s": timed_start_s,
-                "end_s": timed_end_s,
-                "duration_ms": timed_wall_ms,
+                **schedule_windows["stage_timed_window_s"],
             },
+            "schedule_timed_window_s": schedule_windows["schedule_timed_window_s"],
             "enqueue_windows": enqueue_windows,
             "finite": {
                 "all_finite": first_nonfinite is None,

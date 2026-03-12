@@ -25,9 +25,14 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     validate_case_payload,
     validate_matrix_summary,
 )
-from examples.attn_moe_overlap.megatron_layer_runtime import _resolve_profiler_schedule
+from examples.attn_moe_overlap.megatron_layer_runtime import (
+    _resolve_profiler_schedule,
+    _run_iteration_schedule,
+)
 from examples.attn_moe_overlap.step7_megatron_ep_overlap import (
     _collapse_timed_window_s,
+    _normalize_launch_failure,
+    _run_case_attempt,
     _run_torch_profiler_capture,
     _select_torch_profiler_cases,
 )
@@ -124,6 +129,147 @@ def test_resolve_profiler_schedule_supports_independent_wait_iters():
     )
     assert wait_iters == 12
     assert active_iters == 7
+
+
+def test_run_iteration_schedule_serial_lockstep_steps_once_and_skips_inactive_phase():
+    barrier_calls: list[tuple[str, int]] = []
+    forward_calls: list[tuple[str, int, bool]] = []
+    profiler_steps: list[int] = []
+    clock = iter(range(100, 200))
+
+    windows = _run_iteration_schedule(
+        execution_schedule="serial_lockstep",
+        stage_role="attn",
+        total_iters=3,
+        warmup_iters=1,
+        barrier_wait=lambda phase, iter_idx: barrier_calls.append((phase, iter_idx)),
+        run_forward=lambda phase, iter_idx, is_timed: forward_calls.append((phase, iter_idx, is_timed)),
+        profiler_step=lambda iter_idx: profiler_steps.append(iter_idx),
+        now=lambda: float(next(clock)),
+    )
+
+    assert barrier_calls == [
+        ("serial_start", 0),
+        ("serial_between", 0),
+        ("serial_end", 0),
+        ("serial_start", 1),
+        ("serial_between", 1),
+        ("serial_end", 1),
+        ("serial_start", 2),
+        ("serial_between", 2),
+        ("serial_end", 2),
+    ]
+    assert forward_calls == [
+        ("attn", 0, False),
+        ("attn", 1, True),
+        ("attn", 2, True),
+    ]
+    assert profiler_steps == [0, 1, 2]
+    assert windows["stage_timed_window_s"]["duration_ms"] == pytest.approx(4000.0)
+    assert windows["schedule_timed_window_s"]["duration_ms"] == pytest.approx(6000.0)
+
+
+def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def _fake_launch_workers(*, stage_specs, common_config, timeout_s, mps_env):
+        del timeout_s, mps_env
+        calls.append({"stage_specs": stage_specs, "common_config": common_config})
+        return {
+            "status": "ok",
+            "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
+            "results": [
+                {
+                    "role": "attn",
+                    "rank": 0,
+                    "status": "ok",
+                    "failure_origin": False,
+                    "timing_ms": {"cuda": 1.25, "step_total": 1.5, "timed_wall": 400.0},
+                    "timed_window_s": {"start_s": 10.1, "end_s": 10.5, "duration_ms": 400.0},
+                    "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [(1.0, 1.1)],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 1.0, "mean": 0.1, "std": 0.2, "max_abs": 1.5},
+                },
+                {
+                    "role": "moe",
+                    "rank": 0,
+                    "status": "ok",
+                    "failure_origin": False,
+                    "timing_ms": {"cuda": 2.5, "step_total": 3.0, "timed_wall": 700.0},
+                    "timed_window_s": {"start_s": 10.2, "end_s": 10.9, "duration_ms": 700.0},
+                    "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [(1.2, 1.4)],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 2.0, "mean": 0.2, "std": 0.3, "max_abs": 2.5},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(
+        "examples.attn_moe_overlap.step7_megatron_ep_overlap._launch_workers",
+        _fake_launch_workers,
+    )
+
+    result = _run_case_attempt(
+        mode="serial",
+        common_config={
+            "model_name": "Qwen/Qwen3-30B-A3B",
+            "model_type": "qwen3_moe",
+            "dtype": "bf16",
+            "seq_len": 1024,
+            "batch_size": 1,
+            "seed": 1234,
+            "warmup_iters": 1,
+            "timed_iters": 3,
+            "moe_ep_size": 4,
+            "num_experts": None,
+            "nccl_tuple": (4, 16, 32),
+            "profiler_trace_root": None,
+            "profiler_wait_iters": None,
+            "profiler_active_timed_iters": 2,
+        },
+        attn_gpu_ids=[0],
+        moe_gpu_ids=[0],
+        timeout_s=180.0,
+        mps_env={},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["common_config"]["execution_schedule"] == "serial_lockstep"
+    assert {spec["role"] for spec in calls[0]["stage_specs"]} == {"attn", "moe"}
+    assert result["status"] == "ok"
+    assert result["timing_ms"]["timed_wall"] == pytest.approx(1000.0)
+    assert result["timing_ms"]["attn"] == pytest.approx(1.25)
+    assert result["timing_ms"]["moe"] == pytest.approx(2.5)
+    assert result["overlap_ms"] == pytest.approx(0.0)
+
+
+def test_normalize_launch_failure_prefers_root_cause_worker_error():
+    normalized = _normalize_launch_failure(
+        results=[
+            {
+                "role": "attn",
+                "rank": 0,
+                "status": "oom",
+                "failure_origin": True,
+                "error": {"code": "oom", "message": "CUDA out of memory", "traceback": None},
+            },
+            {
+                "role": "moe",
+                "rank": 0,
+                "status": "runtime_error",
+                "failure_origin": False,
+                "error": {"code": "runtime_error", "message": "Schedule aborted", "traceback": None},
+            },
+        ],
+        expected=4,
+        timed_out=True,
+        exitcodes={"123": 1},
+    )
+
+    assert normalized["status"] == "oom"
+    assert normalized["error"]["message"] == "CUDA out of memory"
 
 
 def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypatch):

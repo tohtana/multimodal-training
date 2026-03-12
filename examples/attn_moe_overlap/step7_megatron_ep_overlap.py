@@ -412,6 +412,75 @@ def _build_case_descriptors(
     return cases
 
 
+def _null_timed_window() -> dict[str, float | None]:
+    return {"start_s": None, "end_s": None, "duration_ms": None}
+
+
+def _empty_stage_result(
+    *,
+    role: str,
+    status: str,
+    error: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "error": error
+        or {
+            "code": status,
+            "message": f"No results for role={role}",
+            "traceback": None,
+        },
+        "timing_ms": None,
+        "timed_window_s": _null_timed_window(),
+        "enqueue_windows": [],
+        "output_signature": None,
+        "finite": {"all_finite": False, "first_nonfinite": None},
+    }
+
+
+def _select_root_cause_worker_result(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    priorities = [
+        lambda item: item.get("failure_origin") is True and item.get("status") == "oom",
+        lambda item: item.get("failure_origin") is True and item.get("status") == "runtime_error",
+        lambda item: item.get("status") == "oom",
+        lambda item: item.get("status") == "runtime_error",
+        lambda item: item.get("status") == "timeout",
+    ]
+    for predicate in priorities:
+        for result in results:
+            if predicate(result):
+                return result
+    return None
+
+
+def _normalize_launch_failure(
+    *,
+    results: list[dict[str, Any]],
+    expected: int,
+    timed_out: bool,
+    exitcodes: dict[str, int | None],
+) -> dict[str, Any]:
+    root_cause = _select_root_cause_worker_result(results)
+    if root_cause is not None:
+        status = str(root_cause.get("status") or "runtime_error")
+        error = root_cause.get("error") or {
+            "code": status,
+            "message": f"Worker {root_cause.get('role')} rank {root_cause.get('rank')} failed",
+            "traceback": None,
+        }
+        return {"status": status, "error": error}
+
+    status = "timeout" if timed_out else "runtime_error"
+    return {
+        "status": status,
+        "error": {
+            "code": status,
+            "message": f"Missing worker results ({len(results)}/{expected}); exitcodes={exitcodes}",
+            "traceback": None,
+        },
+    }
+
+
 def _worker_main(
     *,
     role: str,
@@ -432,7 +501,10 @@ def _worker_main(
     num_experts: int | None,
     nccl_tuple: tuple[int, int, int],
     mps_env: dict[str, str],
+    execution_schedule: str,
     iteration_barrier: Any | None,
+    abort_event: Any | None,
+    barrier_timeout_s: float,
     profiler_trace_root: str | None,
     profiler_wait_iters: int | None,
     profiler_active_timed_iters: int | None,
@@ -442,6 +514,7 @@ def _worker_main(
         from examples.attn_moe_overlap.megatron_layer_runtime import (
             RuntimeConfig,
             MegatronSingleLayerRuntime,
+            ScheduleAborted,
             cleanup_distributed_state,
             classify_exception,
         )
@@ -449,12 +522,14 @@ def _worker_main(
         from megatron_layer_runtime import (  # type: ignore[no-redef]
             RuntimeConfig,
             MegatronSingleLayerRuntime,
+            ScheduleAborted,
             cleanup_distributed_state,
             classify_exception,
         )
 
     status = "ok"
     payload: dict[str, Any] = {}
+    failure_origin = False
     try:
         _bootstrap_local_pythonpath()
         os.environ.update(mps_env)
@@ -486,7 +561,10 @@ def _worker_main(
         payload = runtime.run_stage(
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            execution_schedule=execution_schedule,
             iteration_barrier=iteration_barrier,
+            abort_event=abort_event,
+            barrier_timeout_s=barrier_timeout_s,
             profiler_trace_dir=str(Path(profiler_trace_root)) if profiler_trace_root is not None else None,
             profiler_worker_name=f"{role}_rank{rank}_gpu{gpu_id}",
             profiler_wait_iters=profiler_wait_iters,
@@ -495,10 +573,19 @@ def _worker_main(
         status = payload.get("status", "runtime_error")
     except Exception as exc:
         status, error = classify_exception(exc)
+        failure_origin = not isinstance(exc, ScheduleAborted)
+        if abort_event is not None:
+            abort_event.set()
+        if iteration_barrier is not None:
+            try:
+                iteration_barrier.abort()
+            except Exception:
+                pass
         payload = {
             "status": status,
             "timing_ms": {"cuda": None, "step_total": None, "timed_wall": None},
-            "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
+            "timed_window_s": _null_timed_window(),
+            "schedule_timed_window_s": _null_timed_window(),
             "enqueue_windows": [],
             "finite": {"all_finite": False, "first_nonfinite": None},
             "output_signature": None,
@@ -512,6 +599,7 @@ def _worker_main(
                 "role": role,
                 "rank": rank,
                 "status": status,
+                "failure_origin": failure_origin,
                 **payload,
             },
         )
@@ -534,6 +622,7 @@ def _launch_workers(
     for spec in stage_specs:
         expected += len(spec["gpu_ids"])
     iteration_barrier = mp.Barrier(expected) if expected > 0 else None
+    abort_event = mp.Event()
     try:
         for spec in stage_specs:
             for rank, gpu_id in enumerate(spec["gpu_ids"]):
@@ -558,7 +647,10 @@ def _launch_workers(
                         "num_experts": common_config["num_experts"],
                         "nccl_tuple": common_config["nccl_tuple"],
                         "mps_env": mps_env,
+                        "execution_schedule": common_config["execution_schedule"],
                         "iteration_barrier": iteration_barrier,
+                        "abort_event": abort_event,
+                        "barrier_timeout_s": timeout_s,
                         "profiler_trace_root": common_config.get("profiler_trace_root"),
                         "profiler_wait_iters": common_config.get("profiler_wait_iters"),
                         "profiler_active_timed_iters": common_config.get("profiler_active_timed_iters"),
@@ -580,6 +672,12 @@ def _launch_workers(
         results = _load_worker_results(worker_result_dir)
         timed_out = len(results) < expected and any(process.is_alive() for process in processes)
         if timed_out:
+            abort_event.set()
+            if iteration_barrier is not None:
+                try:
+                    iteration_barrier.abort()
+                except Exception:
+                    pass
             for process in processes:
                 if process.is_alive():
                     process.terminate()
@@ -590,55 +688,73 @@ def _launch_workers(
                 process.kill()
 
         results = _load_worker_results(worker_result_dir)
+        schedule_timed_window = _collapse_timed_window_s(
+            [item.get("schedule_timed_window_s") for item in results]
+        )
         if len(results) < expected:
             exitcodes = {str(process.pid): process.exitcode for process in processes}
-            status = "timeout" if timed_out else "runtime_error"
+            normalized = _normalize_launch_failure(
+                results=results,
+                expected=expected,
+                timed_out=timed_out,
+                exitcodes=exitcodes,
+            )
             return {
-                "status": status,
-                "error": {
-                    "code": status,
-                    "message": (
-                        f"Missing worker results ({len(results)}/{expected}); exitcodes={exitcodes}"
-                    ),
-                    "traceback": None,
-                },
+                "status": normalized["status"],
+                "error": normalized["error"],
                 "results": results,
+                "schedule_timed_window_s": schedule_timed_window,
             }
-        return {"status": "ok", "results": results}
+        return {
+            "status": "ok",
+            "results": results,
+            "schedule_timed_window_s": schedule_timed_window,
+        }
     finally:
         shutil.rmtree(worker_result_dir, ignore_errors=True)
 
 
-def _aggregate_stage_results(role: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_stage_results(
+    role: str,
+    results: list[dict[str, Any]],
+    *,
+    expected_world_size: int | None = None,
+    fallback_status: str | None = None,
+    fallback_error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     role_results = sorted((item for item in results if item.get("role") == role), key=lambda item: item["rank"])
     if not role_results:
-        return {
-            "status": "runtime_error",
-            "error": {"code": "runtime_error", "message": f"No results for role={role}", "traceback": None},
-            "timing_ms": None,
-            "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
-            "enqueue_windows": [],
-            "output_signature": None,
-            "finite": {"all_finite": False, "first_nonfinite": None},
-        }
+        return _empty_stage_result(
+            role=role,
+            status=fallback_status or "runtime_error",
+            error=fallback_error,
+        )
 
-    failing = next((item for item in role_results if item.get("status") != "ok"), None)
+    if expected_world_size is not None and len(role_results) < int(expected_world_size):
+        failing = _select_root_cause_worker_result(role_results)
+        if failing is not None:
+            status = str(failing.get("status") or "runtime_error")
+            error = failing.get("error") or {
+                "code": status,
+                "message": f"{role} rank {failing.get('rank')} failed",
+                "traceback": None,
+            }
+            return _empty_stage_result(role=role, status=status, error=error)
+        return _empty_stage_result(
+            role=role,
+            status=fallback_status or "runtime_error",
+            error=fallback_error,
+        )
+
+    failing = _select_root_cause_worker_result(role_results)
     if failing is not None:
-        status = failing.get("status", "runtime_error")
+        status = str(failing.get("status") or "runtime_error")
         error = failing.get("error") or {
             "code": status,
             "message": f"{role} rank {failing.get('rank')} failed",
             "traceback": None,
         }
-        return {
-            "status": status,
-            "error": error,
-            "timing_ms": None,
-            "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
-            "enqueue_windows": [],
-            "output_signature": None,
-            "finite": {"all_finite": False, "first_nonfinite": None},
-        }
+        return _empty_stage_result(role=role, status=status, error=error)
 
     timed_window = _collapse_timed_window_s([item.get("timed_window_s") for item in role_results])
     rank0 = role_results[0]
@@ -719,103 +835,42 @@ def _run_case_attempt(
     mps_env: dict[str, str],
 ) -> dict[str, Any]:
     start_s = time.perf_counter()
-    case_timed_wall_ms: float | None = None
-    if mode == "serial":
-        attn_spec, moe_spec = _stage_specs(attn_gpu_ids, moe_gpu_ids)
-        attn_launch = _launch_workers(
-            stage_specs=[attn_spec],
-            common_config=common_config,
-            timeout_s=timeout_s,
-            mps_env=mps_env,
+    execution_schedule = "serial_lockstep" if mode == "serial" else "overlap"
+    attn_spec, moe_spec = _stage_specs(attn_gpu_ids, moe_gpu_ids)
+    launch_result = _launch_workers(
+        stage_specs=[attn_spec, moe_spec],
+        common_config={**common_config, "execution_schedule": execution_schedule},
+        timeout_s=timeout_s,
+        mps_env=mps_env,
+    )
+    results = launch_result.get("results", [])
+    fallback_status = launch_result.get("status")
+    fallback_error = launch_result.get("error")
+    if fallback_status == "ok":
+        fallback_status = None
+        fallback_error = None
+
+    attn_stage = _aggregate_stage_results(
+        "attn",
+        results,
+        expected_world_size=attn_spec["world_size"],
+        fallback_status=fallback_status,
+        fallback_error=fallback_error,
+    )
+    moe_stage = _aggregate_stage_results(
+        "moe",
+        results,
+        expected_world_size=moe_spec["world_size"],
+        fallback_status=fallback_status,
+        fallback_error=fallback_error,
+    )
+    case_timed_wall_ms = (launch_result.get("schedule_timed_window_s") or {}).get("duration_ms")
+    host_overlap_ms = 0.0
+    if mode == "overlap":
+        host_overlap_ms = compute_host_enqueue_overlap_ms(
+            attn_stage.get("enqueue_windows", []),
+            moe_stage.get("enqueue_windows", []),
         )
-        if attn_launch["status"] != "ok":
-            attn_stage = {
-                "status": "timeout",
-                "error": attn_launch["error"],
-                "timing_ms": None,
-                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
-                "enqueue_windows": [],
-                "output_signature": None,
-                "finite": {"all_finite": False, "first_nonfinite": None},
-            }
-            moe_stage = {
-                "status": "runtime_error",
-                "error": {
-                    "code": "runtime_error",
-                    "message": "Skipped moe stage because attn stage timed out",
-                    "traceback": None,
-                },
-                "timing_ms": None,
-                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
-                "enqueue_windows": [],
-                "output_signature": None,
-                "finite": {"all_finite": False, "first_nonfinite": None},
-            }
-        else:
-            attn_stage = _aggregate_stage_results("attn", attn_launch["results"])
-            moe_launch = _launch_workers(
-                stage_specs=[moe_spec],
-                common_config=common_config,
-                timeout_s=timeout_s,
-                mps_env=mps_env,
-            )
-            if moe_launch["status"] != "ok":
-                moe_stage = {
-                    "status": "timeout",
-                    "error": moe_launch["error"],
-                    "timing_ms": None,
-                    "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
-                    "enqueue_windows": [],
-                    "output_signature": None,
-                    "finite": {"all_finite": False, "first_nonfinite": None},
-                }
-            else:
-                moe_stage = _aggregate_stage_results("moe", moe_launch["results"])
-        host_overlap_ms = 0.0
-        attn_timed_wall_ms = (attn_stage.get("timing_ms") or {}).get("timed_wall")
-        moe_timed_wall_ms = (moe_stage.get("timing_ms") or {}).get("timed_wall")
-        if attn_timed_wall_ms is not None and moe_timed_wall_ms is not None:
-            case_timed_wall_ms = float(attn_timed_wall_ms) + float(moe_timed_wall_ms)
-    else:
-        attn_spec, moe_spec = _stage_specs(attn_gpu_ids, moe_gpu_ids)
-        overlap_launch = _launch_workers(
-            stage_specs=[attn_spec, moe_spec],
-            common_config=common_config,
-            timeout_s=timeout_s,
-            mps_env=mps_env,
-        )
-        if overlap_launch["status"] != "ok":
-            error = overlap_launch["error"]
-            attn_stage = {
-                "status": "timeout",
-                "error": error,
-                "timing_ms": None,
-                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
-                "enqueue_windows": [],
-                "output_signature": None,
-                "finite": {"all_finite": False, "first_nonfinite": None},
-            }
-            moe_stage = {
-                "status": "timeout",
-                "error": error,
-                "timing_ms": None,
-                "timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
-                "enqueue_windows": [],
-                "output_signature": None,
-                "finite": {"all_finite": False, "first_nonfinite": None},
-            }
-            host_overlap_ms = 0.0
-        else:
-            attn_stage = _aggregate_stage_results("attn", overlap_launch["results"])
-            moe_stage = _aggregate_stage_results("moe", overlap_launch["results"])
-            host_overlap_ms = compute_host_enqueue_overlap_ms(
-                attn_stage.get("enqueue_windows", []),
-                moe_stage.get("enqueue_windows", []),
-            )
-            case_timed_window = _collapse_timed_window_s(
-                [attn_stage.get("timed_window_s"), moe_stage.get("timed_window_s")]
-            )
-            case_timed_wall_ms = case_timed_window["duration_ms"]
 
     wall_ms = (time.perf_counter() - start_s) * 1000.0
     stage_statuses = [attn_stage["status"], moe_stage["status"]]
