@@ -206,10 +206,10 @@ class MegatronSingleLayerRuntime:
             "pipeline_model_parallel_size": 1,
             "expert_model_parallel_size": int(self.config.expert_model_parallel_size),
             "attention_backend": str(self.config.attention_backend),
-            "megatron_moe_grouped_gemm": bool(self.config.moe_grouped_gemm),
+            "megatron_moe_grouped_gemm": True if self.config.moe_grouped_gemm else None,
             "megatron_moe_token_dispatcher_type": str(self.config.moe_token_dispatcher_type),
-            "megatron_overlap_moe_expert_parallel_comm": bool(
-                self.config.overlap_moe_expert_parallel_comm
+            "megatron_overlap_moe_expert_parallel_comm": (
+                True if self.config.overlap_moe_expert_parallel_comm else None
             ),
             "megatron_num_layers": 1,
             "load_weights": False,

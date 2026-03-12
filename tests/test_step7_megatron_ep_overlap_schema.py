@@ -436,6 +436,31 @@ def test_runtime_config_threads_attention_and_moe_overrides_into_engine_config()
     assert trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"] is True
 
 
+def test_runtime_config_omits_false_boolean_moe_overrides():
+    runtime_config = RuntimeConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        stage_role="attn",
+        attention_backend="auto",
+        moe_grouped_gemm=False,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=False,
+        dtype="bf16",
+        seq_len=1024,
+        batch_size=1,
+        seed=1234,
+        expert_model_parallel_size=1,
+        num_experts=None,
+    )
+
+    from examples.attn_moe_overlap.megatron_layer_runtime import MegatronSingleLayerRuntime
+
+    trainer_config = MegatronSingleLayerRuntime(runtime_config)._build_trainer_config()
+    assert trainer_config["engine_config"]["megatron_moe_grouped_gemm"] is None
+    assert trainer_config["engine_config"]["megatron_moe_token_dispatcher_type"] == "alltoall"
+    assert trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"] is None
+
+
 def test_invalid_environment_payload_contract():
     payload = build_invalid_environment_payload(
         case_id="case-invalid",
