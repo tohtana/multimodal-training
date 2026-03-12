@@ -276,6 +276,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nccl-max-ctas", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
     parser.add_argument(
+        "--moe-token-dispatcher-type",
+        choices=["allgather", "alltoall", "flex"],
+        default="allgather",
+        help="Megatron MoE token dispatcher type. Megatron recommends `alltoall` when expert parallelism is used.",
+    )
+    parser.add_argument(
+        "--moe-grouped-gemm",
+        action="store_true",
+        help="Enable Megatron grouped GEMM for local expert MLPs when supported.",
+    )
+    parser.add_argument(
+        "--overlap-moe-expert-parallel-comm",
+        action="store_true",
+        help="Enable Megatron overlap of expert-parallel communication with MoE execution when supported.",
+    )
+    parser.add_argument(
         "--attention-backend",
         choices=["auto", "fused", "flash", "unfused"],
         default="auto",
@@ -442,6 +458,9 @@ def _empty_stage_result(
         "enqueue_windows": [],
         "output_signature": None,
         "finite": {"all_finite": False, "first_nonfinite": None},
+        "moe_grouped_gemm": None,
+        "moe_token_dispatcher_type": None,
+        "overlap_moe_expert_parallel_comm": None,
     }
 
 
@@ -506,6 +525,9 @@ def _worker_main(
     timed_iters: int,
     moe_ep_size: int,
     num_experts: int | None,
+    moe_grouped_gemm: bool,
+    moe_token_dispatcher_type: str,
+    overlap_moe_expert_parallel_comm: bool,
     attention_backend: str,
     nccl_tuple: tuple[int, int, int],
     mps_env: dict[str, str],
@@ -559,6 +581,9 @@ def _worker_main(
                 model_type=model_type,
                 stage_role=role,
                 attention_backend=attention_backend,
+                moe_grouped_gemm=moe_grouped_gemm,
+                moe_token_dispatcher_type=moe_token_dispatcher_type,
+                overlap_moe_expert_parallel_comm=overlap_moe_expert_parallel_comm,
                 dtype=dtype,
                 seq_len=seq_len,
                 batch_size=batch_size,
@@ -610,6 +635,9 @@ def _worker_main(
                 "status": status,
                 "failure_origin": failure_origin,
                 "attention_backend": attention_backend,
+                "moe_grouped_gemm": moe_grouped_gemm,
+                "moe_token_dispatcher_type": moe_token_dispatcher_type,
+                "overlap_moe_expert_parallel_comm": overlap_moe_expert_parallel_comm,
                 **payload,
             },
         )
@@ -655,6 +683,11 @@ def _launch_workers(
                         "timed_iters": common_config["timed_iters"],
                         "moe_ep_size": common_config["moe_ep_size"],
                         "num_experts": common_config["num_experts"],
+                        "moe_grouped_gemm": common_config["moe_grouped_gemm"],
+                        "moe_token_dispatcher_type": common_config["moe_token_dispatcher_type"],
+                        "overlap_moe_expert_parallel_comm": common_config[
+                            "overlap_moe_expert_parallel_comm"
+                        ],
                         "attention_backend": common_config["attention_backend"],
                         "nccl_tuple": common_config["nccl_tuple"],
                         "mps_env": mps_env,
@@ -782,6 +815,9 @@ def _aggregate_stage_results(
         "status": "ok",
         "error": {"code": None, "message": None, "traceback": None},
         "attention_backend": rank0.get("attention_backend"),
+        "moe_grouped_gemm": rank0.get("moe_grouped_gemm"),
+        "moe_token_dispatcher_type": rank0.get("moe_token_dispatcher_type"),
+        "overlap_moe_expert_parallel_comm": rank0.get("overlap_moe_expert_parallel_comm"),
         "timing_ms": {
             "cuda": (rank0.get("timing_ms") or {}).get("cuda"),
             "step_total": (rank0.get("timing_ms") or {}).get("step_total"),
@@ -920,6 +956,23 @@ def _run_case_attempt(
             "requested": common_config["attention_backend"],
             "attn": attn_stage.get("attention_backend"),
             "moe": moe_stage.get("attention_backend"),
+        },
+        "moe_runtime": {
+            "grouped_gemm": {
+                "requested": common_config["moe_grouped_gemm"],
+                "attn": attn_stage.get("moe_grouped_gemm"),
+                "moe": moe_stage.get("moe_grouped_gemm"),
+            },
+            "token_dispatcher_type": {
+                "requested": common_config["moe_token_dispatcher_type"],
+                "attn": attn_stage.get("moe_token_dispatcher_type"),
+                "moe": moe_stage.get("moe_token_dispatcher_type"),
+            },
+            "overlap_expert_parallel_comm": {
+                "requested": common_config["overlap_moe_expert_parallel_comm"],
+                "attn": attn_stage.get("overlap_moe_expert_parallel_comm"),
+                "moe": moe_stage.get("overlap_moe_expert_parallel_comm"),
+            },
         },
         "timing_ms": {
             "total": wall_ms,
@@ -1173,6 +1226,8 @@ def _run_torch_profiler_capture(
             "off",
             "--attention-backend",
             str(args.attention_backend),
+            "--moe-token-dispatcher-type",
+            str(args.moe_token_dispatcher_type),
             "--torch-profiler-trace-dir",
             str(trace_dir),
             "--torch-profiler-wait-iters",
@@ -1181,6 +1236,10 @@ def _run_torch_profiler_capture(
             str(args.torch_profiler_active_iters),
             "--rerun-existing",
         ]
+        if args.moe_grouped_gemm:
+            cmd.append("--moe-grouped-gemm")
+        if args.overlap_moe_expert_parallel_comm:
+            cmd.append("--overlap-moe-expert-parallel-comm")
         completed = subprocess.run(cmd, capture_output=True, text=True)
         trace_files = [str(path) for path in sorted(trace_dir.rglob("*.pt.trace.json"))]
         entries.append(
@@ -1291,6 +1350,9 @@ def main() -> int:
                 "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
                 "capture_nsys": args.capture_nsys,
                 "attention_backend": args.attention_backend,
+                "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
+                "moe_grouped_gemm": args.moe_grouped_gemm,
+                "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
             },
             cases=all_case_payloads,
             total_points=total_points,
@@ -1334,6 +1396,9 @@ def main() -> int:
                     "timed_iters": args.timed_iters,
                     "moe_ep_size": args.moe_ep_size,
                     "num_experts": args.num_experts,
+                    "moe_grouped_gemm": args.moe_grouped_gemm,
+                    "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
+                    "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
                     "attention_backend": args.attention_backend,
                     "nccl_tuple": nccl_tuple,
                     "profiler_trace_root": args.torch_profiler_trace_dir,
@@ -1370,6 +1435,7 @@ def main() -> int:
                         retry_trigger=retry_trigger,
                     )
                     payload["attention_backend"] = attempt_result["attention_backend"]
+                    payload["moe_runtime"] = attempt_result["moe_runtime"]
 
                     if should_retry(payload["status"], attempt_count):
                         retry_trigger = payload["status"]
@@ -1438,6 +1504,10 @@ def main() -> int:
                 "dtypes": dtypes,
                 "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
                 "capture_nsys": args.capture_nsys,
+                "attention_backend": args.attention_backend,
+                "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
+                "moe_grouped_gemm": args.moe_grouped_gemm,
+                "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
             },
             cases=all_case_payloads,
             total_points=total_points,
@@ -1497,6 +1567,10 @@ def main() -> int:
         "batch_size": args.batch_size,
         "capture_nsys": args.capture_nsys,
         "nsys_status": nsys_status,
+        "attention_backend": args.attention_backend,
+        "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
+        "moe_grouped_gemm": args.moe_grouped_gemm,
+        "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
         "capture_torch_profiler": args.capture_torch_profiler,
         "torch_profiler_wait_iters": args.torch_profiler_wait_iters,
         "torch_profiler_active_iters": args.torch_profiler_active_iters,

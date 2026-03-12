@@ -142,6 +142,9 @@ class RuntimeConfig:
     model_type: str
     stage_role: str
     attention_backend: str
+    moe_grouped_gemm: bool
+    moe_token_dispatcher_type: str
+    overlap_moe_expert_parallel_comm: bool
     dtype: str
     seq_len: int
     batch_size: int
@@ -203,6 +206,11 @@ class MegatronSingleLayerRuntime:
             "pipeline_model_parallel_size": 1,
             "expert_model_parallel_size": int(self.config.expert_model_parallel_size),
             "attention_backend": str(self.config.attention_backend),
+            "megatron_moe_grouped_gemm": bool(self.config.moe_grouped_gemm),
+            "megatron_moe_token_dispatcher_type": str(self.config.moe_token_dispatcher_type),
+            "megatron_overlap_moe_expert_parallel_comm": bool(
+                self.config.overlap_moe_expert_parallel_comm
+            ),
             "megatron_num_layers": 1,
             "load_weights": False,
             "use_cpu_initialization": True,
@@ -416,6 +424,9 @@ class MegatronSingleLayerRuntime:
             "status": "ok",
             "stage_role": self.config.stage_role,
             "attention_backend": self.config.attention_backend,
+            "moe_grouped_gemm": self.config.moe_grouped_gemm,
+            "moe_token_dispatcher_type": self.config.moe_token_dispatcher_type,
+            "overlap_moe_expert_parallel_comm": self.config.overlap_moe_expert_parallel_comm,
             "timing_ms": {
                 "cuda": mean_cuda_ms,
                 "step_total": mean_step_ms,

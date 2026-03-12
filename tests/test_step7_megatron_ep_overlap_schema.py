@@ -186,6 +186,9 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "status": "ok",
                     "failure_origin": False,
                     "attention_backend": "auto",
+                    "moe_grouped_gemm": True,
+                    "moe_token_dispatcher_type": "alltoall",
+                    "overlap_moe_expert_parallel_comm": True,
                     "timing_ms": {"cuda": 1.25, "step_total": 1.5, "timed_wall": 400.0},
                     "timed_window_s": {"start_s": 10.1, "end_s": 10.5, "duration_ms": 400.0},
                     "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
@@ -199,6 +202,9 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "status": "ok",
                     "failure_origin": False,
                     "attention_backend": "auto",
+                    "moe_grouped_gemm": True,
+                    "moe_token_dispatcher_type": "alltoall",
+                    "overlap_moe_expert_parallel_comm": True,
                     "timing_ms": {"cuda": 2.5, "step_total": 3.0, "timed_wall": 700.0},
                     "timed_window_s": {"start_s": 10.2, "end_s": 10.9, "duration_ms": 700.0},
                     "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
@@ -227,6 +233,9 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
             "timed_iters": 3,
             "moe_ep_size": 4,
             "num_experts": None,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "alltoall",
+            "overlap_moe_expert_parallel_comm": True,
             "attention_backend": "auto",
             "nccl_tuple": (4, 16, 32),
             "profiler_trace_root": None,
@@ -244,6 +253,11 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
     assert {spec["role"] for spec in calls[0]["stage_specs"]} == {"attn", "moe"}
     assert result["status"] == "ok"
     assert result["attention_backend"] == {"requested": "auto", "attn": "auto", "moe": "auto"}
+    assert result["moe_runtime"] == {
+        "grouped_gemm": {"requested": True, "attn": True, "moe": True},
+        "token_dispatcher_type": {"requested": "alltoall", "attn": "alltoall", "moe": "alltoall"},
+        "overlap_expert_parallel_comm": {"requested": True, "attn": True, "moe": True},
+    }
     assert result["timing_ms"]["timed_wall"] == pytest.approx(1000.0)
     assert result["timing_ms"]["attn"] == pytest.approx(1.25)
     assert result["timing_ms"]["moe"] == pytest.approx(2.5)
@@ -308,6 +322,9 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         timed_iters=3,
         worker_timeout_s=180.0,
         attention_backend="fused",
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=True,
         torch_profiler_wait_iters=11,
         torch_profiler_active_iters=2,
     )
@@ -327,6 +344,9 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert calls[0][1] == str((REPO_ROOT / "examples/attn_moe_overlap/step7_megatron_ep_overlap.py").resolve())
     assert "-m" not in calls[0]
     assert calls[0][calls[0].index("--attention-backend") + 1] == "fused"
+    assert calls[0][calls[0].index("--moe-token-dispatcher-type") + 1] == "alltoall"
+    assert "--moe-grouped-gemm" in calls[0]
+    assert "--overlap-moe-expert-parallel-comm" in calls[0]
     assert calls[0][calls[0].index("--torch-profiler-wait-iters") + 1] == "11"
 
     trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
@@ -390,12 +410,15 @@ def test_retry_policy_allows_single_retry_only_for_oom_timeout():
     assert should_retry("oom", 2) is False
 
 
-def test_runtime_config_uses_auto_attention_backend_by_default():
+def test_runtime_config_threads_attention_and_moe_overrides_into_engine_config():
     runtime_config = RuntimeConfig(
         model_name="Qwen/Qwen3-30B-A3B",
         model_type="qwen3_moe",
         stage_role="attn",
         attention_backend="auto",
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=True,
         dtype="bf16",
         seq_len=1024,
         batch_size=1,
@@ -408,6 +431,9 @@ def test_runtime_config_uses_auto_attention_backend_by_default():
 
     trainer_config = MegatronSingleLayerRuntime(runtime_config)._build_trainer_config()
     assert trainer_config["engine_config"]["attention_backend"] == "auto"
+    assert trainer_config["engine_config"]["megatron_moe_grouped_gemm"] is True
+    assert trainer_config["engine_config"]["megatron_moe_token_dispatcher_type"] == "alltoall"
+    assert trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"] is True
 
 
 def test_invalid_environment_payload_contract():
