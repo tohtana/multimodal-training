@@ -131,7 +131,9 @@ def parse_dtypes(raw: str) -> list[str]:
     return values
 
 
-def canonical_nccl_tuple(nccl_tuple: tuple[int, int, int]) -> str:
+def canonical_nccl_tuple(nccl_tuple: tuple[int, int, int] | None) -> str:
+    if nccl_tuple is None:
+        return "off"
     return f"{nccl_tuple[0]},{nccl_tuple[1]},{nccl_tuple[2]}"
 
 
@@ -141,18 +143,21 @@ def parse_nccl_tuples(
     nccl_socket_nthreads: int | None,
     nccl_max_nchannels: int | None,
     nccl_max_ctas: int | None,
-) -> list[tuple[int, int, int]]:
+) -> list[tuple[int, int, int] | None]:
     has_fallback = any(
         value is not None for value in (nccl_socket_nthreads, nccl_max_nchannels, nccl_max_ctas)
     )
     if nccl_tuples and has_fallback:
         raise ValueError("Do not mix --nccl-tuples with --nccl-socket-nthreads/--nccl-max-nchannels/--nccl-max-ctas")
 
-    parsed: list[tuple[int, int, int]] = []
+    parsed: list[tuple[int, int, int] | None] = []
     if nccl_tuples:
         for raw_tuple in nccl_tuples.split(";"):
             token = raw_tuple.strip()
             if not token:
+                continue
+            if token.lower() in {"off", "none", "unset", "disabled"}:
+                parsed.append(None)
                 continue
             parts = [part.strip() for part in token.split(",")]
             if len(parts) != 3:
@@ -162,25 +167,36 @@ def parse_nccl_tuples(
             except ValueError as exc:
                 raise ValueError(f"Invalid NCCL tuple {token!r}: values must be integers") from exc
             parsed.append(triple)  # type: ignore[arg-type]
-    else:
-        # Keep defaults modest and explicit when tuple list is omitted.
+    elif has_fallback:
         triple = (
             int(nccl_socket_nthreads or 4),
             int(nccl_max_nchannels or 16),
             int(nccl_max_ctas or 32),
         )
         parsed.append(triple)
+    else:
+        parsed.append(None)
 
-    deduped: list[tuple[int, int, int]] = []
-    seen: set[tuple[int, int, int]] = set()
+    if parsed.count(None) and len(parsed) > 1:
+        raise ValueError("Do not mix disabled NCCL tuning with explicit NCCL tuples")
+
+    deduped: list[tuple[int, int, int] | None] = []
+    seen: set[str] = set()
     for triple in parsed:
+        canonical = canonical_nccl_tuple(triple)
+        if triple is None:
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            deduped.append(triple)
+            continue
         if len(triple) != 3:
             raise ValueError(f"Invalid NCCL tuple length: {triple}")
         if any(value <= 0 for value in triple):
             raise ValueError(f"NCCL tuple values must be positive integers: {triple}")
-        if triple in seen:
+        if canonical in seen:
             continue
-        seen.add(triple)
+        seen.add(canonical)
         deduped.append(triple)
     return deduped
 
@@ -203,8 +219,9 @@ def build_case_id(
     moe_ep_size: int,
     attn_gpu_ids: Iterable[int],
     moe_gpu_ids: Iterable[int],
-    nccl_tuple: tuple[int, int, int],
+    nccl_tuple: tuple[int, int, int] | None,
 ) -> str:
+    nccl_fragment = "off" if nccl_tuple is None else f"{nccl_tuple[0]}_{nccl_tuple[1]}_{nccl_tuple[2]}"
     return "__".join(
         (
             f"mode-{mode}",
@@ -216,7 +233,7 @@ def build_case_id(
             f"ep-{moe_ep_size}",
             f"attn-{_gpu_ids_fragment(attn_gpu_ids)}",
             f"moe-{_gpu_ids_fragment(moe_gpu_ids)}",
-            f"nccl-{nccl_tuple[0]}_{nccl_tuple[1]}_{nccl_tuple[2]}",
+            f"nccl-{nccl_fragment}",
         )
     )
 

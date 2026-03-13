@@ -72,6 +72,34 @@ def _timed_window_from_bounds(start_s: float | None, end_s: float | None) -> dic
     }
 
 
+def _enum_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name.lower()
+    return str(value)
+
+
+def describe_attention_runtime(layer: Any, requested_backend: str) -> dict[str, Any]:
+    config = getattr(layer, "config", None)
+    self_attention = getattr(layer, "self_attention", None)
+    core_attention = getattr(self_attention, "core_attention", None) if self_attention is not None else None
+    return {
+        "requested_backend": str(requested_backend),
+        "config_attention_backend": _enum_name(getattr(config, "attention_backend", None)),
+        "transformer_impl": getattr(config, "transformer_impl", None),
+        "layer_class": type(layer).__name__,
+        "self_attention_class": type(self_attention).__name__ if self_attention is not None else None,
+        "core_attention_class": type(core_attention).__name__ if core_attention is not None else None,
+        "nvte_backend_flags": {
+            "flash": os.getenv("NVTE_FLASH_ATTN"),
+            "fused": os.getenv("NVTE_FUSED_ATTN"),
+            "unfused": os.getenv("NVTE_UNFUSED_ATTN"),
+        },
+    }
+
+
 class ScheduleAborted(RuntimeError):
     """Raised when a peer failure aborts the shared launch schedule."""
 
@@ -186,6 +214,7 @@ class MegatronSingleLayerRuntime:
         self.layer = None
         self.hidden_states: torch.Tensor | None = None
         self.attention_mask: torch.Tensor | None = None
+        self.attention_runtime: dict[str, Any] | None = None
 
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
@@ -195,6 +224,7 @@ class MegatronSingleLayerRuntime:
         self.trainer.build_model()
         self.layer = self._resolve_decoder_layer(self.trainer.megatron_model)
         self.layer.eval()
+        self.attention_runtime = describe_attention_runtime(self.layer, self.config.attention_backend)
         hidden_size = int(self.layer.config.hidden_size)
         self.hidden_states = self._build_hidden_states(hidden_size)
         self.attention_mask = self._build_attention_mask()
@@ -424,6 +454,7 @@ class MegatronSingleLayerRuntime:
             "status": "ok",
             "stage_role": self.config.stage_role,
             "attention_backend": self.config.attention_backend,
+            "attention_impl": self.attention_runtime,
             "moe_grouped_gemm": self.config.moe_grouped_gemm,
             "moe_token_dispatcher_type": self.config.moe_token_dispatcher_type,
             "overlap_moe_expert_parallel_comm": self.config.overlap_moe_expert_parallel_comm,

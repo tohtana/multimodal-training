@@ -30,6 +30,7 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
 )
 from examples.attn_moe_overlap.megatron_layer_runtime import (
     RuntimeConfig,
+    describe_attention_runtime,
     _resolve_profiler_schedule,
     _run_iteration_schedule,
 )
@@ -60,6 +61,16 @@ def _sample_nccl() -> dict:
         "max_nchannels": 16,
         "max_ctas": 32,
         "tuple": "4,16,32",
+    }
+
+
+def _sample_nccl_off() -> dict:
+    return {
+        "socket_nthreads": None,
+        "max_nchannels": None,
+        "max_ctas": None,
+        "tuple": "off",
+        "env_applied": False,
     }
 
 
@@ -205,6 +216,15 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "status": "ok",
                     "failure_origin": False,
                     "attention_backend": "auto",
+                    "attention_impl": {
+                        "requested_backend": "auto",
+                        "config_attention_backend": "auto",
+                        "transformer_impl": "transformer_engine",
+                        "layer_class": "TransformerLayer",
+                        "self_attention_class": "SelfAttention",
+                        "core_attention_class": "TEDotProductAttention",
+                        "nvte_backend_flags": {"flash": "1", "fused": "1", "unfused": "1"},
+                    },
                     "moe_grouped_gemm": True,
                     "moe_token_dispatcher_type": "alltoall",
                     "overlap_moe_expert_parallel_comm": True,
@@ -221,6 +241,15 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "status": "ok",
                     "failure_origin": False,
                     "attention_backend": "auto",
+                    "attention_impl": {
+                        "requested_backend": "auto",
+                        "config_attention_backend": "auto",
+                        "transformer_impl": "transformer_engine",
+                        "layer_class": "TransformerLayer",
+                        "self_attention_class": "SelfAttention",
+                        "core_attention_class": "TEDotProductAttention",
+                        "nvte_backend_flags": {"flash": "1", "fused": "1", "unfused": "1"},
+                    },
                     "moe_grouped_gemm": True,
                     "moe_token_dispatcher_type": "alltoall",
                     "overlap_moe_expert_parallel_comm": True,
@@ -272,6 +301,8 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
     assert {spec["role"] for spec in calls[0]["stage_specs"]} == {"attn", "moe"}
     assert result["status"] == "ok"
     assert result["attention_backend"] == {"requested": "auto", "attn": "auto", "moe": "auto"}
+    assert result["attention_impl"]["attn"]["core_attention_class"] == "TEDotProductAttention"
+    assert result["attention_impl"]["attn"]["transformer_impl"] == "transformer_engine"
     assert result["moe_runtime"] == {
         "grouped_gemm": {"requested": True, "attn": True, "moe": True},
         "token_dispatcher_type": {"requested": "alltoall", "attn": "alltoall", "moe": "alltoall"},
@@ -395,6 +426,22 @@ def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
     assert case_id_a != case_id_d
 
 
+def test_case_id_supports_disabled_nccl_tuning():
+    case_id = build_case_id(
+        mode="serial",
+        seq_len=512,
+        batch_size=1,
+        dtype="bf16",
+        seed=1234,
+        attn_dp_size=2,
+        moe_ep_size=4,
+        attn_gpu_ids=[0, 1],
+        moe_gpu_ids=[0, 1, 2, 3],
+        nccl_tuple=None,
+    )
+    assert "nccl-off" in case_id
+
+
 def test_case_payload_validation_requires_contract_keys():
     payload = _sample_case_payload("case-a", "serial")
     assert validate_case_payload(payload) == []
@@ -502,6 +549,12 @@ def test_invalid_environment_payload_contract():
 
 
 def test_parse_nccl_tuples_normalization_and_mixed_arg_rejection():
+    assert parse_nccl_tuples(
+        nccl_tuples=None,
+        nccl_socket_nthreads=None,
+        nccl_max_nchannels=None,
+        nccl_max_ctas=None,
+    ) == [None]
     tuples = parse_nccl_tuples(
         nccl_tuples="4,16,32;8,32,64;4,16,32",
         nccl_socket_nthreads=None,
@@ -509,6 +562,12 @@ def test_parse_nccl_tuples_normalization_and_mixed_arg_rejection():
         nccl_max_ctas=None,
     )
     assert tuples == [(4, 16, 32), (8, 32, 64)]
+    assert parse_nccl_tuples(
+        nccl_tuples="off",
+        nccl_socket_nthreads=None,
+        nccl_max_nchannels=None,
+        nccl_max_ctas=None,
+    ) == [None]
     with pytest.raises(ValueError):
         parse_nccl_tuples(
             nccl_tuples="4,16,32",
@@ -516,6 +575,43 @@ def test_parse_nccl_tuples_normalization_and_mixed_arg_rejection():
             nccl_max_nchannels=None,
             nccl_max_ctas=None,
         )
+    with pytest.raises(ValueError):
+        parse_nccl_tuples(
+            nccl_tuples="off;4,16,32",
+            nccl_socket_nthreads=None,
+            nccl_max_nchannels=None,
+            nccl_max_ctas=None,
+        )
+
+
+def test_describe_attention_runtime_reports_layer_and_nvte_flags(monkeypatch):
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "1")
+
+    class _Backend:
+        name = "auto"
+
+    class _Config:
+        attention_backend = _Backend()
+        transformer_impl = "transformer_engine"
+
+    class _CoreAttention:
+        pass
+
+    class _SelfAttention:
+        core_attention = _CoreAttention()
+
+    class _Layer:
+        config = _Config()
+        self_attention = _SelfAttention()
+
+    info = describe_attention_runtime(_Layer(), requested_backend="auto")
+    assert info["requested_backend"] == "auto"
+    assert info["config_attention_backend"] == "auto"
+    assert info["transformer_impl"] == "transformer_engine"
+    assert info["core_attention_class"] == "_CoreAttention"
+    assert info["nvte_backend_flags"] == {"flash": "1", "fused": "1", "unfused": "1"}
 
 
 def test_matrix_summary_contract_and_status_count_invariant():

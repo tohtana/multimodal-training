@@ -252,7 +252,7 @@ class CaseDescriptor:
     seq_len: int
     batch_size: int
     dtype: str
-    nccl_tuple: tuple[int, int, int]
+    nccl_tuple: tuple[int, int, int] | None
     case_id: str
     baseline_key: str
 
@@ -410,7 +410,7 @@ def _baseline_key(
     seq_len: int,
     batch_size: int,
     dtype: str,
-    nccl_tuple: tuple[int, int, int],
+    nccl_tuple: tuple[int, int, int] | None,
 ) -> str:
     return (
         f"seq={seq_len}|batch={batch_size}|dtype={normalize_dtype_name(dtype)}|"
@@ -424,7 +424,7 @@ def _build_case_descriptors(
     seq_lens: list[int],
     batch_sizes: list[int],
     dtypes: list[str],
-    nccl_tuples: list[tuple[int, int, int]],
+    nccl_tuples: list[tuple[int, int, int] | None],
     seed: int,
     attn_dp_size: int,
     moe_ep_size: int,
@@ -468,6 +468,16 @@ def _null_timed_window() -> dict[str, float | None]:
     return {"start_s": None, "end_s": None, "duration_ms": None}
 
 
+def _nccl_meta(nccl_tuple: tuple[int, int, int] | None) -> dict[str, Any]:
+    return {
+        "socket_nthreads": None if nccl_tuple is None else nccl_tuple[0],
+        "max_nchannels": None if nccl_tuple is None else nccl_tuple[1],
+        "max_ctas": None if nccl_tuple is None else nccl_tuple[2],
+        "tuple": canonical_nccl_tuple(nccl_tuple),
+        "env_applied": nccl_tuple is not None,
+    }
+
+
 def _empty_stage_result(
     *,
     role: str,
@@ -490,6 +500,7 @@ def _empty_stage_result(
         "moe_grouped_gemm": None,
         "moe_token_dispatcher_type": None,
         "overlap_moe_expert_parallel_comm": None,
+        "attention_impl": None,
     }
 
 
@@ -558,7 +569,7 @@ def _worker_main(
     moe_token_dispatcher_type: str,
     overlap_moe_expert_parallel_comm: bool,
     attention_backend: str,
-    nccl_tuple: tuple[int, int, int],
+    nccl_tuple: tuple[int, int, int] | None,
     mps_env: dict[str, str],
     execution_schedule: str,
     iteration_barrier: Any | None,
@@ -598,9 +609,12 @@ def _worker_main(
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
-        os.environ["NCCL_SOCKET_NTHREADS"] = str(nccl_tuple[0])
-        os.environ["NCCL_MAX_NCHANNELS"] = str(nccl_tuple[1])
-        os.environ["NCCL_MAX_CTAS"] = str(nccl_tuple[2])
+        for env_key in ("NCCL_SOCKET_NTHREADS", "NCCL_MAX_NCHANNELS", "NCCL_MAX_CTAS"):
+            os.environ.pop(env_key, None)
+        if nccl_tuple is not None:
+            os.environ["NCCL_SOCKET_NTHREADS"] = str(nccl_tuple[0])
+            os.environ["NCCL_MAX_NCHANNELS"] = str(nccl_tuple[1])
+            os.environ["NCCL_MAX_CTAS"] = str(nccl_tuple[2])
         os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
 
         torch.cuda.set_device(0)
@@ -844,6 +858,7 @@ def _aggregate_stage_results(
         "status": "ok",
         "error": {"code": None, "message": None, "traceback": None},
         "attention_backend": rank0.get("attention_backend"),
+        "attention_impl": rank0.get("attention_impl"),
         "moe_grouped_gemm": rank0.get("moe_grouped_gemm"),
         "moe_token_dispatcher_type": rank0.get("moe_token_dispatcher_type"),
         "overlap_moe_expert_parallel_comm": rank0.get("overlap_moe_expert_parallel_comm"),
@@ -986,6 +1001,10 @@ def _run_case_attempt(
             "attn": attn_stage.get("attention_backend"),
             "moe": moe_stage.get("attention_backend"),
         },
+        "attention_impl": {
+            "attn": attn_stage.get("attention_impl"),
+            "moe": moe_stage.get("attention_impl"),
+        },
         "moe_runtime": {
             "grouped_gemm": {
                 "requested": common_config["moe_grouped_gemm"],
@@ -1075,7 +1094,6 @@ def _invalid_env_matrix(
 ) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for descriptor in cases:
-        nccl_tuple = descriptor.nccl_tuple
         payload = build_invalid_environment_payload(
             case_id=descriptor.case_id,
             mode=descriptor.mode,
@@ -1084,12 +1102,7 @@ def _invalid_env_matrix(
             dtype=descriptor.dtype,
             seed=topology["seed"],
             topology=topology,
-            nccl_env={
-                "socket_nthreads": nccl_tuple[0],
-                "max_nchannels": nccl_tuple[1],
-                "max_ctas": nccl_tuple[2],
-                "tuple": canonical_nccl_tuple(nccl_tuple),
-            },
+            nccl_env=_nccl_meta(descriptor.nccl_tuple),
             message=error_message,
         )
         write_case_json(output_dir=output_dir, payload=payload, strict_schema=strict_schema)
@@ -1142,6 +1155,10 @@ def _requested_moe_runtime(row: dict[str, Any], args: argparse.Namespace) -> tup
     )
 
 
+def _append_nccl_tuple_args(cmd: list[str], nccl_tuple_token: str) -> None:
+    cmd.extend(["--nccl-tuples", nccl_tuple_token])
+
+
 def _run_nsys_capture(
     *,
     args: argparse.Namespace,
@@ -1191,8 +1208,6 @@ def _run_nsys_capture(
             str(row["dtype"]),
             "--single-mode",
             str(row["mode"]),
-            "--nccl-tuples",
-            str(row["nccl"]["tuple"]),
             "--seed",
             str(args.seed),
             "--batch-size",
@@ -1213,6 +1228,7 @@ def _run_nsys_capture(
             "--moe-token-dispatcher-type",
             token_dispatcher,
         ]
+        _append_nccl_tuple_args(cmd, str(row["nccl"]["tuple"]))
         if grouped_gemm:
             cmd.append("--moe-grouped-gemm")
         if overlap_comm:
@@ -1285,8 +1301,6 @@ def _run_torch_profiler_capture(
             str(row["dtype"]),
             "--single-mode",
             str(row["mode"]),
-            "--nccl-tuples",
-            str(row["nccl"]["tuple"]),
             "--seed",
             str(args.seed),
             "--batch-size",
@@ -1315,6 +1329,7 @@ def _run_torch_profiler_capture(
             str(args.torch_profiler_active_iters),
             "--rerun-existing",
         ]
+        _append_nccl_tuple_args(cmd, str(row["nccl"]["tuple"]))
         if grouped_gemm:
             cmd.append("--moe-grouped-gemm")
         if overlap_comm:
@@ -1461,12 +1476,7 @@ def main() -> int:
                         continue
 
                 nccl_tuple = descriptor.nccl_tuple
-                nccl_meta = {
-                    "socket_nthreads": nccl_tuple[0],
-                    "max_nchannels": nccl_tuple[1],
-                    "max_ctas": nccl_tuple[2],
-                    "tuple": canonical_nccl_tuple(nccl_tuple),
-                }
+                nccl_meta = _nccl_meta(nccl_tuple)
                 common_config = {
                     "model_name": args.model_name,
                     "model_type": args.model_type,
@@ -1518,6 +1528,7 @@ def main() -> int:
                         retry_trigger=retry_trigger,
                     )
                     payload["attention_backend"] = attempt_result["attention_backend"]
+                    payload["attention_impl"] = attempt_result["attention_impl"]
                     payload["moe_runtime"] = attempt_result["moe_runtime"]
 
                     if should_retry(payload["status"], attempt_count):
