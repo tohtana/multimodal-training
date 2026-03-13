@@ -12,6 +12,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from examples.attn_moe_overlap.megatron_overlap_schema import (
+    CASE_SCHEMA_VERSION,
+    MATRIX_SCHEMA_VERSION,
     REQUIRED_STATUS_KEYS,
     build_case_id,
     build_case_payload,
@@ -19,6 +21,7 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     build_matrix_summary,
     compute_speedup,
     evaluate_stage_diff,
+    parse_batch_sizes,
     parse_nccl_tuples,
     should_retry,
     should_skip_existing,
@@ -60,12 +63,20 @@ def _sample_nccl() -> dict:
     }
 
 
-def _sample_case_payload(case_id: str, mode: str, status: str = "ok") -> dict:
+def _sample_case_payload(
+    case_id: str,
+    mode: str,
+    status: str = "ok",
+    *,
+    seq_len: int = 512,
+    batch_size: int = 1,
+) -> dict:
     return build_case_payload(
         case_id=case_id,
         status=status,
         mode=mode,
-        seq_len=512,
+        seq_len=seq_len,
+        batch_size=batch_size,
         dtype="bf16",
         seed=1234,
         topology=_sample_topology(),
@@ -103,11 +114,19 @@ def test_collapse_timed_window_spans_earliest_start_to_latest_end():
 
 
 def test_select_torch_profiler_cases_prefers_passing_serial_and_overlap():
-    serial = _sample_case_payload("case-serial", "serial", status="ok")
-    overlap = _sample_case_payload("case-overlap", "overlap", status="ok")
+    serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=1024, batch_size=1)
+    overlap = _sample_case_payload("case-overlap", "overlap", status="ok", seq_len=1024, batch_size=1)
+    later_serial = _sample_case_payload("case-serial-later", "serial", status="ok", seq_len=2048, batch_size=4)
+    later_overlap = _sample_case_payload("case-overlap-later", "overlap", status="ok", seq_len=2048, batch_size=4)
     failed_overlap = _sample_case_payload("case-overlap-bad", "overlap", status="runtime_error")
-    selected = _select_torch_profiler_cases([failed_overlap, serial, overlap])
-    assert [row["case_id"] for row in selected] == ["case-serial", "case-overlap"]
+    selected = _select_torch_profiler_cases([failed_overlap, serial, overlap, later_serial, later_overlap])
+    assert [row["case_id"] for row in selected] == ["case-serial-later", "case-overlap-later"]
+
+
+def test_parse_batch_sizes_requires_positive_integers():
+    assert parse_batch_sizes("1, 2,4") == [1, 2, 4]
+    with pytest.raises(ValueError):
+        parse_batch_sizes("1,0")
 
 
 def test_resolve_profiler_schedule_defaults_wait_to_warmup():
@@ -328,8 +347,8 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         torch_profiler_wait_iters=11,
         torch_profiler_active_iters=2,
     )
-    serial = _sample_case_payload("case-serial", "serial", status="ok")
-    overlap = _sample_case_payload("case-overlap", "overlap", status="ok")
+    serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=2048, batch_size=4)
+    overlap = _sample_case_payload("case-overlap", "overlap", status="ok", seq_len=2048, batch_size=4)
 
     status = _run_torch_profiler_capture(
         args=args,
@@ -347,6 +366,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert calls[0][calls[0].index("--moe-token-dispatcher-type") + 1] == "alltoall"
     assert "--moe-grouped-gemm" in calls[0]
     assert "--overlap-moe-expert-parallel-comm" in calls[0]
+    assert calls[0][calls[0].index("--batch-size") + 1] == "4"
     assert calls[0][calls[0].index("--torch-profiler-wait-iters") + 1] == "11"
 
     trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
@@ -354,10 +374,11 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert all(entry["trace_files"] == [f"{entry['trace_dir']}/worker0.pt.trace.json"] for entry in trace_index["entries"])
 
 
-def test_case_id_is_deterministic_and_sensitive_to_nccl_tuple():
+def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
     kwargs = {
         "mode": "serial",
         "seq_len": 512,
+        "batch_size": 1,
         "dtype": "bf16",
         "seed": 1234,
         "attn_dp_size": 2,
@@ -368,8 +389,10 @@ def test_case_id_is_deterministic_and_sensitive_to_nccl_tuple():
     case_id_a = build_case_id(**kwargs, nccl_tuple=(4, 16, 32))
     case_id_b = build_case_id(**kwargs, nccl_tuple=(4, 16, 32))
     case_id_c = build_case_id(**kwargs, nccl_tuple=(8, 16, 32))
+    case_id_d = build_case_id(**{**kwargs, "batch_size": 4}, nccl_tuple=(4, 16, 32))
     assert case_id_a == case_id_b
     assert case_id_a != case_id_c
+    assert case_id_a != case_id_d
 
 
 def test_case_payload_validation_requires_contract_keys():
@@ -466,6 +489,7 @@ def test_invalid_environment_payload_contract():
         case_id="case-invalid",
         mode="serial",
         seq_len=512,
+        batch_size=2,
         dtype="bf16",
         seed=1234,
         topology=_sample_topology(),
@@ -474,6 +498,7 @@ def test_invalid_environment_payload_contract():
     )
     assert payload["status"] == "invalid_environment"
     assert payload["error"]["code"] == "invalid_environment"
+    assert payload["batch_size"] == 2
 
 
 def test_parse_nccl_tuples_normalization_and_mixed_arg_rejection():
@@ -494,24 +519,80 @@ def test_parse_nccl_tuples_normalization_and_mixed_arg_rejection():
 
 
 def test_matrix_summary_contract_and_status_count_invariant():
-    serial = _sample_case_payload("case-serial", "serial", status="ok")
-    overlap = _sample_case_payload("case-overlap", "overlap", status="oom")
+    serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=1024, batch_size=2)
+    overlap = _sample_case_payload("case-overlap", "overlap", status="oom", seq_len=1024, batch_size=2)
     overlap["attempt_count"] = 2
     summary = build_matrix_summary(
-        run_config={"model_name": "Qwen/Qwen3-30B-A3B", "model_type": "qwen3_moe"},
+        run_config={
+            "model_name": "Qwen/Qwen3-30B-A3B",
+            "model_type": "qwen3_moe",
+            "batch_sizes": [2],
+            "batch_size": 2,
+        },
         cases=[serial, overlap],
         total_points=2,
     )
     assert validate_matrix_summary(summary) == []
+    assert summary["schema_version"] == MATRIX_SCHEMA_VERSION
     by_status = summary["counts"]["by_status"]
     assert by_status["ok"] == 1
     assert by_status["oom"] == 1
     assert sum(by_status.values()) == summary["counts"]["completed_cases"]
     for key in REQUIRED_STATUS_KEYS:
         assert key in by_status
+    assert summary["counts"]["comparison_points"] == 1
+    comparison_row = summary["comparison_rows"][0]
+    assert comparison_row["seq_len"] == 1024
+    assert comparison_row["batch_size"] == 2
+    assert comparison_row["serial_status"] == "ok"
+    assert comparison_row["overlap_status"] == "oom"
+    assert comparison_row["overlap_total_ms"] is None
+    assert comparison_row["timed_speedup_vs_serial"] is None
 
 
 def test_resume_skip_behavior_honors_rerun_flag():
     payload = _sample_case_payload("case-existing", "serial", status="runtime_error")
     assert should_skip_existing(payload, rerun_existing=False) is True
     assert should_skip_existing(payload, rerun_existing=True) is False
+
+
+def test_legacy_case_payload_is_not_reused_for_resume_or_comparison():
+    payload = _sample_case_payload("case-legacy", "serial", status="ok")
+    payload["schema_version"] = "megatron_ep_overlap.case.v1"
+    del payload["batch_size"]
+    assert should_skip_existing(payload, rerun_existing=False) is False
+
+
+def test_case_payload_uses_v2_schema():
+    payload = _sample_case_payload("case-v2", "serial", status="ok")
+    assert payload["schema_version"] == CASE_SCHEMA_VERSION
+
+
+def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path):
+    args = SimpleNamespace(
+        capture_torch_profiler="on",
+        output_dir=str(tmp_path / "out"),
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        attn_dp_size=4,
+        moe_ep_size=4,
+        seed=1234,
+        batch_size=1,
+        warmup_iters=1,
+        timed_iters=3,
+        worker_timeout_s=180.0,
+        attention_backend="auto",
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=False,
+        torch_profiler_wait_iters=11,
+        torch_profiler_active_iters=2,
+    )
+    status = _run_torch_profiler_capture(
+        args=args,
+        cases=[_sample_case_payload("case-bad", "overlap", status="runtime_error", batch_size=4)],
+        attn_gpu_ids=[0, 1, 2, 3],
+        moe_gpu_ids=[0, 1, 2, 3],
+    )
+    assert status == "off"
+    assert not (tmp_path / "out" / "torch_profiler" / "trace_index.json").exists()

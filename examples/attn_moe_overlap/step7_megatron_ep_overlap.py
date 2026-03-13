@@ -62,6 +62,7 @@ try:
         evaluate_stage_diff,
         is_terminal_status,
         normalize_dtype_name,
+        parse_batch_sizes,
         parse_dtypes,
         parse_gpu_ids,
         parse_nccl_tuples,
@@ -89,6 +90,7 @@ except ModuleNotFoundError:
         evaluate_stage_diff,
         is_terminal_status,
         normalize_dtype_name,
+        parse_batch_sizes,
         parse_dtypes,
         parse_gpu_ids,
         parse_nccl_tuples,
@@ -248,6 +250,7 @@ class MultiGpuMPSContext:
 class CaseDescriptor:
     mode: str
     seq_len: int
+    batch_size: int
     dtype: str
     nccl_tuple: tuple[int, int, int]
     case_id: str
@@ -267,6 +270,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtypes", type=str, default=None)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-sizes", type=str, default=None)
     parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--timed-iters", type=int, default=2)
     parser.add_argument("--worker-timeout-s", type=float, default=600.0)
@@ -316,6 +320,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-strict-schema", dest="strict_schema", action="store_false")
     parser.add_argument("--mps-active-thread-pct", type=int, default=None)
     return parser.parse_args()
+
+
+def _resolve_batch_sizes(args: argparse.Namespace) -> list[int]:
+    single_batch_sizes = parse_batch_sizes(str(args.batch_size))
+    if args.batch_sizes is None:
+        return single_batch_sizes
+
+    batch_sizes = parse_batch_sizes(args.batch_sizes)
+    if batch_sizes != single_batch_sizes and args.batch_size != 1:
+        raise ValueError(
+            "--batch-size and --batch-sizes must resolve to the same values when both are provided"
+        )
+    return batch_sizes
 
 
 def _validate_topology(
@@ -389,14 +406,23 @@ def _preflight_errors(
     return errors
 
 
-def _baseline_key(seq_len: int, dtype: str, nccl_tuple: tuple[int, int, int]) -> str:
-    return f"seq={seq_len}|dtype={normalize_dtype_name(dtype)}|nccl={canonical_nccl_tuple(nccl_tuple)}"
+def _baseline_key(
+    seq_len: int,
+    batch_size: int,
+    dtype: str,
+    nccl_tuple: tuple[int, int, int],
+) -> str:
+    return (
+        f"seq={seq_len}|batch={batch_size}|dtype={normalize_dtype_name(dtype)}|"
+        f"nccl={canonical_nccl_tuple(nccl_tuple)}"
+    )
 
 
 def _build_case_descriptors(
     *,
     modes: list[str],
     seq_lens: list[int],
+    batch_sizes: list[int],
     dtypes: list[str],
     nccl_tuples: list[tuple[int, int, int]],
     seed: int,
@@ -407,31 +433,34 @@ def _build_case_descriptors(
 ) -> list[CaseDescriptor]:
     cases: list[CaseDescriptor] = []
     for seq_len in seq_lens:
-        for dtype in dtypes:
-            for nccl_tuple in nccl_tuples:
-                for mode in modes:
-                    baseline_key = _baseline_key(seq_len, dtype, nccl_tuple)
-                    case_id = build_case_id(
-                        mode=mode,
-                        seq_len=seq_len,
-                        dtype=dtype,
-                        seed=seed,
-                        attn_dp_size=attn_dp_size,
-                        moe_ep_size=moe_ep_size,
-                        attn_gpu_ids=attn_gpu_ids,
-                        moe_gpu_ids=moe_gpu_ids,
-                        nccl_tuple=nccl_tuple,
-                    )
-                    cases.append(
-                        CaseDescriptor(
+        for batch_size in batch_sizes:
+            for dtype in dtypes:
+                for nccl_tuple in nccl_tuples:
+                    for mode in modes:
+                        baseline_key = _baseline_key(seq_len, batch_size, dtype, nccl_tuple)
+                        case_id = build_case_id(
                             mode=mode,
                             seq_len=seq_len,
+                            batch_size=batch_size,
                             dtype=dtype,
+                            seed=seed,
+                            attn_dp_size=attn_dp_size,
+                            moe_ep_size=moe_ep_size,
+                            attn_gpu_ids=attn_gpu_ids,
+                            moe_gpu_ids=moe_gpu_ids,
                             nccl_tuple=nccl_tuple,
-                            case_id=case_id,
-                            baseline_key=baseline_key,
                         )
-                    )
+                        cases.append(
+                            CaseDescriptor(
+                                mode=mode,
+                                seq_len=seq_len,
+                                batch_size=batch_size,
+                                dtype=dtype,
+                                nccl_tuple=nccl_tuple,
+                                case_id=case_id,
+                                baseline_key=baseline_key,
+                            )
+                        )
     return cases
 
 
@@ -1051,6 +1080,7 @@ def _invalid_env_matrix(
             case_id=descriptor.case_id,
             mode=descriptor.mode,
             seq_len=descriptor.seq_len,
+            batch_size=descriptor.batch_size,
             dtype=descriptor.dtype,
             seed=topology["seed"],
             topology=topology,
@@ -1067,6 +1097,51 @@ def _invalid_env_matrix(
     return payloads
 
 
+def _representative_pair_key(payload: dict[str, Any]) -> tuple[int, int, str, str]:
+    return (
+        int(payload.get("seq_len") or 0),
+        int(payload.get("batch_size") or 0),
+        str(payload.get("dtype") or ""),
+        str(payload.get("nccl", {}).get("tuple") or ""),
+    )
+
+
+def _select_representative_case_pair(cases: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    serial_by_key: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    overlap_by_key: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    for row in cases:
+        if row.get("status") != "ok":
+            continue
+        key = _representative_pair_key(row)
+        if row.get("mode") == "serial":
+            serial_by_key[key] = row
+        elif row.get("mode") == "overlap":
+            overlap_by_key[key] = row
+
+    successful_keys = sorted(set(serial_by_key) & set(overlap_by_key))
+    if not successful_keys:
+        return None
+    selected_key = successful_keys[-1]
+    return serial_by_key[selected_key], overlap_by_key[selected_key]
+
+
+def _requested_attention_backend(row: dict[str, Any], args: argparse.Namespace) -> str:
+    requested = (row.get("attention_backend") or {}).get("requested")
+    return str(requested if requested is not None else args.attention_backend)
+
+
+def _requested_moe_runtime(row: dict[str, Any], args: argparse.Namespace) -> tuple[bool, str, bool]:
+    moe_runtime = row.get("moe_runtime") or {}
+    grouped_gemm = (moe_runtime.get("grouped_gemm") or {}).get("requested")
+    token_dispatcher = (moe_runtime.get("token_dispatcher_type") or {}).get("requested")
+    overlap_comm = (moe_runtime.get("overlap_expert_parallel_comm") or {}).get("requested")
+    return (
+        bool(args.moe_grouped_gemm if grouped_gemm is None else grouped_gemm),
+        str(args.moe_token_dispatcher_type if token_dispatcher is None else token_dispatcher),
+        bool(args.overlap_moe_expert_parallel_comm if overlap_comm is None else overlap_comm),
+    )
+
+
 def _run_nsys_capture(
     *,
     args: argparse.Namespace,
@@ -1079,16 +1154,15 @@ def _run_nsys_capture(
     if shutil.which(args.nsys_bin) is None and not Path(args.nsys_bin).exists():
         return "nsys_capture_failed"
 
-    serial_case = next((row for row in cases if row.get("mode") == "serial" and row.get("status") == "ok"), None)
-    overlap_case = next((row for row in cases if row.get("mode") == "overlap" and row.get("status") == "ok"), None)
-    if serial_case is None or overlap_case is None:
+    selected_pair = _select_representative_case_pair(cases)
+    if selected_pair is None:
         return "off"
-
-    selected = [serial_case, overlap_case]
+    selected = list(selected_pair)
     nsys_dir = Path(args.output_dir) / "nsys"
     nsys_dir.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, Any]] = []
     for row in selected:
+        grouped_gemm, token_dispatcher, overlap_comm = _requested_moe_runtime(row, args)
         out_prefix = nsys_dir / row["case_id"]
         cmd = [
             args.nsys_bin,
@@ -1122,7 +1196,7 @@ def _run_nsys_capture(
             "--seed",
             str(args.seed),
             "--batch-size",
-            str(args.batch_size),
+            str(row["batch_size"]),
             "--warmup-iters",
             "1",
             "--timed-iters",
@@ -1134,7 +1208,15 @@ def _run_nsys_capture(
             "--capture-nsys",
             "off",
             "--rerun-existing",
+            "--attention-backend",
+            _requested_attention_backend(row, args),
+            "--moe-token-dispatcher-type",
+            token_dispatcher,
         ]
+        if grouped_gemm:
+            cmd.append("--moe-grouped-gemm")
+        if overlap_comm:
+            cmd.append("--overlap-moe-expert-parallel-comm")
         completed = subprocess.run(cmd, capture_output=True, text=True)
         entries.append(
             {
@@ -1154,14 +1236,10 @@ def _run_nsys_capture(
 
 
 def _select_torch_profiler_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    serial_case = next((row for row in cases if row.get("mode") == "serial" and row.get("status") == "ok"), None)
-    overlap_case = next((row for row in cases if row.get("mode") == "overlap" and row.get("status") == "ok"), None)
-    if serial_case is not None:
-        selected.append(serial_case)
-    if overlap_case is not None:
-        selected.append(overlap_case)
-    return selected
+    selected_pair = _select_representative_case_pair(cases)
+    if selected_pair is None:
+        return []
+    return list(selected_pair)
 
 
 def _run_torch_profiler_capture(
@@ -1183,6 +1261,7 @@ def _run_torch_profiler_capture(
     entries: list[dict[str, Any]] = []
     step7_script = str(Path(__file__).resolve())
     for row in selected:
+        grouped_gemm, token_dispatcher, overlap_comm = _requested_moe_runtime(row, args)
         trace_dir = profiler_root / row["case_id"]
         rerun_output_dir = profiler_root / f"rerun_{row['case_id']}"
         cmd = [
@@ -1211,7 +1290,7 @@ def _run_torch_profiler_capture(
             "--seed",
             str(args.seed),
             "--batch-size",
-            str(args.batch_size),
+            str(row["batch_size"]),
             "--warmup-iters",
             str(args.warmup_iters),
             "--timed-iters",
@@ -1225,9 +1304,9 @@ def _run_torch_profiler_capture(
             "--capture-torch-profiler",
             "off",
             "--attention-backend",
-            str(args.attention_backend),
+            _requested_attention_backend(row, args),
             "--moe-token-dispatcher-type",
-            str(args.moe_token_dispatcher_type),
+            token_dispatcher,
             "--torch-profiler-trace-dir",
             str(trace_dir),
             "--torch-profiler-wait-iters",
@@ -1236,9 +1315,9 @@ def _run_torch_profiler_capture(
             str(args.torch_profiler_active_iters),
             "--rerun-existing",
         ]
-        if args.moe_grouped_gemm:
+        if grouped_gemm:
             cmd.append("--moe-grouped-gemm")
-        if args.overlap_moe_expert_parallel_comm:
+        if overlap_comm:
             cmd.append("--overlap-moe-expert-parallel-comm")
         completed = subprocess.run(cmd, capture_output=True, text=True)
         trace_files = [str(path) for path in sorted(trace_dir.rglob("*.pt.trace.json"))]
@@ -1290,6 +1369,7 @@ def main() -> int:
     attn_gpu_ids = parse_gpu_ids(args.attn_gpu_ids, field_name="attn-gpu-ids")
     moe_gpu_ids = parse_gpu_ids(args.moe_gpu_ids, field_name="moe-gpu-ids")
     seq_lens = parse_seq_lens(args.seq_lens)
+    batch_sizes = _resolve_batch_sizes(args)
     dtype_raw = args.dtypes if args.dtypes is not None else args.dtype
     dtypes = parse_dtypes(dtype_raw)
     nccl_tuples = parse_nccl_tuples(
@@ -1313,6 +1393,7 @@ def main() -> int:
     cases = _build_case_descriptors(
         modes=modes,
         seq_lens=seq_lens,
+        batch_sizes=batch_sizes,
         dtypes=dtypes,
         nccl_tuples=nccl_tuples,
         seed=args.seed,
@@ -1346,6 +1427,7 @@ def main() -> int:
                 "model_type": args.model_type,
                 "topology": topology,
                 "seq_lens": seq_lens,
+                "batch_sizes": batch_sizes,
                 "dtypes": dtypes,
                 "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
                 "capture_nsys": args.capture_nsys,
@@ -1390,7 +1472,7 @@ def main() -> int:
                     "model_type": args.model_type,
                     "dtype": descriptor.dtype,
                     "seq_len": descriptor.seq_len,
-                    "batch_size": args.batch_size,
+                    "batch_size": descriptor.batch_size,
                     "seed": args.seed,
                     "warmup_iters": args.warmup_iters,
                     "timed_iters": args.timed_iters,
@@ -1422,6 +1504,7 @@ def main() -> int:
                         status=attempt_result["status"],
                         mode=descriptor.mode,
                         seq_len=descriptor.seq_len,
+                        batch_size=descriptor.batch_size,
                         dtype=descriptor.dtype,
                         seed=args.seed,
                         topology=topology,
@@ -1501,6 +1584,7 @@ def main() -> int:
                 "model_type": args.model_type,
                 "topology": topology,
                 "seq_lens": seq_lens,
+                "batch_sizes": batch_sizes,
                 "dtypes": dtypes,
                 "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
                 "capture_nsys": args.capture_nsys,
@@ -1528,43 +1612,17 @@ def main() -> int:
         attn_gpu_ids=attn_gpu_ids,
         moe_gpu_ids=moe_gpu_ids,
     )
-    if nsys_status == "nsys_capture_failed":
-        failed_case = build_case_payload(
-            case_id="nsys_capture_failed",
-            status="nsys_capture_failed",
-            mode="overlap",
-            seq_len=seq_lens[0],
-            dtype=dtypes[0],
-            seed=args.seed,
-            topology=topology,
-            nccl_env={
-                "socket_nthreads": nccl_tuples[0][0],
-                "max_nchannels": nccl_tuples[0][1],
-                "max_ctas": nccl_tuples[0][2],
-                "tuple": canonical_nccl_tuple(nccl_tuples[0]),
-            },
-            error={
-                "code": "nsys_capture_failed",
-                "message": "Nsight Systems capture failed for representative cases",
-                "traceback": None,
-            },
-            attempt_count=1,
-            retry_trigger="none",
-        )
-        write_case_json(output_dir=args.output_dir, payload=failed_case, strict_schema=args.strict_schema)
-        all_case_payloads.append(failed_case)
-
     run_config = {
         "model_name": args.model_name,
         "model_type": args.model_type,
         "topology": topology,
         "seq_lens": seq_lens,
+        "batch_sizes": batch_sizes,
         "dtypes": dtypes,
         "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
         "modes": modes,
         "warmup_iters": args.warmup_iters,
         "timed_iters": args.timed_iters,
-        "batch_size": args.batch_size,
         "capture_nsys": args.capture_nsys,
         "nsys_status": nsys_status,
         "attention_backend": args.attention_backend,
@@ -1576,6 +1634,8 @@ def main() -> int:
         "torch_profiler_active_iters": args.torch_profiler_active_iters,
         "torch_profiler_status": torch_profiler_status,
     }
+    if len(batch_sizes) == 1:
+        run_config["batch_size"] = batch_sizes[0]
     summary = build_matrix_summary(run_config=run_config, cases=all_case_payloads, total_points=total_points)
     write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
     write_matrix_summary_markdown(args.output_dir, summary)

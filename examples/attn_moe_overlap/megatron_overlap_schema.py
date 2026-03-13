@@ -9,8 +9,8 @@ from typing import Any, Iterable
 
 import torch
 
-CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v1"
-MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v1"
+CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v2"
+MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v2"
 
 REQUIRED_STATUS_KEYS = (
     "ok",
@@ -89,6 +89,14 @@ def parse_seq_lens(raw: str) -> list[int]:
     for value in values:
         if value <= 0:
             raise ValueError(f"seq-lens must be > 0: got {value}")
+    return values
+
+
+def parse_batch_sizes(raw: str) -> list[int]:
+    values = parse_int_csv(raw, field_name="batch-sizes")
+    for value in values:
+        if value <= 0:
+            raise ValueError(f"batch-sizes must be > 0: got {value}")
     return values
 
 
@@ -188,6 +196,7 @@ def build_case_id(
     *,
     mode: str,
     seq_len: int,
+    batch_size: int,
     dtype: str,
     seed: int,
     attn_dp_size: int,
@@ -200,6 +209,7 @@ def build_case_id(
         (
             f"mode-{mode}",
             f"seq-{seq_len}",
+            f"batch-{batch_size}",
             f"dtype-{normalize_dtype_name(dtype)}",
             f"seed-{seed}",
             f"dp-{attn_dp_size}",
@@ -334,6 +344,7 @@ def build_case_payload(
     status: str,
     mode: str,
     seq_len: int,
+    batch_size: int,
     dtype: str,
     seed: int,
     topology: dict[str, Any],
@@ -355,6 +366,7 @@ def build_case_payload(
         "status": status,
         "mode": mode,
         "seq_len": int(seq_len),
+        "batch_size": int(batch_size),
         "dtype": normalized_dtype,
         "seed": int(seed),
         "topology": topology,
@@ -399,6 +411,7 @@ def build_invalid_environment_payload(
     case_id: str,
     mode: str,
     seq_len: int,
+    batch_size: int,
     dtype: str,
     seed: int,
     topology: dict[str, Any],
@@ -410,6 +423,7 @@ def build_invalid_environment_payload(
         status="invalid_environment",
         mode=mode,
         seq_len=seq_len,
+        batch_size=batch_size,
         dtype=dtype,
         seed=seed,
         topology=topology,
@@ -426,6 +440,7 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         "status",
         "mode",
         "seq_len",
+        "batch_size",
         "dtype",
         "seed",
         "topology",
@@ -452,6 +467,10 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     status = payload.get("status")
     if status not in REQUIRED_STATUS_KEYS:
         errors.append(f"status must be one of {REQUIRED_STATUS_KEYS}, got {status!r}")
+
+    batch_size = payload.get("batch_size")
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        errors.append(f"batch_size must be a positive integer, got {batch_size!r}")
 
     timing_ms = payload.get("timing_ms")
     if not isinstance(timing_ms, dict):
@@ -551,6 +570,11 @@ def should_retry(status: str, attempt_count: int) -> bool:
 def should_skip_existing(existing_payload: dict[str, Any], rerun_existing: bool) -> bool:
     if rerun_existing:
         return False
+    if existing_payload.get("schema_version") != CASE_SCHEMA_VERSION:
+        return False
+    batch_size = existing_payload.get("batch_size")
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        return False
     status = str(existing_payload.get("status"))
     return is_terminal_status(status)
 
@@ -561,11 +585,67 @@ def _compact_case_row(payload: dict[str, Any]) -> dict[str, Any]:
         "status": payload.get("status"),
         "mode": payload.get("mode"),
         "seq_len": payload.get("seq_len"),
+        "batch_size": payload.get("batch_size"),
         "dtype": payload.get("dtype"),
         "nccl_tuple": payload.get("nccl", {}).get("tuple"),
         "attempt_count": payload.get("attempt_count", 1),
         "artifact_path": payload.get("artifact_path"),
     }
+
+
+def _comparison_group_key(payload: dict[str, Any]) -> tuple[int, int, str, str]:
+    return (
+        int(payload.get("seq_len") or 0),
+        int(payload.get("batch_size") or 0),
+        str(payload.get("dtype") or ""),
+        str(payload.get("nccl", {}).get("tuple") or ""),
+    )
+
+
+def _comparison_row_template(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "seq_len": int(payload.get("seq_len") or 0),
+        "batch_size": int(payload.get("batch_size") or 0),
+        "dtype": payload.get("dtype"),
+        "nccl_tuple": payload.get("nccl", {}).get("tuple"),
+        "serial_case_id": None,
+        "serial_status": "missing",
+        "serial_attn_ms": None,
+        "serial_moe_ms": None,
+        "serial_total_ms": None,
+        "serial_timed_wall_ms": None,
+        "overlap_case_id": None,
+        "overlap_status": "missing",
+        "overlap_attn_ms": None,
+        "overlap_moe_ms": None,
+        "overlap_total_ms": None,
+        "overlap_timed_wall_ms": None,
+        "timed_speedup_vs_serial": None,
+    }
+
+
+def _build_comparison_rows(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    for case in cases:
+        key = _comparison_group_key(case)
+        row = grouped.setdefault(key, _comparison_row_template(case))
+        mode = case.get("mode")
+        prefix = "serial" if mode == "serial" else "overlap" if mode == "overlap" else None
+        if prefix is None:
+            continue
+        status = case.get("status") or "missing"
+        timing_ms = case.get("timing_ms") or {}
+        row[f"{prefix}_case_id"] = case.get("case_id")
+        row[f"{prefix}_status"] = status
+        if status == "ok":
+            row[f"{prefix}_attn_ms"] = timing_ms.get("attn")
+            row[f"{prefix}_moe_ms"] = timing_ms.get("moe")
+            row[f"{prefix}_total_ms"] = timing_ms.get("total")
+            row[f"{prefix}_timed_wall_ms"] = timing_ms.get("timed_wall")
+        if prefix == "overlap" and status == "ok":
+            row["timed_speedup_vs_serial"] = (case.get("overlap") or {}).get("timed_speedup_vs_serial")
+
+    return [grouped[key] for key in sorted(grouped)]
 
 
 def build_matrix_summary(
@@ -583,6 +663,7 @@ def build_matrix_summary(
         by_status[status] += 1
         attempted_cases += max(int(case.get("attempt_count", 1)), 1)
 
+    comparison_rows = _build_comparison_rows(cases)
     summary = {
         "schema_version": MATRIX_SCHEMA_VERSION,
         "run_config": run_config,
@@ -590,9 +671,11 @@ def build_matrix_summary(
             "total_points": int(total_points),
             "attempted_cases": int(attempted_cases),
             "completed_cases": len(cases),
+            "comparison_points": len(comparison_rows),
             "by_status": by_status,
         },
         "cases": [_compact_case_row(case) for case in cases],
+        "comparison_rows": comparison_rows,
         "generated_at": now_utc_iso(),
     }
     return summary
@@ -600,7 +683,7 @@ def build_matrix_summary(
 
 def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    required_top = ("schema_version", "run_config", "counts", "cases", "generated_at")
+    required_top = ("schema_version", "run_config", "counts", "cases", "comparison_rows", "generated_at")
     for key in required_top:
         if key not in summary:
             errors.append(f"missing key: {key}")
@@ -615,7 +698,7 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         errors.append("counts must be an object")
         return errors
 
-    for key in ("total_points", "attempted_cases", "completed_cases", "by_status"):
+    for key in ("total_points", "attempted_cases", "completed_cases", "comparison_points", "by_status"):
         if key not in counts:
             errors.append(f"counts.{key} missing")
 
@@ -634,6 +717,64 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         errors.append(
             f"sum(counts.by_status.values()) must equal completed_cases: {status_sum} != {completed_cases}"
         )
+
+    run_config = summary.get("run_config")
+    if not isinstance(run_config, dict):
+        errors.append("run_config must be an object")
+    else:
+        batch_sizes = run_config.get("batch_sizes")
+        if not isinstance(batch_sizes, list) or not batch_sizes:
+            errors.append("run_config.batch_sizes missing or empty")
+        elif any(not isinstance(value, int) or value <= 0 for value in batch_sizes):
+            errors.append("run_config.batch_sizes must contain positive integers")
+        if "batch_size" in run_config and batch_sizes:
+            if len(batch_sizes) != 1 or int(run_config["batch_size"]) != int(batch_sizes[0]):
+                errors.append("run_config.batch_size must mirror the only entry in run_config.batch_sizes")
+
+    cases = summary.get("cases")
+    if not isinstance(cases, list):
+        errors.append("cases must be an array")
+    else:
+        for index, row in enumerate(cases):
+            if not isinstance(row, dict):
+                errors.append(f"cases[{index}] must be an object")
+                continue
+            if "batch_size" not in row:
+                errors.append(f"cases[{index}].batch_size missing")
+
+    comparison_rows = summary.get("comparison_rows")
+    if not isinstance(comparison_rows, list):
+        errors.append("comparison_rows must be an array")
+    else:
+        required_comparison_keys = (
+            "seq_len",
+            "batch_size",
+            "serial_case_id",
+            "serial_status",
+            "serial_attn_ms",
+            "serial_moe_ms",
+            "serial_total_ms",
+            "serial_timed_wall_ms",
+            "overlap_case_id",
+            "overlap_status",
+            "overlap_attn_ms",
+            "overlap_moe_ms",
+            "overlap_total_ms",
+            "overlap_timed_wall_ms",
+            "timed_speedup_vs_serial",
+        )
+        for index, row in enumerate(comparison_rows):
+            if not isinstance(row, dict):
+                errors.append(f"comparison_rows[{index}] must be an object")
+                continue
+            for key in required_comparison_keys:
+                if key not in row:
+                    errors.append(f"comparison_rows[{index}].{key} missing")
+        if int(counts.get("comparison_points", 0)) != len(comparison_rows):
+            errors.append(
+                "counts.comparison_points must equal len(comparison_rows): "
+                f"{counts.get('comparison_points')} != {len(comparison_rows)}"
+            )
     return errors
 
 
@@ -662,19 +803,46 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- total_points: `{counts.get('total_points')}`")
     lines.append(f"- attempted_cases: `{counts.get('attempted_cases')}`")
     lines.append(f"- completed_cases: `{counts.get('completed_cases')}`")
+    lines.append(f"- comparison_points: `{counts.get('comparison_points')}`")
     lines.append("")
-    lines.append("| case_id | status | mode | seq_len | dtype | nccl_tuple | attempt_count |")
-    lines.append("|---|---|---|---:|---|---|---:|")
+    lines.append("| case_id | status | mode | seq_len | batch_size | dtype | nccl_tuple | attempt_count |")
+    lines.append("|---|---|---|---:|---:|---|---|---:|")
     for row in summary.get("cases", []):
         lines.append(
-            "| {case_id} | {status} | {mode} | {seq_len} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
+            "| {case_id} | {status} | {mode} | {seq_len} | {batch_size} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
                 case_id=row.get("case_id"),
                 status=row.get("status"),
                 mode=row.get("mode"),
                 seq_len=row.get("seq_len"),
+                batch_size=row.get("batch_size"),
                 dtype=row.get("dtype"),
                 nccl_tuple=row.get("nccl_tuple"),
                 attempt_count=row.get("attempt_count"),
+            )
+        )
+    lines.append("")
+    lines.append("## Comparison Rows")
+    lines.append("")
+    lines.append(
+        "| seq_len | batch_size | serial_status | serial_attn_ms | serial_moe_ms | serial_total_ms | overlap_status | overlap_attn_ms | overlap_moe_ms | overlap_total_ms | timed_speedup_vs_serial |"
+    )
+    lines.append(
+        "|---:|---:|---|---:|---:|---:|---|---:|---:|---:|---:|"
+    )
+    for row in summary.get("comparison_rows", []):
+        lines.append(
+            "| {seq_len} | {batch_size} | {serial_status} | {serial_attn_ms} | {serial_moe_ms} | {serial_total_ms} | {overlap_status} | {overlap_attn_ms} | {overlap_moe_ms} | {overlap_total_ms} | {timed_speedup_vs_serial} |".format(
+                seq_len=row.get("seq_len"),
+                batch_size=row.get("batch_size"),
+                serial_status=row.get("serial_status"),
+                serial_attn_ms=row.get("serial_attn_ms"),
+                serial_moe_ms=row.get("serial_moe_ms"),
+                serial_total_ms=row.get("serial_total_ms"),
+                overlap_status=row.get("overlap_status"),
+                overlap_attn_ms=row.get("overlap_attn_ms"),
+                overlap_moe_ms=row.get("overlap_moe_ms"),
+                overlap_total_ms=row.get("overlap_total_ms"),
+                timed_speedup_vs_serial=row.get("timed_speedup_vs_serial"),
             )
         )
     lines.append("")
