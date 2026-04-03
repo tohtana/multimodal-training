@@ -50,11 +50,17 @@ def _early_bootstrap_local_pythonpath() -> list[str]:
 _early_bootstrap_local_pythonpath()
 
 try:
+    from examples.attn_moe_overlap.green_context_utils import (
+        get_device_total_sms,
+        green_context_supported,
+    )
     from examples.attn_moe_overlap.megatron_overlap_schema import (
+        build_config_fingerprint,
         build_case_id,
         build_case_payload,
         build_invalid_environment_payload,
         build_matrix_summary,
+        build_runtime_metadata,
         canonical_nccl_tuple,
         case_output_path,
         compute_host_enqueue_overlap_ms,
@@ -66,6 +72,7 @@ try:
         parse_dtypes,
         parse_gpu_ids,
         parse_nccl_tuples,
+        parse_runtime_backends,
         parse_seq_lens,
         should_retry,
         should_skip_existing,
@@ -78,11 +85,17 @@ try:
         load_case_payload,
     )
 except ModuleNotFoundError:
+    from green_context_utils import (  # type: ignore[no-redef]
+        get_device_total_sms,
+        green_context_supported,
+    )
     from megatron_overlap_schema import (  # type: ignore[no-redef]
+        build_config_fingerprint,
         build_case_id,
         build_case_payload,
         build_invalid_environment_payload,
         build_matrix_summary,
+        build_runtime_metadata,
         canonical_nccl_tuple,
         case_output_path,
         compute_host_enqueue_overlap_ms,
@@ -94,6 +107,7 @@ except ModuleNotFoundError:
         parse_dtypes,
         parse_gpu_ids,
         parse_nccl_tuples,
+        parse_runtime_backends,
         parse_seq_lens,
         should_retry,
         should_skip_existing,
@@ -251,6 +265,9 @@ class CaseDescriptor:
     mode: str
     seq_len: int
     batch_size: int
+    runtime_backend: str
+    green_ctx_attn_sms: int | None
+    green_ctx_moe_sms: int | None
     dtype: str
     nccl_tuple: tuple[int, int, int] | None
     case_id: str
@@ -271,6 +288,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--batch-sizes", type=str, default=None)
+    parser.add_argument("--runtime-backends", type=str, default="mps_only")
+    parser.add_argument("--green-ctx-attn-sms", type=int, default=None)
+    parser.add_argument("--green-ctx-moe-sms", type=int, default=None)
     parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--timed-iters", type=int, default=2)
     parser.add_argument("--worker-timeout-s", type=float, default=600.0)
@@ -335,6 +355,137 @@ def _resolve_batch_sizes(args: argparse.Namespace) -> list[int]:
     return batch_sizes
 
 
+def _resolve_runtime_backends(args: argparse.Namespace) -> list[str]:
+    return parse_runtime_backends(args.runtime_backends)
+
+
+def _resolved_green_ctx_sms(args: argparse.Namespace) -> dict[str, int | None]:
+    return {
+        "attn": None if args.green_ctx_attn_sms is None else int(args.green_ctx_attn_sms),
+        "moe": None if args.green_ctx_moe_sms is None else int(args.green_ctx_moe_sms),
+    }
+
+
+def _device_sm_signature(device_total_sms: dict[int, int]) -> dict[str, int]:
+    return {str(device_id): int(device_total_sms[device_id]) for device_id in sorted(device_total_sms)}
+
+
+def _run_config_identity_fields(
+    *,
+    seq_lens: list[int],
+    batch_sizes: list[int],
+    dtypes: list[str],
+    nccl_tuples: list[tuple[int, int, int] | None],
+    runtime_backends: list[str],
+    green_ctx_sms: dict[str, int | None],
+    device_sm_signature: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "seq_lens": [int(value) for value in seq_lens],
+        "batch_sizes": [int(value) for value in batch_sizes],
+        "dtypes": [normalize_dtype_name(value) for value in dtypes],
+        "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
+        "runtime_backends": list(runtime_backends),
+        "green_ctx_sms": {
+            "attn": green_ctx_sms.get("attn"),
+            "moe": green_ctx_sms.get("moe"),
+        },
+        "device_sm_signature": dict(device_sm_signature),
+    }
+
+
+def _build_run_config(
+    *,
+    args: argparse.Namespace,
+    topology: dict[str, Any],
+    seq_lens: list[int],
+    batch_sizes: list[int],
+    dtypes: list[str],
+    nccl_tuples: list[tuple[int, int, int] | None],
+    runtime_backends: list[str],
+    green_ctx_sms: dict[str, int | None],
+    device_sm_signature: dict[str, int],
+    nsys_status: str | None = None,
+    torch_profiler_status: str | None = None,
+) -> dict[str, Any]:
+    identity_fields = _run_config_identity_fields(
+        seq_lens=seq_lens,
+        batch_sizes=batch_sizes,
+        dtypes=dtypes,
+        nccl_tuples=nccl_tuples,
+        runtime_backends=runtime_backends,
+        green_ctx_sms=green_ctx_sms,
+        device_sm_signature=device_sm_signature,
+    )
+    run_config = {
+        "model_name": args.model_name,
+        "model_type": args.model_type,
+        "topology": topology,
+        **identity_fields,
+        "config_fingerprint": build_config_fingerprint(identity_fields),
+        "modes": [args.single_mode] if args.single_mode is not None else ["serial", "overlap"],
+        "warmup_iters": args.warmup_iters,
+        "timed_iters": args.timed_iters,
+        "capture_nsys": args.capture_nsys,
+        "nsys_status": nsys_status,
+        "attention_backend": args.attention_backend,
+        "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
+        "moe_grouped_gemm": args.moe_grouped_gemm,
+        "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
+        "capture_torch_profiler": args.capture_torch_profiler,
+        "torch_profiler_wait_iters": args.torch_profiler_wait_iters,
+        "torch_profiler_active_iters": args.torch_profiler_active_iters,
+        "torch_profiler_status": torch_profiler_status,
+    }
+    if len(batch_sizes) == 1:
+        run_config["batch_size"] = batch_sizes[0]
+    return run_config
+
+
+def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, Any]) -> None:
+    summary_path = output_dir / "matrix_summary.json"
+    cases_dir = output_dir / "cases"
+    if not summary_path.exists():
+        if cases_dir.exists() and any(cases_dir.glob("*.json")):
+            raise RuntimeError(
+                f"{output_dir} contains case artifacts but no matrix_summary.json; use a fresh output dir"
+            )
+        return
+
+    existing_summary = json.loads(summary_path.read_text())
+    existing_run_config = existing_summary.get("run_config") or {}
+    expected_fields = {
+        key: run_config.get(key)
+        for key in (
+            "seq_lens",
+            "batch_sizes",
+            "dtypes",
+            "nccl_tuples",
+            "runtime_backends",
+            "green_ctx_sms",
+            "device_sm_signature",
+            "config_fingerprint",
+        )
+    }
+    actual_fields = {
+        key: existing_run_config.get(key)
+        for key in (
+            "seq_lens",
+            "batch_sizes",
+            "dtypes",
+            "nccl_tuples",
+            "runtime_backends",
+            "green_ctx_sms",
+            "device_sm_signature",
+            "config_fingerprint",
+        )
+    }
+    if actual_fields != expected_fields:
+        raise RuntimeError(
+            f"Output-dir config mismatch for {output_dir}: expected {expected_fields}, found {actual_fields}"
+        )
+
+
 def _validate_topology(
     *,
     attn_gpu_ids: list[int],
@@ -364,8 +515,11 @@ def _preflight_errors(
     moe_gpu_ids: list[int],
     attn_dp_size: int,
     moe_ep_size: int,
-) -> list[str]:
+    runtime_backends: list[str],
+    green_ctx_sms: dict[str, int | None],
+) -> tuple[list[str], dict[int, int]]:
     errors: list[str] = []
+    device_total_sms: dict[int, int] = {}
     if not model_name.strip():
         errors.append("model-name must be non-empty")
     if not model_type.strip():
@@ -373,11 +527,11 @@ def _preflight_errors(
 
     if not torch.cuda.is_available():
         errors.append("CUDA is not available")
-        return errors
+        return errors, device_total_sms
     cuda_device_count = torch.cuda.device_count()
     if cuda_device_count < 2:
         errors.append(f"Need at least 2 GPUs, found {cuda_device_count}")
-        return errors
+        return errors, device_total_sms
 
     errors.extend(
         _validate_topology(
@@ -402,18 +556,68 @@ def _preflight_errors(
     except Exception as exc:
         errors.append(f"Failed to import swift.megatron: {exc}")
 
-    errors.extend(_check_mps_support_for_devices(sorted(set(attn_gpu_ids + moe_gpu_ids))))
-    return errors
+    unique_gpu_ids = sorted(set(attn_gpu_ids + moe_gpu_ids))
+    errors.extend(_check_mps_support_for_devices(unique_gpu_ids))
+
+    for gpu_id in unique_gpu_ids:
+        properties = torch.cuda.get_device_properties(gpu_id)
+        device_total_sms[gpu_id] = int(properties.multi_processor_count)
+
+    if "mps_green_ctx" in runtime_backends:
+        supported, support_error = green_context_supported()
+        if not supported:
+            errors.append(support_error or "CUDA Green Context support is unavailable")
+
+        for role in ("attn", "moe"):
+            requested = green_ctx_sms.get(role)
+            if requested is None:
+                errors.append(f"--green-ctx-{role}-sms is required when mps_green_ctx is selected")
+            elif requested <= 0:
+                errors.append(f"--green-ctx-{role}-sms must be > 0, got {requested}")
+
+        if supported:
+            for gpu_id in unique_gpu_ids:
+                try:
+                    device_total_sms[gpu_id] = int(get_device_total_sms(gpu_id))
+                except Exception as exc:
+                    errors.append(f"Green Context total-SM query failed for gpu-id {gpu_id}: {exc}")
+
+        unique_total_sms = sorted(set(device_total_sms.values()))
+        if len(unique_total_sms) > 1:
+            errors.append(
+                "Heterogeneous GPU total-SM topology is unsupported for mps_green_ctx: "
+                f"{_device_sm_signature(device_total_sms)}"
+            )
+        for role, gpu_ids in (("attn", attn_gpu_ids), ("moe", moe_gpu_ids)):
+            requested = green_ctx_sms.get(role)
+            if requested is None:
+                continue
+            for gpu_id in gpu_ids:
+                total_sms = device_total_sms.get(gpu_id)
+                if total_sms is not None and requested > total_sms:
+                    errors.append(
+                        f"--green-ctx-{role}-sms ({requested}) exceeds gpu-id {gpu_id} total SMs ({total_sms})"
+                    )
+    return errors, device_total_sms
 
 
 def _baseline_key(
     seq_len: int,
     batch_size: int,
+    runtime_backend: str,
+    green_ctx_attn_sms: int | None,
+    green_ctx_moe_sms: int | None,
     dtype: str,
     nccl_tuple: tuple[int, int, int] | None,
 ) -> str:
+    green_ctx_fragment = (
+        f"gc={int(green_ctx_attn_sms or 0)},{int(green_ctx_moe_sms or 0)}"
+        if runtime_backend == "mps_green_ctx"
+        else "gc=off"
+    )
     return (
-        f"seq={seq_len}|batch={batch_size}|dtype={normalize_dtype_name(dtype)}|"
+        f"seq={seq_len}|batch={batch_size}|backend={runtime_backend}|{green_ctx_fragment}|"
+        f"dtype={normalize_dtype_name(dtype)}|"
         f"nccl={canonical_nccl_tuple(nccl_tuple)}"
     )
 
@@ -423,6 +627,8 @@ def _build_case_descriptors(
     modes: list[str],
     seq_lens: list[int],
     batch_sizes: list[int],
+    runtime_backends: list[str],
+    green_ctx_sms: dict[str, int | None],
     dtypes: list[str],
     nccl_tuples: list[tuple[int, int, int] | None],
     seed: int,
@@ -434,33 +640,48 @@ def _build_case_descriptors(
     cases: list[CaseDescriptor] = []
     for seq_len in seq_lens:
         for batch_size in batch_sizes:
-            for dtype in dtypes:
-                for nccl_tuple in nccl_tuples:
-                    for mode in modes:
-                        baseline_key = _baseline_key(seq_len, batch_size, dtype, nccl_tuple)
-                        case_id = build_case_id(
-                            mode=mode,
-                            seq_len=seq_len,
-                            batch_size=batch_size,
-                            dtype=dtype,
-                            seed=seed,
-                            attn_dp_size=attn_dp_size,
-                            moe_ep_size=moe_ep_size,
-                            attn_gpu_ids=attn_gpu_ids,
-                            moe_gpu_ids=moe_gpu_ids,
-                            nccl_tuple=nccl_tuple,
-                        )
-                        cases.append(
-                            CaseDescriptor(
+            for runtime_backend in runtime_backends:
+                for dtype in dtypes:
+                    for nccl_tuple in nccl_tuples:
+                        for mode in modes:
+                            baseline_key = _baseline_key(
+                                seq_len,
+                                batch_size,
+                                runtime_backend,
+                                green_ctx_sms.get("attn"),
+                                green_ctx_sms.get("moe"),
+                                dtype,
+                                nccl_tuple,
+                            )
+                            case_id = build_case_id(
                                 mode=mode,
                                 seq_len=seq_len,
                                 batch_size=batch_size,
+                                runtime_backend=runtime_backend,
+                                green_ctx_attn_sms=green_ctx_sms.get("attn"),
+                                green_ctx_moe_sms=green_ctx_sms.get("moe"),
                                 dtype=dtype,
+                                seed=seed,
+                                attn_dp_size=attn_dp_size,
+                                moe_ep_size=moe_ep_size,
+                                attn_gpu_ids=attn_gpu_ids,
+                                moe_gpu_ids=moe_gpu_ids,
                                 nccl_tuple=nccl_tuple,
-                                case_id=case_id,
-                                baseline_key=baseline_key,
                             )
-                        )
+                            cases.append(
+                                CaseDescriptor(
+                                    mode=mode,
+                                    seq_len=seq_len,
+                                    batch_size=batch_size,
+                                    runtime_backend=runtime_backend,
+                                    green_ctx_attn_sms=green_ctx_sms.get("attn"),
+                                    green_ctx_moe_sms=green_ctx_sms.get("moe"),
+                                    dtype=dtype,
+                                    nccl_tuple=nccl_tuple,
+                                    case_id=case_id,
+                                    baseline_key=baseline_key,
+                                )
+                            )
     return cases
 
 
@@ -483,6 +704,7 @@ def _empty_stage_result(
     role: str,
     status: str,
     error: dict[str, Any] | None,
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -501,6 +723,12 @@ def _empty_stage_result(
         "moe_token_dispatcher_type": None,
         "overlap_moe_expert_parallel_comm": None,
         "attention_impl": None,
+        "runtime": runtime
+        or {
+            "requested_sms_by_rank": [],
+            "granted_sms_by_rank": [],
+            "device_total_sms_by_rank": [],
+        },
     }
 
 
@@ -557,6 +785,9 @@ def _worker_main(
     master_port: int,
     model_name: str,
     model_type: str,
+    runtime_backend: str,
+    green_ctx_attn_sms: int | None,
+    green_ctx_moe_sms: int | None,
     dtype: str,
     seq_len: int,
     batch_size: int,
@@ -623,6 +854,7 @@ def _worker_main(
                 model_name=model_name,
                 model_type=model_type,
                 stage_role=role,
+                runtime_backend=runtime_backend,
                 attention_backend=attention_backend,
                 moe_grouped_gemm=moe_grouped_gemm,
                 moe_token_dispatcher_type=moe_token_dispatcher_type,
@@ -632,6 +864,8 @@ def _worker_main(
                 batch_size=batch_size,
                 seed=seed,
                 expert_model_parallel_size=moe_ep_size if role == "moe" else 1,
+                green_ctx_attn_sms=green_ctx_attn_sms,
+                green_ctx_moe_sms=green_ctx_moe_sms,
                 num_experts=num_experts,
             )
         )
@@ -718,6 +952,9 @@ def _launch_workers(
                         "master_port": spec["master_port"],
                         "model_name": common_config["model_name"],
                         "model_type": common_config["model_type"],
+                        "runtime_backend": common_config["runtime_backend"],
+                        "green_ctx_attn_sms": common_config["green_ctx_attn_sms"],
+                        "green_ctx_moe_sms": common_config["green_ctx_moe_sms"],
                         "dtype": common_config["dtype"],
                         "seq_len": common_config["seq_len"],
                         "batch_size": common_config["batch_size"],
@@ -810,6 +1047,11 @@ def _aggregate_stage_results(
     fallback_error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     role_results = sorted((item for item in results if item.get("role") == role), key=lambda item: item["rank"])
+    role_runtime = {
+        "requested_sms_by_rank": [((item.get("runtime") or {}).get("requested_sms")) for item in role_results],
+        "granted_sms_by_rank": [((item.get("runtime") or {}).get("granted_sms")) for item in role_results],
+        "device_total_sms_by_rank": [((item.get("runtime") or {}).get("device_total_sms")) for item in role_results],
+    }
     if not role_results:
         return _empty_stage_result(
             role=role,
@@ -826,11 +1068,12 @@ def _aggregate_stage_results(
                 "message": f"{role} rank {failing.get('rank')} failed",
                 "traceback": None,
             }
-            return _empty_stage_result(role=role, status=status, error=error)
+            return _empty_stage_result(role=role, status=status, error=error, runtime=role_runtime)
         return _empty_stage_result(
             role=role,
             status=fallback_status or "runtime_error",
             error=fallback_error,
+            runtime=role_runtime,
         )
 
     failing = _select_root_cause_worker_result(role_results)
@@ -841,7 +1084,7 @@ def _aggregate_stage_results(
             "message": f"{role} rank {failing.get('rank')} failed",
             "traceback": None,
         }
-        return _empty_stage_result(role=role, status=status, error=error)
+        return _empty_stage_result(role=role, status=status, error=error, runtime=role_runtime)
 
     timed_window = _collapse_timed_window_s([item.get("timed_window_s") for item in role_results])
     rank0 = role_results[0]
@@ -871,6 +1114,7 @@ def _aggregate_stage_results(
         "enqueue_windows": rank0.get("enqueue_windows", []),
         "output_signature": rank0.get("output_signature"),
         "finite": {"all_finite": all_finite, "first_nonfinite": first_nonfinite},
+        "runtime": role_runtime,
     }
 
 
@@ -996,6 +1240,20 @@ def _run_case_attempt(
     return {
         "status": status,
         "error": error,
+        "runtime_backend": common_config["runtime_backend"],
+        "runtime": build_runtime_metadata(
+            runtime_backend=common_config["runtime_backend"],
+            green_ctx_attn_sms=common_config["green_ctx_attn_sms"],
+            green_ctx_moe_sms=common_config["green_ctx_moe_sms"],
+            granted_sms_by_role={
+                "attn": (attn_stage.get("runtime") or {}).get("granted_sms_by_rank"),
+                "moe": (moe_stage.get("runtime") or {}).get("granted_sms_by_rank"),
+            },
+            device_total_sms_by_role={
+                "attn": (attn_stage.get("runtime") or {}).get("device_total_sms_by_rank"),
+                "moe": (moe_stage.get("runtime") or {}).get("device_total_sms_by_rank"),
+            },
+        ),
         "attention_backend": {
             "requested": common_config["attention_backend"],
             "attn": attn_stage.get("attention_backend"),
@@ -1099,10 +1357,16 @@ def _invalid_env_matrix(
             mode=descriptor.mode,
             seq_len=descriptor.seq_len,
             batch_size=descriptor.batch_size,
+            runtime_backend=descriptor.runtime_backend,
             dtype=descriptor.dtype,
             seed=topology["seed"],
             topology=topology,
             nccl_env=_nccl_meta(descriptor.nccl_tuple),
+            runtime=build_runtime_metadata(
+                runtime_backend=descriptor.runtime_backend,
+                green_ctx_attn_sms=descriptor.green_ctx_attn_sms,
+                green_ctx_moe_sms=descriptor.green_ctx_moe_sms,
+            ),
             message=error_message,
         )
         write_case_json(output_dir=output_dir, payload=payload, strict_schema=strict_schema)
@@ -1110,32 +1374,68 @@ def _invalid_env_matrix(
     return payloads
 
 
-def _representative_pair_key(payload: dict[str, Any]) -> tuple[int, int, str, str]:
-    return (
-        int(payload.get("seq_len") or 0),
-        int(payload.get("batch_size") or 0),
-        str(payload.get("dtype") or ""),
-        str(payload.get("nccl", {}).get("tuple") or ""),
+def _pair_metric(pair: dict[str, Any]) -> float | None:
+    value = pair.get("delta_overlap_timed_wall_ms")
+    if value is not None:
+        return float(value)
+    value = pair.get("delta_overlap_total_ms")
+    if value is not None:
+        return float(value)
+    return None
+
+
+def _infer_selection_run_config(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    runtime_backends = sorted({str(case.get("runtime_backend") or "") for case in cases if case.get("runtime_backend")})
+    green_ctx_case = next((case for case in cases if case.get("runtime_backend") == "mps_green_ctx"), None)
+    runtime = (green_ctx_case or {}).get("runtime") or {}
+    return {
+        "runtime_backends": runtime_backends,
+        "green_ctx_sms": dict(runtime.get("requested_sms_by_role") or {"attn": None, "moe": None}),
+    }
+
+
+def _select_profiler_backend_pairs(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary = build_matrix_summary(
+        run_config=_infer_selection_run_config(cases),
+        cases=cases,
+        total_points=len(cases),
     )
+    pair_rows = list((summary.get("comparisons") or {}).get("backend_pairs") or [])
+    if not pair_rows:
+        return []
 
+    successful_pairs = [pair for pair in pair_rows if pair.get("pair_status") == "ok" and _pair_metric(pair) is not None]
+    selected: list[dict[str, Any]] = []
 
-def _select_representative_case_pair(cases: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    serial_by_key: dict[tuple[int, int, str, str], dict[str, Any]] = {}
-    overlap_by_key: dict[tuple[int, int, str, str], dict[str, Any]] = {}
-    for row in cases:
-        if row.get("status") != "ok":
+    if successful_pairs:
+        positive_pairs = [pair for pair in successful_pairs if float(_pair_metric(pair) or 0.0) > 0.0]
+        if positive_pairs:
+            selected.append(max(positive_pairs, key=lambda pair: (float(_pair_metric(pair) or 0.0), pair["pair_id"])))
+
+        selected.append(min(successful_pairs, key=lambda pair: (abs(float(_pair_metric(pair) or 0.0)), pair["pair_id"])))
+
+        negative_pairs = [pair for pair in successful_pairs if float(_pair_metric(pair) or 0.0) < 0.0]
+        if negative_pairs:
+            selected.append(min(negative_pairs, key=lambda pair: (float(_pair_metric(pair) or 0.0), pair["pair_id"])))
+        else:
+            failing_pairs = [pair for pair in pair_rows if pair.get("pair_status") != "ok"]
+            if failing_pairs:
+                selected.append(sorted(failing_pairs, key=lambda pair: str(pair.get("pair_id") or ""))[0])
+
+    if not selected:
+        failing_pairs = [pair for pair in pair_rows if pair.get("pair_status") != "ok"]
+        if failing_pairs:
+            selected.append(sorted(failing_pairs, key=lambda pair: str(pair.get("pair_id") or ""))[0])
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pair in selected:
+        pair_id = str(pair.get("pair_id") or "")
+        if pair_id in seen:
             continue
-        key = _representative_pair_key(row)
-        if row.get("mode") == "serial":
-            serial_by_key[key] = row
-        elif row.get("mode") == "overlap":
-            overlap_by_key[key] = row
-
-    successful_keys = sorted(set(serial_by_key) & set(overlap_by_key))
-    if not successful_keys:
-        return None
-    selected_key = successful_keys[-1]
-    return serial_by_key[selected_key], overlap_by_key[selected_key]
+        seen.add(pair_id)
+        deduped.append(pair)
+    return deduped
 
 
 def _requested_attention_backend(row: dict[str, Any], args: argparse.Namespace) -> str:
@@ -1155,6 +1455,39 @@ def _requested_moe_runtime(row: dict[str, Any], args: argparse.Namespace) -> tup
     )
 
 
+def _selected_green_ctx_sms(pair: dict[str, Any]) -> dict[str, int | None]:
+    return dict(pair.get("green_ctx_sms") or {"attn": None, "moe": None})
+
+
+def _select_torch_profiler_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected_pairs = _select_profiler_backend_pairs(cases)
+    if not selected_pairs:
+        return []
+
+    reruns: list[dict[str, Any]] = []
+    for pair in selected_pairs:
+        green_ctx_sms = _selected_green_ctx_sms(pair)
+        for backend in ("mps_only", "mps_green_ctx"):
+            case_id_key = "mps_only_case_id" if backend == "mps_only" else "mps_green_ctx_case_id"
+            if pair.get(case_id_key) is None:
+                continue
+            reruns.append(
+                {
+                    "pair_id": pair["pair_id"],
+                    "runtime_backend": backend,
+                    "case_id": pair[case_id_key],
+                    "mode": "overlap",
+                    "seq_len": pair["seq_len"],
+                    "batch_size": pair["batch_size"],
+                    "dtype": pair["dtype"],
+                    "nccl_tuple": pair["nccl_tuple"],
+                    "green_ctx_sms": green_ctx_sms,
+                    "pair_status": pair["pair_status"],
+                }
+            )
+    return reruns
+
+
 def _append_nccl_tuple_args(cmd: list[str], nccl_tuple_token: str) -> None:
     cmd.extend(["--nccl-tuples", nccl_tuple_token])
 
@@ -1171,16 +1504,16 @@ def _run_nsys_capture(
     if shutil.which(args.nsys_bin) is None and not Path(args.nsys_bin).exists():
         return "nsys_capture_failed"
 
-    selected_pair = _select_representative_case_pair(cases)
-    if selected_pair is None:
+    selected = _select_torch_profiler_cases(cases)
+    if not selected:
         return "off"
-    selected = list(selected_pair)
     nsys_dir = Path(args.output_dir) / "nsys"
     nsys_dir.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, Any]] = []
     for row in selected:
-        grouped_gemm, token_dispatcher, overlap_comm = _requested_moe_runtime(row, args)
-        out_prefix = nsys_dir / row["case_id"]
+        pair_dir = nsys_dir / row["pair_id"] / row["runtime_backend"]
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        out_prefix = pair_dir / row["case_id"]
         cmd = [
             args.nsys_bin,
             "profile",
@@ -1206,6 +1539,8 @@ def _run_nsys_capture(
             str(row["seq_len"]),
             "--dtypes",
             str(row["dtype"]),
+            "--runtime-backends",
+            str(row["runtime_backend"]),
             "--single-mode",
             str(row["mode"]),
             "--seed",
@@ -1219,23 +1554,31 @@ def _run_nsys_capture(
             "--worker-timeout-s",
             str(args.worker_timeout_s),
             "--output-dir",
-            str(nsys_dir / f"rerun_{row['case_id']}"),
+            str(pair_dir / "rerun_output"),
             "--capture-nsys",
+            "off",
+            "--capture-torch-profiler",
             "off",
             "--rerun-existing",
             "--attention-backend",
-            _requested_attention_backend(row, args),
+            args.attention_backend,
             "--moe-token-dispatcher-type",
-            token_dispatcher,
+            args.moe_token_dispatcher_type,
         ]
-        _append_nccl_tuple_args(cmd, str(row["nccl"]["tuple"]))
-        if grouped_gemm:
+        _append_nccl_tuple_args(cmd, str(row["nccl_tuple"]))
+        if args.moe_grouped_gemm:
             cmd.append("--moe-grouped-gemm")
-        if overlap_comm:
+        if args.overlap_moe_expert_parallel_comm:
             cmd.append("--overlap-moe-expert-parallel-comm")
+        if row["runtime_backend"] == "mps_green_ctx":
+            green_ctx_sms = row["green_ctx_sms"]
+            cmd.extend(["--green-ctx-attn-sms", str(green_ctx_sms["attn"])])
+            cmd.extend(["--green-ctx-moe-sms", str(green_ctx_sms["moe"])])
         completed = subprocess.run(cmd, capture_output=True, text=True)
         entries.append(
             {
+                "pair_id": row["pair_id"],
+                "runtime_backend": row["runtime_backend"],
                 "case_id": row["case_id"],
                 "command": cmd,
                 "returncode": completed.returncode,
@@ -1249,15 +1592,6 @@ def _run_nsys_capture(
             return "nsys_capture_failed"
     write_json_atomic(nsys_dir / "trace_index.json", {"status": "ok", "entries": entries})
     return "ok"
-
-
-def _select_torch_profiler_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected_pair = _select_representative_case_pair(cases)
-    if selected_pair is None:
-        return []
-    return list(selected_pair)
-
-
 def _run_torch_profiler_capture(
     *,
     args: argparse.Namespace,
@@ -1277,9 +1611,9 @@ def _run_torch_profiler_capture(
     entries: list[dict[str, Any]] = []
     step7_script = str(Path(__file__).resolve())
     for row in selected:
-        grouped_gemm, token_dispatcher, overlap_comm = _requested_moe_runtime(row, args)
-        trace_dir = profiler_root / row["case_id"]
-        rerun_output_dir = profiler_root / f"rerun_{row['case_id']}"
+        pair_dir = profiler_root / row["pair_id"] / row["runtime_backend"]
+        trace_dir = pair_dir / "trace"
+        rerun_output_dir = pair_dir / "rerun_output"
         cmd = [
             sys.executable,
             step7_script,
@@ -1299,6 +1633,8 @@ def _run_torch_profiler_capture(
             str(row["seq_len"]),
             "--dtypes",
             str(row["dtype"]),
+            "--runtime-backends",
+            str(row["runtime_backend"]),
             "--single-mode",
             str(row["mode"]),
             "--seed",
@@ -1318,9 +1654,9 @@ def _run_torch_profiler_capture(
             "--capture-torch-profiler",
             "off",
             "--attention-backend",
-            _requested_attention_backend(row, args),
+            args.attention_backend,
             "--moe-token-dispatcher-type",
-            token_dispatcher,
+            args.moe_token_dispatcher_type,
             "--torch-profiler-trace-dir",
             str(trace_dir),
             "--torch-profiler-wait-iters",
@@ -1329,15 +1665,21 @@ def _run_torch_profiler_capture(
             str(args.torch_profiler_active_iters),
             "--rerun-existing",
         ]
-        _append_nccl_tuple_args(cmd, str(row["nccl"]["tuple"]))
-        if grouped_gemm:
+        _append_nccl_tuple_args(cmd, str(row["nccl_tuple"]))
+        if args.moe_grouped_gemm:
             cmd.append("--moe-grouped-gemm")
-        if overlap_comm:
+        if args.overlap_moe_expert_parallel_comm:
             cmd.append("--overlap-moe-expert-parallel-comm")
+        if row["runtime_backend"] == "mps_green_ctx":
+            green_ctx_sms = row["green_ctx_sms"]
+            cmd.extend(["--green-ctx-attn-sms", str(green_ctx_sms["attn"])])
+            cmd.extend(["--green-ctx-moe-sms", str(green_ctx_sms["moe"])])
         completed = subprocess.run(cmd, capture_output=True, text=True)
         trace_files = [str(path) for path in sorted(trace_dir.rglob("*.pt.trace.json"))]
         entries.append(
             {
+                "pair_id": row["pair_id"],
+                "runtime_backend": row["runtime_backend"],
                 "case_id": row["case_id"],
                 "mode": row["mode"],
                 "command": cmd,
@@ -1385,6 +1727,8 @@ def main() -> int:
     moe_gpu_ids = parse_gpu_ids(args.moe_gpu_ids, field_name="moe-gpu-ids")
     seq_lens = parse_seq_lens(args.seq_lens)
     batch_sizes = _resolve_batch_sizes(args)
+    runtime_backends = _resolve_runtime_backends(args)
+    green_ctx_sms = _resolved_green_ctx_sms(args)
     dtype_raw = args.dtypes if args.dtypes is not None else args.dtype
     dtypes = parse_dtypes(dtype_raw)
     nccl_tuples = parse_nccl_tuples(
@@ -1405,10 +1749,23 @@ def main() -> int:
         "seed": int(args.seed),
     }
 
+    preflight_errors, device_total_sms = _preflight_errors(
+        model_name=args.model_name,
+        model_type=args.model_type,
+        attn_gpu_ids=attn_gpu_ids,
+        moe_gpu_ids=moe_gpu_ids,
+        attn_dp_size=args.attn_dp_size,
+        moe_ep_size=args.moe_ep_size,
+        runtime_backends=runtime_backends,
+        green_ctx_sms=green_ctx_sms,
+    )
+    device_sm_signature = _device_sm_signature(device_total_sms)
     cases = _build_case_descriptors(
         modes=modes,
         seq_lens=seq_lens,
         batch_sizes=batch_sizes,
+        runtime_backends=runtime_backends,
+        green_ctx_sms=green_ctx_sms,
         dtypes=dtypes,
         nccl_tuples=nccl_tuples,
         seed=args.seed,
@@ -1419,15 +1776,26 @@ def main() -> int:
     )
     total_points = len(cases)
 
-    preflight_errors = _preflight_errors(
-        model_name=args.model_name,
-        model_type=args.model_type,
-        attn_gpu_ids=attn_gpu_ids,
-        moe_gpu_ids=moe_gpu_ids,
-        attn_dp_size=args.attn_dp_size,
-        moe_ep_size=args.moe_ep_size,
-    )
     all_case_payloads: list[dict[str, Any]] = []
+    base_run_config = _build_run_config(
+        args=args,
+        topology=topology,
+        seq_lens=seq_lens,
+        batch_sizes=batch_sizes,
+        dtypes=dtypes,
+        nccl_tuples=nccl_tuples,
+        runtime_backends=runtime_backends,
+        green_ctx_sms=green_ctx_sms,
+        device_sm_signature=device_sm_signature,
+        nsys_status="off" if args.capture_nsys == "off" else None,
+        torch_profiler_status="off" if args.capture_torch_profiler == "off" else None,
+    )
+
+    try:
+        _ensure_output_dir_identity_matches(output_dir, base_run_config)
+    except RuntimeError as exc:
+        preflight_errors.append(str(exc))
+
     if preflight_errors:
         all_case_payloads = _invalid_env_matrix(
             cases=cases,
@@ -1437,20 +1805,7 @@ def main() -> int:
             topology=topology,
         )
         summary = build_matrix_summary(
-            run_config={
-                "model_name": args.model_name,
-                "model_type": args.model_type,
-                "topology": topology,
-                "seq_lens": seq_lens,
-                "batch_sizes": batch_sizes,
-                "dtypes": dtypes,
-                "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
-                "capture_nsys": args.capture_nsys,
-                "attention_backend": args.attention_backend,
-                "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
-                "moe_grouped_gemm": args.moe_grouped_gemm,
-                "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
-            },
+            run_config=base_run_config,
             cases=all_case_payloads,
             total_points=total_points,
         )
@@ -1480,6 +1835,9 @@ def main() -> int:
                 common_config = {
                     "model_name": args.model_name,
                     "model_type": args.model_type,
+                    "runtime_backend": descriptor.runtime_backend,
+                    "green_ctx_attn_sms": descriptor.green_ctx_attn_sms,
+                    "green_ctx_moe_sms": descriptor.green_ctx_moe_sms,
                     "dtype": descriptor.dtype,
                     "seq_len": descriptor.seq_len,
                     "batch_size": descriptor.batch_size,
@@ -1515,10 +1873,12 @@ def main() -> int:
                         mode=descriptor.mode,
                         seq_len=descriptor.seq_len,
                         batch_size=descriptor.batch_size,
+                        runtime_backend=descriptor.runtime_backend,
                         dtype=descriptor.dtype,
                         seed=args.seed,
                         topology=topology,
                         nccl_env=nccl_meta,
+                        runtime=attempt_result["runtime"],
                         timing_ms=attempt_result["timing_ms"],
                         overlap_ms=attempt_result["overlap_ms"],
                         finite=attempt_result["finite"],
@@ -1590,20 +1950,7 @@ def main() -> int:
         )
         all_case_payloads.extend(error_payloads)
         summary = build_matrix_summary(
-            run_config={
-                "model_name": args.model_name,
-                "model_type": args.model_type,
-                "topology": topology,
-                "seq_lens": seq_lens,
-                "batch_sizes": batch_sizes,
-                "dtypes": dtypes,
-                "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
-                "capture_nsys": args.capture_nsys,
-                "attention_backend": args.attention_backend,
-                "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
-                "moe_grouped_gemm": args.moe_grouped_gemm,
-                "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
-            },
+            run_config=base_run_config,
             cases=all_case_payloads,
             total_points=total_points,
         )
@@ -1623,38 +1970,23 @@ def main() -> int:
         attn_gpu_ids=attn_gpu_ids,
         moe_gpu_ids=moe_gpu_ids,
     )
-    run_config = {
-        "model_name": args.model_name,
-        "model_type": args.model_type,
-        "topology": topology,
-        "seq_lens": seq_lens,
-        "batch_sizes": batch_sizes,
-        "dtypes": dtypes,
-        "nccl_tuples": [canonical_nccl_tuple(tpl) for tpl in nccl_tuples],
-        "modes": modes,
-        "warmup_iters": args.warmup_iters,
-        "timed_iters": args.timed_iters,
-        "capture_nsys": args.capture_nsys,
-        "nsys_status": nsys_status,
-        "attention_backend": args.attention_backend,
-        "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
-        "moe_grouped_gemm": args.moe_grouped_gemm,
-        "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
-        "capture_torch_profiler": args.capture_torch_profiler,
-        "torch_profiler_wait_iters": args.torch_profiler_wait_iters,
-        "torch_profiler_active_iters": args.torch_profiler_active_iters,
-        "torch_profiler_status": torch_profiler_status,
-    }
-    if len(batch_sizes) == 1:
-        run_config["batch_size"] = batch_sizes[0]
+    run_config = _build_run_config(
+        args=args,
+        topology=topology,
+        seq_lens=seq_lens,
+        batch_sizes=batch_sizes,
+        dtypes=dtypes,
+        nccl_tuples=nccl_tuples,
+        runtime_backends=runtime_backends,
+        green_ctx_sms=green_ctx_sms,
+        device_sm_signature=device_sm_signature,
+        nsys_status=nsys_status,
+        torch_profiler_status=torch_profiler_status,
+    )
     summary = build_matrix_summary(run_config=run_config, cases=all_case_payloads, total_points=total_points)
     write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
     write_matrix_summary_markdown(args.output_dir, summary)
 
-    if nsys_status == "nsys_capture_failed":
-        return 1
-    if torch_profiler_status == "torch_profiler_capture_failed":
-        return 1
     return 0
 
 

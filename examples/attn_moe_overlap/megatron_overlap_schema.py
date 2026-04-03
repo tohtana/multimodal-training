@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,8 +10,9 @@ from typing import Any, Iterable
 
 import torch
 
-CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v2"
-MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v2"
+CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v3"
+MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v3"
+RUNTIME_BACKENDS = ("mps_only", "mps_green_ctx")
 
 REQUIRED_STATUS_KEYS = (
     "ok",
@@ -68,6 +70,13 @@ def tolerance_for_dtype(dtype_name: str) -> dict[str, float]:
     return dict(_DTYPE_TOLERANCES[normalized])
 
 
+def normalize_runtime_backend(runtime_backend: str) -> str:
+    normalized = runtime_backend.strip().lower()
+    if normalized not in RUNTIME_BACKENDS:
+        raise ValueError(f"Unsupported runtime backend: {runtime_backend}")
+    return normalized
+
+
 def parse_int_csv(raw: str, *, field_name: str) -> list[int]:
     values: list[int] = []
     for chunk in raw.split(","):
@@ -97,6 +106,23 @@ def parse_batch_sizes(raw: str) -> list[int]:
     for value in values:
         if value <= 0:
             raise ValueError(f"batch-sizes must be > 0: got {value}")
+    return values
+
+
+def parse_runtime_backends(raw: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw.split(","):
+        text = chunk.strip()
+        if not text:
+            continue
+        normalized = normalize_runtime_backend(text)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    if not values:
+        raise ValueError("runtime-backends must not be empty")
     return values
 
 
@@ -213,6 +239,9 @@ def build_case_id(
     mode: str,
     seq_len: int,
     batch_size: int,
+    runtime_backend: str,
+    green_ctx_attn_sms: int | None,
+    green_ctx_moe_sms: int | None,
     dtype: str,
     seed: int,
     attn_dp_size: int,
@@ -222,11 +251,18 @@ def build_case_id(
     nccl_tuple: tuple[int, int, int] | None,
 ) -> str:
     nccl_fragment = "off" if nccl_tuple is None else f"{nccl_tuple[0]}_{nccl_tuple[1]}_{nccl_tuple[2]}"
+    runtime_backend = normalize_runtime_backend(runtime_backend)
+    if runtime_backend == "mps_green_ctx":
+        green_ctx_fragment = f"gc-{int(green_ctx_attn_sms or 0)}_{int(green_ctx_moe_sms or 0)}"
+    else:
+        green_ctx_fragment = "gc-off"
     return "__".join(
         (
             f"mode-{mode}",
             f"seq-{seq_len}",
             f"batch-{batch_size}",
+            f"backend-{runtime_backend}",
+            green_ctx_fragment,
             f"dtype-{normalize_dtype_name(dtype)}",
             f"seed-{seed}",
             f"dp-{attn_dp_size}",
@@ -355,6 +391,47 @@ def compute_host_enqueue_overlap_ms(
     return float(sum(overlap_values_ms) / len(overlap_values_ms))
 
 
+def _normalize_worker_sms(values: list[int | None] | None) -> list[int]:
+    normalized: list[int] = []
+    for value in values or []:
+        if value is None:
+            continue
+        normalized.append(int(value))
+    return normalized
+
+
+def build_runtime_metadata(
+    *,
+    runtime_backend: str,
+    green_ctx_attn_sms: int | None = None,
+    green_ctx_moe_sms: int | None = None,
+    granted_sms_by_role: dict[str, list[int | None] | None] | None = None,
+    device_total_sms_by_role: dict[str, list[int | None] | None] | None = None,
+) -> dict[str, Any]:
+    runtime_backend = normalize_runtime_backend(runtime_backend)
+    green_ctx_enabled = runtime_backend == "mps_green_ctx"
+    return {
+        "green_ctx_enabled": green_ctx_enabled,
+        "requested_sms_by_role": {
+            "attn": None if not green_ctx_enabled or green_ctx_attn_sms is None else int(green_ctx_attn_sms),
+            "moe": None if not green_ctx_enabled or green_ctx_moe_sms is None else int(green_ctx_moe_sms),
+        },
+        "granted_sms_by_role": {
+            "attn": _normalize_worker_sms((granted_sms_by_role or {}).get("attn")),
+            "moe": _normalize_worker_sms((granted_sms_by_role or {}).get("moe")),
+        },
+        "device_total_sms_by_role": {
+            "attn": _normalize_worker_sms((device_total_sms_by_role or {}).get("attn")),
+            "moe": _normalize_worker_sms((device_total_sms_by_role or {}).get("moe")),
+        },
+    }
+
+
+def build_config_fingerprint(identity_fields: dict[str, Any]) -> str:
+    encoded = json.dumps(identity_fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def build_case_payload(
     *,
     case_id: str,
@@ -362,10 +439,12 @@ def build_case_payload(
     mode: str,
     seq_len: int,
     batch_size: int,
+    runtime_backend: str,
     dtype: str,
     seed: int,
     topology: dict[str, Any],
     nccl_env: dict[str, Any],
+    runtime: dict[str, Any] | None = None,
     timing_ms: dict[str, Any] | None = None,
     overlap_ms: float | None = None,
     finite: dict[str, Any] | None = None,
@@ -377,6 +456,7 @@ def build_case_payload(
     artifact_path: str | None = None,
 ) -> dict[str, Any]:
     normalized_dtype = normalize_dtype_name(dtype)
+    normalized_runtime_backend = normalize_runtime_backend(runtime_backend)
     return {
         "schema_version": CASE_SCHEMA_VERSION,
         "case_id": case_id,
@@ -384,10 +464,14 @@ def build_case_payload(
         "mode": mode,
         "seq_len": int(seq_len),
         "batch_size": int(batch_size),
+        "runtime_backend": normalized_runtime_backend,
         "dtype": normalized_dtype,
         "seed": int(seed),
         "topology": topology,
         "nccl": nccl_env,
+        "runtime": runtime
+        if runtime is not None
+        else build_runtime_metadata(runtime_backend=normalized_runtime_backend),
         "timing_ms": timing_ms
         if timing_ms is not None
         else {"total": None, "timed_wall": None, "attn": None, "moe": None},
@@ -429,10 +513,12 @@ def build_invalid_environment_payload(
     mode: str,
     seq_len: int,
     batch_size: int,
+    runtime_backend: str,
     dtype: str,
     seed: int,
     topology: dict[str, Any],
     nccl_env: dict[str, Any],
+    runtime: dict[str, Any] | None,
     message: str,
 ) -> dict[str, Any]:
     return build_case_payload(
@@ -441,10 +527,12 @@ def build_invalid_environment_payload(
         mode=mode,
         seq_len=seq_len,
         batch_size=batch_size,
+        runtime_backend=runtime_backend,
         dtype=dtype,
         seed=seed,
         topology=topology,
         nccl_env=nccl_env,
+        runtime=runtime,
         error={"code": "invalid_environment", "message": message, "traceback": None},
     )
 
@@ -458,10 +546,12 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         "mode",
         "seq_len",
         "batch_size",
+        "runtime_backend",
         "dtype",
         "seed",
         "topology",
         "nccl",
+        "runtime",
         "timing_ms",
         "overlap",
         "finite",
@@ -488,6 +578,47 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     batch_size = payload.get("batch_size")
     if not isinstance(batch_size, int) or batch_size <= 0:
         errors.append(f"batch_size must be a positive integer, got {batch_size!r}")
+
+    runtime_backend = payload.get("runtime_backend")
+    if runtime_backend not in RUNTIME_BACKENDS:
+        errors.append(f"runtime_backend must be one of {RUNTIME_BACKENDS}, got {runtime_backend!r}")
+
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        errors.append("runtime must be an object")
+    else:
+        if "green_ctx_enabled" not in runtime:
+            errors.append("runtime.green_ctx_enabled missing")
+        requested_sms = runtime.get("requested_sms_by_role")
+        granted_sms = runtime.get("granted_sms_by_role")
+        device_total_sms = runtime.get("device_total_sms_by_role")
+        for key, value in (
+            ("requested_sms_by_role", requested_sms),
+            ("granted_sms_by_role", granted_sms),
+            ("device_total_sms_by_role", device_total_sms),
+        ):
+            if not isinstance(value, dict):
+                errors.append(f"runtime.{key} must be an object")
+                continue
+            for role in ("attn", "moe"):
+                if role not in value:
+                    errors.append(f"runtime.{key}.{role} missing")
+        for role in ("attn", "moe"):
+            requested_value = (requested_sms or {}).get(role)
+            if requested_value is not None and (not isinstance(requested_value, int) or requested_value <= 0):
+                errors.append(f"runtime.requested_sms_by_role.{role} must be null or a positive integer")
+            granted_value = (granted_sms or {}).get(role)
+            if granted_value is not None:
+                if not isinstance(granted_value, list):
+                    errors.append(f"runtime.granted_sms_by_role.{role} must be a list")
+                elif any(not isinstance(item, int) or item <= 0 for item in granted_value):
+                    errors.append(f"runtime.granted_sms_by_role.{role} must contain positive integers")
+            device_total_value = (device_total_sms or {}).get(role)
+            if device_total_value is not None:
+                if not isinstance(device_total_value, list):
+                    errors.append(f"runtime.device_total_sms_by_role.{role} must be a list")
+                elif any(not isinstance(item, int) or item <= 0 for item in device_total_value):
+                    errors.append(f"runtime.device_total_sms_by_role.{role} must contain positive integers")
 
     timing_ms = payload.get("timing_ms")
     if not isinstance(timing_ms, dict):
@@ -597,12 +728,15 @@ def should_skip_existing(existing_payload: dict[str, Any], rerun_existing: bool)
 
 
 def _compact_case_row(payload: dict[str, Any]) -> dict[str, Any]:
+    runtime = payload.get("runtime") or {}
     return {
         "case_id": payload.get("case_id"),
         "status": payload.get("status"),
         "mode": payload.get("mode"),
         "seq_len": payload.get("seq_len"),
         "batch_size": payload.get("batch_size"),
+        "runtime_backend": payload.get("runtime_backend"),
+        "green_ctx_sms": dict(runtime.get("requested_sms_by_role") or {"attn": None, "moe": None}),
         "dtype": payload.get("dtype"),
         "nccl_tuple": payload.get("nccl", {}).get("tuple"),
         "attempt_count": payload.get("attempt_count", 1),
@@ -610,19 +744,38 @@ def _compact_case_row(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _comparison_group_key(payload: dict[str, Any]) -> tuple[int, int, str, str]:
+def _comparison_green_ctx_sms(payload: dict[str, Any]) -> tuple[int | None, int | None]:
+    runtime = payload.get("runtime") or {}
+    requested = runtime.get("requested_sms_by_role") or {}
+    return (
+        None if requested.get("attn") is None else int(requested["attn"]),
+        None if requested.get("moe") is None else int(requested["moe"]),
+    )
+
+
+def _comparison_group_key(payload: dict[str, Any]) -> tuple[int, int, str, str, str, int | None, int | None]:
+    green_ctx_attn_sms, green_ctx_moe_sms = _comparison_green_ctx_sms(payload)
     return (
         int(payload.get("seq_len") or 0),
         int(payload.get("batch_size") or 0),
+        str(payload.get("runtime_backend") or ""),
         str(payload.get("dtype") or ""),
         str(payload.get("nccl", {}).get("tuple") or ""),
+        -1 if green_ctx_attn_sms is None else green_ctx_attn_sms,
+        -1 if green_ctx_moe_sms is None else green_ctx_moe_sms,
     )
 
 
 def _comparison_row_template(payload: dict[str, Any]) -> dict[str, Any]:
+    green_ctx_attn_sms, green_ctx_moe_sms = _comparison_green_ctx_sms(payload)
     return {
         "seq_len": int(payload.get("seq_len") or 0),
         "batch_size": int(payload.get("batch_size") or 0),
+        "runtime_backend": payload.get("runtime_backend"),
+        "green_ctx_sms": {
+            "attn": green_ctx_attn_sms,
+            "moe": green_ctx_moe_sms,
+        },
         "dtype": payload.get("dtype"),
         "nccl_tuple": payload.get("nccl", {}).get("tuple"),
         "serial_case_id": None,
@@ -642,7 +795,7 @@ def _comparison_row_template(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_comparison_rows(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    grouped: dict[tuple[int, int, str, str, str, int | None, int | None], dict[str, Any]] = {}
     for case in cases:
         key = _comparison_group_key(case)
         row = grouped.setdefault(key, _comparison_row_template(case))
@@ -665,6 +818,152 @@ def _build_comparison_rows(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [grouped[key] for key in sorted(grouped)]
 
 
+def _backend_pair_common_key(row: dict[str, Any]) -> tuple[int, int, str, str]:
+    return (
+        int(row.get("seq_len") or 0),
+        int(row.get("batch_size") or 0),
+        str(row.get("dtype") or ""),
+        str(row.get("nccl_tuple") or ""),
+    )
+
+
+def _build_backend_pair_id(
+    *,
+    seq_len: int,
+    batch_size: int,
+    dtype: str,
+    nccl_tuple: str,
+    green_ctx_attn_sms: int | None,
+    green_ctx_moe_sms: int | None,
+) -> str:
+    return "__".join(
+        (
+            f"pair-seq-{seq_len}",
+            f"batch-{batch_size}",
+            f"dtype-{dtype}",
+            f"nccl-{nccl_tuple.replace(',', '_')}",
+            (
+                f"gc-{int(green_ctx_attn_sms or 0)}_{int(green_ctx_moe_sms or 0)}"
+                if green_ctx_attn_sms is not None or green_ctx_moe_sms is not None
+                else "gc-off"
+            ),
+        )
+    )
+
+
+def _pair_status(mps_only_row: dict[str, Any] | None, mps_green_ctx_row: dict[str, Any] | None) -> str:
+    if mps_only_row is None:
+        return "missing_mps_only"
+    if mps_green_ctx_row is None:
+        return "missing_mps_green_ctx"
+    mps_only_ok = (mps_only_row.get("serial_status"), mps_only_row.get("overlap_status")) == ("ok", "ok")
+    mps_green_ctx_ok = (mps_green_ctx_row.get("serial_status"), mps_green_ctx_row.get("overlap_status")) == (
+        "ok",
+        "ok",
+    )
+    if not mps_only_ok and not mps_green_ctx_ok:
+        return "both_failed"
+    if not mps_only_ok:
+        return "mps_only_failed"
+    if not mps_green_ctx_ok:
+        return "mps_green_ctx_failed"
+    return "ok"
+
+
+def _build_backend_pairs(run_config: dict[str, Any], comparison_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    runtime_backends = [str(value) for value in run_config.get("runtime_backends") or []]
+    if "mps_only" not in runtime_backends or "mps_green_ctx" not in runtime_backends:
+        return []
+
+    mps_only_rows: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    mps_green_ctx_rows: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    for row in comparison_rows:
+        key = _backend_pair_common_key(row)
+        backend = row.get("runtime_backend")
+        if backend == "mps_only":
+            mps_only_rows[key] = row
+        elif backend == "mps_green_ctx":
+            mps_green_ctx_rows[key] = row
+
+    requested_green_ctx_sms = dict(run_config.get("green_ctx_sms") or {"attn": None, "moe": None})
+    pair_rows: list[dict[str, Any]] = []
+    for key in sorted(set(mps_only_rows) | set(mps_green_ctx_rows)):
+        seq_len, batch_size, dtype, nccl_tuple = key
+        mps_only_row = mps_only_rows.get(key)
+        mps_green_ctx_row = mps_green_ctx_rows.get(key)
+        pair_status = _pair_status(mps_only_row, mps_green_ctx_row)
+        pair_rows.append(
+            {
+                "pair_id": _build_backend_pair_id(
+                    seq_len=seq_len,
+                    batch_size=batch_size,
+                    dtype=dtype,
+                    nccl_tuple=nccl_tuple,
+                    green_ctx_attn_sms=requested_green_ctx_sms.get("attn"),
+                    green_ctx_moe_sms=requested_green_ctx_sms.get("moe"),
+                ),
+                "pair_status": pair_status,
+                "seq_len": seq_len,
+                "batch_size": batch_size,
+                "dtype": dtype,
+                "nccl_tuple": nccl_tuple,
+                "green_ctx_sms": requested_green_ctx_sms,
+                "mps_only_case_id": None if mps_only_row is None else mps_only_row.get("overlap_case_id"),
+                "mps_green_ctx_case_id": (
+                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_case_id")
+                ),
+                "mps_only_status": None if mps_only_row is None else mps_only_row.get("overlap_status"),
+                "mps_green_ctx_status": (
+                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_status")
+                ),
+                "mps_only_overlap_total_ms": (
+                    None if mps_only_row is None else mps_only_row.get("overlap_total_ms")
+                ),
+                "mps_green_ctx_overlap_total_ms": (
+                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_total_ms")
+                ),
+                "mps_only_overlap_timed_wall_ms": (
+                    None if mps_only_row is None else mps_only_row.get("overlap_timed_wall_ms")
+                ),
+                "mps_green_ctx_overlap_timed_wall_ms": (
+                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_timed_wall_ms")
+                ),
+                "mps_only_timed_speedup_vs_serial": (
+                    None if mps_only_row is None else mps_only_row.get("timed_speedup_vs_serial")
+                ),
+                "mps_green_ctx_timed_speedup_vs_serial": (
+                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("timed_speedup_vs_serial")
+                ),
+                "delta_overlap_total_ms": (
+                    None
+                    if mps_only_row is None
+                    or mps_green_ctx_row is None
+                    or mps_only_row.get("overlap_total_ms") is None
+                    or mps_green_ctx_row.get("overlap_total_ms") is None
+                    else float(mps_only_row["overlap_total_ms"]) - float(mps_green_ctx_row["overlap_total_ms"])
+                ),
+                "delta_overlap_timed_wall_ms": (
+                    None
+                    if mps_only_row is None
+                    or mps_green_ctx_row is None
+                    or mps_only_row.get("overlap_timed_wall_ms") is None
+                    or mps_green_ctx_row.get("overlap_timed_wall_ms") is None
+                    else float(mps_only_row["overlap_timed_wall_ms"]) - float(mps_green_ctx_row["overlap_timed_wall_ms"])
+                ),
+                "delta_timed_speedup_vs_serial": (
+                    None
+                    if mps_only_row is None
+                    or mps_green_ctx_row is None
+                    or mps_only_row.get("timed_speedup_vs_serial") is None
+                    or mps_green_ctx_row.get("timed_speedup_vs_serial") is None
+                    else float(mps_green_ctx_row["timed_speedup_vs_serial"])
+                    - float(mps_only_row["timed_speedup_vs_serial"])
+                ),
+            }
+        )
+    return pair_rows
+
+
 def build_matrix_summary(
     *,
     run_config: dict[str, Any],
@@ -681,6 +980,7 @@ def build_matrix_summary(
         attempted_cases += max(int(case.get("attempt_count", 1)), 1)
 
     comparison_rows = _build_comparison_rows(cases)
+    backend_pairs = _build_backend_pairs(run_config, comparison_rows)
     summary = {
         "schema_version": MATRIX_SCHEMA_VERSION,
         "run_config": run_config,
@@ -689,10 +989,14 @@ def build_matrix_summary(
             "attempted_cases": int(attempted_cases),
             "completed_cases": len(cases),
             "comparison_points": len(comparison_rows),
+            "backend_pair_points": len(backend_pairs),
             "by_status": by_status,
         },
         "cases": [_compact_case_row(case) for case in cases],
         "comparison_rows": comparison_rows,
+        "comparisons": {
+            "backend_pairs": backend_pairs,
+        },
         "generated_at": now_utc_iso(),
     }
     return summary
@@ -700,7 +1004,7 @@ def build_matrix_summary(
 
 def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    required_top = ("schema_version", "run_config", "counts", "cases", "comparison_rows", "generated_at")
+    required_top = ("schema_version", "run_config", "counts", "cases", "comparison_rows", "comparisons", "generated_at")
     for key in required_top:
         if key not in summary:
             errors.append(f"missing key: {key}")
@@ -715,7 +1019,7 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         errors.append("counts must be an object")
         return errors
 
-    for key in ("total_points", "attempted_cases", "completed_cases", "comparison_points", "by_status"):
+    for key in ("total_points", "attempted_cases", "completed_cases", "comparison_points", "backend_pair_points", "by_status"):
         if key not in counts:
             errors.append(f"counts.{key} missing")
 
@@ -747,6 +1051,26 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         if "batch_size" in run_config and batch_sizes:
             if len(batch_sizes) != 1 or int(run_config["batch_size"]) != int(batch_sizes[0]):
                 errors.append("run_config.batch_size must mirror the only entry in run_config.batch_sizes")
+        runtime_backends = run_config.get("runtime_backends")
+        if not isinstance(runtime_backends, list) or not runtime_backends:
+            errors.append("run_config.runtime_backends missing or empty")
+        elif any(str(value) not in RUNTIME_BACKENDS for value in runtime_backends):
+            errors.append(f"run_config.runtime_backends must contain only {RUNTIME_BACKENDS}")
+        green_ctx_sms = run_config.get("green_ctx_sms")
+        if not isinstance(green_ctx_sms, dict):
+            errors.append("run_config.green_ctx_sms missing or invalid")
+        else:
+            for role in ("attn", "moe"):
+                if role not in green_ctx_sms:
+                    errors.append(f"run_config.green_ctx_sms.{role} missing")
+        device_sm_signature = run_config.get("device_sm_signature")
+        if not isinstance(device_sm_signature, dict):
+            errors.append("run_config.device_sm_signature missing or invalid")
+        elif any(not isinstance(value, int) or value <= 0 for value in device_sm_signature.values()):
+            errors.append("run_config.device_sm_signature must map GPU ids to positive integer SM counts")
+        config_fingerprint = run_config.get("config_fingerprint")
+        if not isinstance(config_fingerprint, str) or not config_fingerprint.strip():
+            errors.append("run_config.config_fingerprint missing or invalid")
 
     cases = summary.get("cases")
     if not isinstance(cases, list):
@@ -758,6 +1082,8 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
                 continue
             if "batch_size" not in row:
                 errors.append(f"cases[{index}].batch_size missing")
+            if "runtime_backend" not in row:
+                errors.append(f"cases[{index}].runtime_backend missing")
 
     comparison_rows = summary.get("comparison_rows")
     if not isinstance(comparison_rows, list):
@@ -766,6 +1092,8 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         required_comparison_keys = (
             "seq_len",
             "batch_size",
+            "runtime_backend",
+            "green_ctx_sms",
             "serial_case_id",
             "serial_status",
             "serial_attn_ms",
@@ -792,6 +1120,40 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
                 "counts.comparison_points must equal len(comparison_rows): "
                 f"{counts.get('comparison_points')} != {len(comparison_rows)}"
             )
+    comparisons = summary.get("comparisons")
+    if not isinstance(comparisons, dict):
+        errors.append("comparisons must be an object")
+    else:
+        backend_pairs = comparisons.get("backend_pairs")
+        if not isinstance(backend_pairs, list):
+            errors.append("comparisons.backend_pairs must be an array")
+        else:
+            required_pair_keys = (
+                "pair_id",
+                "pair_status",
+                "seq_len",
+                "batch_size",
+                "dtype",
+                "nccl_tuple",
+                "green_ctx_sms",
+                "mps_only_case_id",
+                "mps_green_ctx_case_id",
+                "delta_overlap_total_ms",
+                "delta_overlap_timed_wall_ms",
+                "delta_timed_speedup_vs_serial",
+            )
+            for index, row in enumerate(backend_pairs):
+                if not isinstance(row, dict):
+                    errors.append(f"comparisons.backend_pairs[{index}] must be an object")
+                    continue
+                for key in required_pair_keys:
+                    if key not in row:
+                        errors.append(f"comparisons.backend_pairs[{index}].{key} missing")
+            if int(counts.get("backend_pair_points", 0)) != len(backend_pairs):
+                errors.append(
+                    "counts.backend_pair_points must equal len(comparisons.backend_pairs): "
+                    f"{counts.get('backend_pair_points')} != {len(backend_pairs)}"
+                )
     return errors
 
 
@@ -821,17 +1183,19 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- attempted_cases: `{counts.get('attempted_cases')}`")
     lines.append(f"- completed_cases: `{counts.get('completed_cases')}`")
     lines.append(f"- comparison_points: `{counts.get('comparison_points')}`")
+    lines.append(f"- backend_pair_points: `{counts.get('backend_pair_points')}`")
     lines.append("")
-    lines.append("| case_id | status | mode | seq_len | batch_size | dtype | nccl_tuple | attempt_count |")
-    lines.append("|---|---|---|---:|---:|---|---|---:|")
+    lines.append("| case_id | status | mode | seq_len | batch_size | runtime_backend | dtype | nccl_tuple | attempt_count |")
+    lines.append("|---|---|---|---:|---:|---|---|---|---:|")
     for row in summary.get("cases", []):
         lines.append(
-            "| {case_id} | {status} | {mode} | {seq_len} | {batch_size} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
+            "| {case_id} | {status} | {mode} | {seq_len} | {batch_size} | {runtime_backend} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
                 case_id=row.get("case_id"),
                 status=row.get("status"),
                 mode=row.get("mode"),
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
+                runtime_backend=row.get("runtime_backend"),
                 dtype=row.get("dtype"),
                 nccl_tuple=row.get("nccl_tuple"),
                 attempt_count=row.get("attempt_count"),
@@ -841,16 +1205,17 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append("## Comparison Rows")
     lines.append("")
     lines.append(
-        "| seq_len | batch_size | serial_status | serial_attn_ms | serial_moe_ms | serial_total_ms | overlap_status | overlap_attn_ms | overlap_moe_ms | overlap_total_ms | timed_speedup_vs_serial |"
+        "| seq_len | batch_size | runtime_backend | serial_status | serial_attn_ms | serial_moe_ms | serial_total_ms | overlap_status | overlap_attn_ms | overlap_moe_ms | overlap_total_ms | timed_speedup_vs_serial |"
     )
     lines.append(
-        "|---:|---:|---|---:|---:|---:|---|---:|---:|---:|---:|"
+        "|---:|---:|---|---|---:|---:|---:|---|---:|---:|---:|---:|"
     )
     for row in summary.get("comparison_rows", []):
         lines.append(
-            "| {seq_len} | {batch_size} | {serial_status} | {serial_attn_ms} | {serial_moe_ms} | {serial_total_ms} | {overlap_status} | {overlap_attn_ms} | {overlap_moe_ms} | {overlap_total_ms} | {timed_speedup_vs_serial} |".format(
+            "| {seq_len} | {batch_size} | {runtime_backend} | {serial_status} | {serial_attn_ms} | {serial_moe_ms} | {serial_total_ms} | {overlap_status} | {overlap_attn_ms} | {overlap_moe_ms} | {overlap_total_ms} | {timed_speedup_vs_serial} |".format(
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
+                runtime_backend=row.get("runtime_backend"),
                 serial_status=row.get("serial_status"),
                 serial_attn_ms=row.get("serial_attn_ms"),
                 serial_moe_ms=row.get("serial_moe_ms"),
@@ -860,6 +1225,24 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
                 overlap_moe_ms=row.get("overlap_moe_ms"),
                 overlap_total_ms=row.get("overlap_total_ms"),
                 timed_speedup_vs_serial=row.get("timed_speedup_vs_serial"),
+            )
+        )
+    lines.append("")
+    lines.append("## Backend Pairs")
+    lines.append("")
+    lines.append(
+        "| pair_id | pair_status | seq_len | batch_size | delta_overlap_timed_wall_ms | delta_timed_speedup_vs_serial |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|")
+    for row in (summary.get("comparisons") or {}).get("backend_pairs", []):
+        lines.append(
+            "| {pair_id} | {pair_status} | {seq_len} | {batch_size} | {delta_overlap_timed_wall_ms} | {delta_timed_speedup_vs_serial} |".format(
+                pair_id=row.get("pair_id"),
+                pair_status=row.get("pair_status"),
+                seq_len=row.get("seq_len"),
+                batch_size=row.get("batch_size"),
+                delta_overlap_timed_wall_ms=row.get("delta_overlap_timed_wall_ms"),
+                delta_timed_speedup_vs_serial=row.get("delta_timed_speedup_vs_serial"),
             )
         )
     lines.append("")

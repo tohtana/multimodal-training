@@ -13,11 +13,21 @@ from threading import BrokenBarrierError
 import torch
 
 try:
+    from examples.attn_moe_overlap.green_context_utils import (
+        GreenContextError,
+        GreenContextStreamOwner,
+        create_green_context_stream,
+    )
     from examples.attn_moe_overlap.megatron_overlap_schema import (
         normalize_dtype_name,
         tensor_signature,
     )
 except ModuleNotFoundError:
+    from green_context_utils import (  # type: ignore[no-redef]
+        GreenContextError,
+        GreenContextStreamOwner,
+        create_green_context_stream,
+    )
     from megatron_overlap_schema import (  # type: ignore[no-redef]
         normalize_dtype_name,
         tensor_signature,
@@ -169,6 +179,7 @@ class RuntimeConfig:
     model_name: str
     model_type: str
     stage_role: str
+    runtime_backend: str
     attention_backend: str
     moe_grouped_gemm: bool
     moe_token_dispatcher_type: str
@@ -178,6 +189,8 @@ class RuntimeConfig:
     batch_size: int
     seed: int
     expert_model_parallel_size: int
+    green_ctx_attn_sms: int | None = None
+    green_ctx_moe_sms: int | None = None
     num_experts: int | None = None
 
 
@@ -215,6 +228,13 @@ class MegatronSingleLayerRuntime:
         self.hidden_states: torch.Tensor | None = None
         self.attention_mask: torch.Tensor | None = None
         self.attention_runtime: dict[str, Any] | None = None
+        self.execution_stream: torch.cuda.Stream | None = None
+        self.green_ctx_stream_owner: GreenContextStreamOwner | None = None
+        self.runtime_metadata = {
+            "requested_sms": None,
+            "granted_sms": None,
+            "device_total_sms": None,
+        }
 
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
@@ -228,6 +248,38 @@ class MegatronSingleLayerRuntime:
         hidden_size = int(self.layer.config.hidden_size)
         self.hidden_states = self._build_hidden_states(hidden_size)
         self.attention_mask = self._build_attention_mask()
+        self._initialize_execution_stream()
+
+    def _requested_green_ctx_sms(self) -> int | None:
+        if self.config.stage_role == "attn":
+            return self.config.green_ctx_attn_sms
+        return self.config.green_ctx_moe_sms
+
+    def _initialize_execution_stream(self) -> None:
+        if self.config.runtime_backend == "mps_only":
+            self.execution_stream = torch.cuda.current_stream(device=self.device)
+            return
+        if self.config.runtime_backend != "mps_green_ctx":
+            raise ValueError(f"Unsupported runtime_backend: {self.config.runtime_backend}")
+
+        requested_sms = self._requested_green_ctx_sms()
+        if requested_sms is None:
+            raise ValueError(
+                f"Missing Green Context SM budget for role={self.config.stage_role} under {self.config.runtime_backend}"
+            )
+
+        try:
+            stream_owner = create_green_context_stream(device_id=int(self.device.index or 0), requested_sms=requested_sms)
+        except GreenContextError as exc:
+            raise RuntimeError(f"{exc.code}: {exc.message}") from exc
+        stream_owner.wait_for_current_stream()
+        self.green_ctx_stream_owner = stream_owner
+        self.execution_stream = stream_owner.external_stream
+        self.runtime_metadata = {
+            "requested_sms": int(stream_owner.requested_sms),
+            "granted_sms": int(stream_owner.granted_sms),
+            "device_total_sms": int(stream_owner.total_sms),
+        }
 
     def _build_trainer_config(self) -> dict[str, Any]:
         engine_config: dict[str, Any] = {
@@ -316,6 +368,7 @@ class MegatronSingleLayerRuntime:
         assert self.layer is not None
         assert self.hidden_states is not None
         assert self.attention_mask is not None
+        assert self.execution_stream is not None
 
         total_iters = int(warmup_iters) + int(timed_iters)
         if total_iters <= 0:
@@ -390,9 +443,10 @@ class MegatronSingleLayerRuntime:
 
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
+                active_stream = self.execution_stream
 
                 step_start = time.perf_counter()
-                start_event.record()
+                start_event.record(active_stream)
                 enqueue_start = time.perf_counter()
                 record_ctx = (
                     torch.profiler.record_function(f"{self.config.stage_role}.iter_{iter_idx:04d}")
@@ -400,7 +454,7 @@ class MegatronSingleLayerRuntime:
                     else nullcontext()
                 )
                 with record_ctx:
-                    with torch.no_grad():
+                    with torch.cuda.stream(active_stream), torch.no_grad():
                         if self.config.stage_role == "attn":
                             output_tensor, _ = self.layer._forward_attention(
                                 self.hidden_states,
@@ -409,8 +463,8 @@ class MegatronSingleLayerRuntime:
                         else:
                             output_tensor = self.layer._forward_mlp(self.hidden_states, inference_context=None)
                 enqueue_end = time.perf_counter()
-                end_event.record()
-                torch.cuda.synchronize(self.device)
+                end_event.record(active_stream)
+                active_stream.synchronize()
                 step_end = time.perf_counter()
 
                 if is_timed:
@@ -442,6 +496,9 @@ class MegatronSingleLayerRuntime:
         finally:
             if profiler is not None:
                 profiler.__exit__(None, None, None)
+            if self.green_ctx_stream_owner is not None:
+                self.green_ctx_stream_owner.cleanup()
+                self.green_ctx_stream_owner = None
 
         mean_cuda_ms = float(sum(cuda_ms) / len(cuda_ms)) if cuda_ms else None
         mean_step_ms = float(sum(step_ms) / len(step_ms)) if step_ms else None
@@ -453,11 +510,13 @@ class MegatronSingleLayerRuntime:
         return {
             "status": "ok",
             "stage_role": self.config.stage_role,
+            "runtime_backend": self.config.runtime_backend,
             "attention_backend": self.config.attention_backend,
             "attention_impl": self.attention_runtime,
             "moe_grouped_gemm": self.config.moe_grouped_gemm,
             "moe_token_dispatcher_type": self.config.moe_token_dispatcher_type,
             "overlap_moe_expert_parallel_comm": self.config.overlap_moe_expert_parallel_comm,
+            "runtime": dict(self.runtime_metadata),
             "timing_ms": {
                 "cuda": mean_cuda_ms,
                 "step_total": mean_step_ms,
@@ -500,10 +559,18 @@ def classify_exception(exc: BaseException) -> tuple[str, dict[str, Any]]:
         status = "oom"
     else:
         status = "runtime_error"
+    code = status
+    if isinstance(exc, GreenContextError):
+        code = exc.code
+    elif status == "runtime_error" and ":" in message:
+        possible_code, _, remainder = message.partition(":")
+        if possible_code.startswith("green_context_") and remainder.strip():
+            code = possible_code
+            message = remainder.strip()
     return (
         status,
         {
-            "code": status,
+            "code": code,
             "message": message,
             "traceback": traceback.format_exc(),
         },

@@ -15,14 +15,17 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     CASE_SCHEMA_VERSION,
     MATRIX_SCHEMA_VERSION,
     REQUIRED_STATUS_KEYS,
+    build_config_fingerprint,
     build_case_id,
     build_case_payload,
     build_invalid_environment_payload,
     build_matrix_summary,
+    build_runtime_metadata,
     compute_speedup,
     evaluate_stage_diff,
     parse_batch_sizes,
     parse_nccl_tuples,
+    parse_runtime_backends,
     should_retry,
     should_skip_existing,
     validate_case_payload,
@@ -35,7 +38,9 @@ from examples.attn_moe_overlap.megatron_layer_runtime import (
     _run_iteration_schedule,
 )
 from examples.attn_moe_overlap.step7_megatron_ep_overlap import (
+    _build_run_config,
     _collapse_timed_window_s,
+    _ensure_output_dir_identity_matches,
     _normalize_launch_failure,
     _run_case_attempt,
     _run_torch_profiler_capture,
@@ -61,6 +66,7 @@ def _sample_nccl() -> dict:
         "max_nchannels": 16,
         "max_ctas": 32,
         "tuple": "4,16,32",
+        "env_applied": True,
     }
 
 
@@ -81,6 +87,9 @@ def _sample_case_payload(
     *,
     seq_len: int = 512,
     batch_size: int = 1,
+    runtime_backend: str = "mps_only",
+    green_ctx_attn_sms: int | None = None,
+    green_ctx_moe_sms: int | None = None,
 ) -> dict:
     return build_case_payload(
         case_id=case_id,
@@ -88,10 +97,18 @@ def _sample_case_payload(
         mode=mode,
         seq_len=seq_len,
         batch_size=batch_size,
+        runtime_backend=runtime_backend,
         dtype="bf16",
         seed=1234,
         topology=_sample_topology(),
         nccl_env=_sample_nccl(),
+        runtime=build_runtime_metadata(
+            runtime_backend=runtime_backend,
+            green_ctx_attn_sms=green_ctx_attn_sms,
+            green_ctx_moe_sms=green_ctx_moe_sms,
+            granted_sms_by_role={"attn": [green_ctx_attn_sms], "moe": [green_ctx_moe_sms]},
+            device_total_sms_by_role={"attn": [132], "moe": [132]},
+        ),
         timing_ms={"total": 10.0, "timed_wall": 8.0, "attn": 4.0, "moe": 6.0},
         overlap_ms=1.5,
         finite={"all_finite": True, "first_nonfinite": None},
@@ -124,20 +141,59 @@ def test_collapse_timed_window_spans_earliest_start_to_latest_end():
     assert window["duration_ms"] == pytest.approx(1000.0)
 
 
-def test_select_torch_profiler_cases_prefers_passing_serial_and_overlap():
-    serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=1024, batch_size=1)
-    overlap = _sample_case_payload("case-overlap", "overlap", status="ok", seq_len=1024, batch_size=1)
-    later_serial = _sample_case_payload("case-serial-later", "serial", status="ok", seq_len=2048, batch_size=4)
-    later_overlap = _sample_case_payload("case-overlap-later", "overlap", status="ok", seq_len=2048, batch_size=4)
-    failed_overlap = _sample_case_payload("case-overlap-bad", "overlap", status="runtime_error")
-    selected = _select_torch_profiler_cases([failed_overlap, serial, overlap, later_serial, later_overlap])
-    assert [row["case_id"] for row in selected] == ["case-serial-later", "case-overlap-later"]
+def test_select_torch_profiler_cases_returns_backend_reruns_for_selected_pairs():
+    mps_only_serial = _sample_case_payload("mps-only-serial", "serial", seq_len=1024, batch_size=1)
+    mps_only_overlap = _sample_case_payload("mps-only-overlap", "overlap", seq_len=1024, batch_size=1)
+    mps_only_overlap["timing_ms"]["timed_wall"] = 10.0
+    mps_green_ctx_serial = _sample_case_payload(
+        "green-serial",
+        "serial",
+        seq_len=1024,
+        batch_size=1,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+    mps_green_ctx_overlap = _sample_case_payload(
+        "green-overlap",
+        "overlap",
+        seq_len=1024,
+        batch_size=1,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+    mps_green_ctx_overlap["timing_ms"]["timed_wall"] = 7.0
+
+    selected = _select_torch_profiler_cases(
+        [mps_only_serial, mps_only_overlap, mps_green_ctx_serial, mps_green_ctx_overlap]
+    )
+
+    assert [row["runtime_backend"] for row in selected] == ["mps_only", "mps_green_ctx"]
+    assert [row["case_id"] for row in selected] == ["mps-only-overlap", "green-overlap"]
+    assert all(row["mode"] == "overlap" for row in selected)
 
 
 def test_parse_batch_sizes_requires_positive_integers():
     assert parse_batch_sizes("1, 2,4") == [1, 2, 4]
     with pytest.raises(ValueError):
         parse_batch_sizes("1,0")
+
+
+def test_parse_runtime_backends_dedupes_and_validates_values():
+    assert parse_runtime_backends("mps_only,mps_green_ctx,mps_only") == ["mps_only", "mps_green_ctx"]
+    with pytest.raises(ValueError):
+        parse_runtime_backends("mps_only,unknown")
+
+
+def test_build_runtime_metadata_omits_green_ctx_request_when_backend_disabled():
+    runtime = build_runtime_metadata(
+        runtime_backend="mps_only",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+    assert runtime["green_ctx_enabled"] is False
+    assert runtime["requested_sms_by_role"] == {"attn": None, "moe": None}
 
 
 def test_resolve_profiler_schedule_defaults_wait_to_warmup():
@@ -273,6 +329,9 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
         common_config={
             "model_name": "Qwen/Qwen3-30B-A3B",
             "model_type": "qwen3_moe",
+            "runtime_backend": "mps_only",
+            "green_ctx_attn_sms": None,
+            "green_ctx_moe_sms": None,
             "dtype": "bf16",
             "seq_len": 1024,
             "batch_size": 1,
@@ -312,6 +371,7 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
     assert result["timing_ms"]["attn"] == pytest.approx(1.25)
     assert result["timing_ms"]["moe"] == pytest.approx(2.5)
     assert result["overlap_ms"] == pytest.approx(0.0)
+    assert result["runtime"]["green_ctx_enabled"] is False
 
 
 def test_normalize_launch_failure_prefers_root_cause_worker_error():
@@ -380,10 +440,30 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     )
     serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=2048, batch_size=4)
     overlap = _sample_case_payload("case-overlap", "overlap", status="ok", seq_len=2048, batch_size=4)
+    green_serial = _sample_case_payload(
+        "green-serial",
+        "serial",
+        status="ok",
+        seq_len=2048,
+        batch_size=4,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+    green_overlap = _sample_case_payload(
+        "green-overlap",
+        "overlap",
+        status="ok",
+        seq_len=2048,
+        batch_size=4,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
 
     status = _run_torch_profiler_capture(
         args=args,
-        cases=[serial, overlap],
+        cases=[serial, overlap, green_serial, green_overlap],
         attn_gpu_ids=[0, 1, 2, 3],
         moe_gpu_ids=[0, 1, 2, 3],
     )
@@ -399,6 +479,10 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert "--overlap-moe-expert-parallel-comm" in calls[0]
     assert calls[0][calls[0].index("--batch-size") + 1] == "4"
     assert calls[0][calls[0].index("--torch-profiler-wait-iters") + 1] == "11"
+    assert calls[0][calls[0].index("--runtime-backends") + 1] == "mps_only"
+    assert calls[1][calls[1].index("--runtime-backends") + 1] == "mps_green_ctx"
+    assert calls[1][calls[1].index("--green-ctx-attn-sms") + 1] == "64"
+    assert calls[1][calls[1].index("--green-ctx-moe-sms") + 1] == "64"
 
     trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
     assert trace_index["status"] == "ok"
@@ -410,6 +494,9 @@ def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
         "mode": "serial",
         "seq_len": 512,
         "batch_size": 1,
+        "runtime_backend": "mps_only",
+        "green_ctx_attn_sms": None,
+        "green_ctx_moe_sms": None,
         "dtype": "bf16",
         "seed": 1234,
         "attn_dp_size": 2,
@@ -421,9 +508,14 @@ def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
     case_id_b = build_case_id(**kwargs, nccl_tuple=(4, 16, 32))
     case_id_c = build_case_id(**kwargs, nccl_tuple=(8, 16, 32))
     case_id_d = build_case_id(**{**kwargs, "batch_size": 4}, nccl_tuple=(4, 16, 32))
+    case_id_e = build_case_id(
+        **{**kwargs, "runtime_backend": "mps_green_ctx", "green_ctx_attn_sms": 64, "green_ctx_moe_sms": 64},
+        nccl_tuple=(4, 16, 32),
+    )
     assert case_id_a == case_id_b
     assert case_id_a != case_id_c
     assert case_id_a != case_id_d
+    assert case_id_a != case_id_e
 
 
 def test_case_id_supports_disabled_nccl_tuning():
@@ -431,6 +523,9 @@ def test_case_id_supports_disabled_nccl_tuning():
         mode="serial",
         seq_len=512,
         batch_size=1,
+        runtime_backend="mps_only",
+        green_ctx_attn_sms=None,
+        green_ctx_moe_sms=None,
         dtype="bf16",
         seed=1234,
         attn_dp_size=2,
@@ -485,6 +580,7 @@ def test_runtime_config_threads_attention_and_moe_overrides_into_engine_config()
         model_name="Qwen/Qwen3-30B-A3B",
         model_type="qwen3_moe",
         stage_role="attn",
+        runtime_backend="mps_only",
         attention_backend="auto",
         moe_grouped_gemm=True,
         moe_token_dispatcher_type="alltoall",
@@ -511,6 +607,7 @@ def test_runtime_config_omits_false_boolean_moe_overrides():
         model_name="Qwen/Qwen3-30B-A3B",
         model_type="qwen3_moe",
         stage_role="attn",
+        runtime_backend="mps_only",
         attention_backend="auto",
         moe_grouped_gemm=False,
         moe_token_dispatcher_type="alltoall",
@@ -537,15 +634,22 @@ def test_invalid_environment_payload_contract():
         mode="serial",
         seq_len=512,
         batch_size=2,
+        runtime_backend="mps_green_ctx",
         dtype="bf16",
         seed=1234,
         topology=_sample_topology(),
         nccl_env=_sample_nccl(),
+        runtime=build_runtime_metadata(
+            runtime_backend="mps_green_ctx",
+            green_ctx_attn_sms=64,
+            green_ctx_moe_sms=64,
+        ),
         message="CUDA is not available",
     )
     assert payload["status"] == "invalid_environment"
     assert payload["error"]["code"] == "invalid_environment"
     assert payload["batch_size"] == 2
+    assert payload["runtime_backend"] == "mps_green_ctx"
 
 
 def test_parse_nccl_tuples_normalization_and_mixed_arg_rejection():
@@ -618,11 +722,21 @@ def test_matrix_summary_contract_and_status_count_invariant():
     serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=1024, batch_size=2)
     overlap = _sample_case_payload("case-overlap", "overlap", status="oom", seq_len=1024, batch_size=2)
     overlap["attempt_count"] = 2
+    identity_fields = {
+        "seq_lens": [1024],
+        "batch_sizes": [2],
+        "dtypes": ["bf16"],
+        "nccl_tuples": ["4,16,32"],
+        "runtime_backends": ["mps_only"],
+        "green_ctx_sms": {"attn": None, "moe": None},
+        "device_sm_signature": {"0": 132, "1": 132},
+    }
     summary = build_matrix_summary(
         run_config={
             "model_name": "Qwen/Qwen3-30B-A3B",
             "model_type": "qwen3_moe",
-            "batch_sizes": [2],
+            **identity_fields,
+            "config_fingerprint": build_config_fingerprint(identity_fields),
             "batch_size": 2,
         },
         cases=[serial, overlap],
@@ -637,13 +751,192 @@ def test_matrix_summary_contract_and_status_count_invariant():
     for key in REQUIRED_STATUS_KEYS:
         assert key in by_status
     assert summary["counts"]["comparison_points"] == 1
+    assert summary["counts"]["backend_pair_points"] == 0
     comparison_row = summary["comparison_rows"][0]
     assert comparison_row["seq_len"] == 1024
     assert comparison_row["batch_size"] == 2
+    assert comparison_row["runtime_backend"] == "mps_only"
     assert comparison_row["serial_status"] == "ok"
     assert comparison_row["overlap_status"] == "oom"
     assert comparison_row["overlap_total_ms"] is None
     assert comparison_row["timed_speedup_vs_serial"] is None
+
+
+def test_matrix_summary_persists_backend_pairs_for_same_code_comparisons():
+    mps_only_serial = _sample_case_payload("mps-only-serial", "serial", seq_len=1024, batch_size=2)
+    mps_only_overlap = _sample_case_payload("mps-only-overlap", "overlap", seq_len=1024, batch_size=2)
+    mps_only_overlap["timing_ms"]["timed_wall"] = 9.0
+    mps_only_overlap["timing_ms"]["total"] = 11.0
+    mps_only_overlap["overlap"]["timed_speedup_vs_serial"] = 1.11
+
+    green_serial = _sample_case_payload(
+        "green-serial",
+        "serial",
+        seq_len=1024,
+        batch_size=2,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+    green_overlap = _sample_case_payload(
+        "green-overlap",
+        "overlap",
+        seq_len=1024,
+        batch_size=2,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+    green_overlap["timing_ms"]["timed_wall"] = 7.0
+    green_overlap["timing_ms"]["total"] = 9.0
+    green_overlap["overlap"]["timed_speedup_vs_serial"] = 1.43
+
+    identity_fields = {
+        "seq_lens": [1024],
+        "batch_sizes": [2],
+        "dtypes": ["bf16"],
+        "nccl_tuples": ["4,16,32"],
+        "runtime_backends": ["mps_only", "mps_green_ctx"],
+        "green_ctx_sms": {"attn": 64, "moe": 64},
+        "device_sm_signature": {"0": 132, "1": 132},
+    }
+    summary = build_matrix_summary(
+        run_config={
+            "model_name": "Qwen/Qwen3-30B-A3B",
+            "model_type": "qwen3_moe",
+            **identity_fields,
+            "config_fingerprint": build_config_fingerprint(identity_fields),
+        },
+        cases=[mps_only_serial, mps_only_overlap, green_serial, green_overlap],
+        total_points=4,
+    )
+
+    backend_pairs = summary["comparisons"]["backend_pairs"]
+    assert summary["counts"]["backend_pair_points"] == 1
+    assert backend_pairs[0]["pair_status"] == "ok"
+    assert backend_pairs[0]["mps_only_case_id"] == "mps-only-overlap"
+    assert backend_pairs[0]["mps_green_ctx_case_id"] == "green-overlap"
+    assert backend_pairs[0]["delta_overlap_timed_wall_ms"] == pytest.approx(2.0)
+    assert backend_pairs[0]["delta_timed_speedup_vs_serial"] == pytest.approx(0.32, abs=1e-6)
+
+
+def test_matrix_summary_marks_backend_pair_as_both_failed_when_both_backends_fail():
+    mps_only_serial = _sample_case_payload("mps-only-serial", "serial", seq_len=1024, batch_size=2)
+    mps_only_overlap = _sample_case_payload("mps-only-overlap", "overlap", status="runtime_error", seq_len=1024, batch_size=2)
+    green_serial = _sample_case_payload(
+        "green-serial",
+        "serial",
+        seq_len=1024,
+        batch_size=2,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+    green_overlap = _sample_case_payload(
+        "green-overlap",
+        "overlap",
+        status="runtime_error",
+        seq_len=1024,
+        batch_size=2,
+        runtime_backend="mps_green_ctx",
+        green_ctx_attn_sms=64,
+        green_ctx_moe_sms=64,
+    )
+
+    identity_fields = {
+        "seq_lens": [1024],
+        "batch_sizes": [2],
+        "dtypes": ["bf16"],
+        "nccl_tuples": ["4,16,32"],
+        "runtime_backends": ["mps_only", "mps_green_ctx"],
+        "green_ctx_sms": {"attn": 64, "moe": 64},
+        "device_sm_signature": {"0": 132, "1": 132},
+    }
+    summary = build_matrix_summary(
+        run_config={
+            "model_name": "Qwen/Qwen3-30B-A3B",
+            "model_type": "qwen3_moe",
+            **identity_fields,
+            "config_fingerprint": build_config_fingerprint(identity_fields),
+        },
+        cases=[mps_only_serial, mps_only_overlap, green_serial, green_overlap],
+        total_points=4,
+    )
+
+    backend_pairs = summary["comparisons"]["backend_pairs"]
+    assert summary["counts"]["backend_pair_points"] == 1
+    assert backend_pairs[0]["pair_status"] == "both_failed"
+    assert backend_pairs[0]["mps_only_status"] == "runtime_error"
+    assert backend_pairs[0]["mps_green_ctx_status"] == "runtime_error"
+
+
+def test_ensure_output_dir_identity_matches_rejects_config_mismatch(tmp_path):
+    output_dir = tmp_path / "matrix"
+    output_dir.mkdir()
+    summary_path = output_dir / "matrix_summary.json"
+    existing_identity = {
+        "seq_lens": [1024],
+        "batch_sizes": [1],
+        "dtypes": ["bf16"],
+        "nccl_tuples": ["4,16,32"],
+        "runtime_backends": ["mps_only"],
+        "green_ctx_sms": {"attn": None, "moe": None},
+        "device_sm_signature": {"0": 132},
+    }
+    summary_path.write_text(
+        json.dumps(
+            {
+                "run_config": {
+                    **existing_identity,
+                    "config_fingerprint": build_config_fingerprint(existing_identity),
+                }
+            }
+        )
+    )
+    with pytest.raises(RuntimeError):
+        _ensure_output_dir_identity_matches(
+            output_dir,
+            {
+                **existing_identity,
+                "runtime_backends": ["mps_only", "mps_green_ctx"],
+                "config_fingerprint": "different",
+            },
+        )
+
+
+def test_build_run_config_persists_identity_fields_and_fingerprint():
+    args = SimpleNamespace(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        single_mode=None,
+        warmup_iters=1,
+        timed_iters=2,
+        capture_nsys="off",
+        attention_backend="auto",
+        moe_token_dispatcher_type="alltoall",
+        moe_grouped_gemm=True,
+        overlap_moe_expert_parallel_comm=False,
+        capture_torch_profiler="off",
+        torch_profiler_wait_iters=None,
+        torch_profiler_active_iters=2,
+    )
+    run_config = _build_run_config(
+        args=args,
+        topology=_sample_topology(),
+        seq_lens=[1024],
+        batch_sizes=[1, 2],
+        dtypes=["bf16"],
+        nccl_tuples=[(4, 16, 32)],
+        runtime_backends=["mps_only", "mps_green_ctx"],
+        green_ctx_sms={"attn": 64, "moe": 64},
+        device_sm_signature={"0": 132, "1": 132},
+        nsys_status="off",
+        torch_profiler_status="off",
+    )
+    assert run_config["runtime_backends"] == ["mps_only", "mps_green_ctx"]
+    assert run_config["green_ctx_sms"] == {"attn": 64, "moe": 64}
+    assert run_config["device_sm_signature"] == {"0": 132, "1": 132}
+    assert isinstance(run_config["config_fingerprint"], str)
 
 
 def test_resume_skip_behavior_honors_rerun_flag():
