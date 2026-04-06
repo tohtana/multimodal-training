@@ -166,12 +166,23 @@ def test_select_torch_profiler_cases_returns_backend_reruns_for_selected_pairs()
     mps_green_ctx_overlap["timing_ms"]["timed_wall"] = 7.0
 
     selected = _select_torch_profiler_cases(
-        [mps_only_serial, mps_only_overlap, mps_green_ctx_serial, mps_green_ctx_overlap]
+        [mps_only_serial, mps_only_overlap, mps_green_ctx_serial, mps_green_ctx_overlap],
+        selection="representative",
     )
 
     assert [row["runtime_backend"] for row in selected] == ["mps_only", "mps_green_ctx"]
     assert [row["case_id"] for row in selected] == ["mps-only-overlap", "green-overlap"]
     assert all(row["mode"] == "overlap" for row in selected)
+
+
+def test_select_torch_profiler_cases_supports_all_successful_selection():
+    serial = _sample_case_payload("case-serial", "serial", seq_len=1024, batch_size=2)
+    overlap = _sample_case_payload("case-overlap", "overlap", seq_len=1024, batch_size=2)
+    failed = _sample_case_payload("case-failed", "overlap", status="runtime_error", seq_len=1024, batch_size=2)
+
+    selected = _select_torch_profiler_cases([failed, overlap, serial], selection="all-successful")
+
+    assert [row["case_id"] for row in selected] == ["case-overlap", "case-serial"]
 
 
 def test_parse_batch_sizes_requires_positive_integers():
@@ -421,6 +432,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
 
     args = SimpleNamespace(
         capture_torch_profiler="on",
+        torch_profiler_selection="all-successful",
         output_dir=str(tmp_path / "out"),
         model_name="Qwen/Qwen3-30B-A3B",
         model_type="qwen3_moe",
@@ -438,6 +450,20 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         torch_profiler_wait_iters=11,
         torch_profiler_active_iters=2,
     )
+    run_config = {
+        "model_name": "Qwen/Qwen3-30B-A3B",
+        "model_type": "qwen3_moe",
+        "topology": {"attn_dp_size": 4, "moe_ep_size": 4, "attn_gpu_ids": [0, 1, 2, 3], "moe_gpu_ids": [0, 1, 2, 3]},
+        "warmup_iters": 1,
+        "timed_iters": 3,
+        "worker_timeout_s": 180.0,
+        "num_experts": None,
+        "mps_active_thread_pct": None,
+        "attention_backend": "fused",
+        "moe_grouped_gemm": True,
+        "moe_token_dispatcher_type": "alltoall",
+        "overlap_moe_expert_parallel_comm": True,
+    }
     serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=2048, batch_size=4)
     overlap = _sample_case_payload("case-overlap", "overlap", status="ok", seq_len=2048, batch_size=4)
     green_serial = _sample_case_payload(
@@ -463,13 +489,12 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
 
     status = _run_torch_profiler_capture(
         args=args,
+        run_config=run_config,
         cases=[serial, overlap, green_serial, green_overlap],
-        attn_gpu_ids=[0, 1, 2, 3],
-        moe_gpu_ids=[0, 1, 2, 3],
     )
 
     assert status == "ok"
-    assert len(calls) == 2
+    assert len(calls) == 4
     assert calls[0][0] == sys.executable
     assert calls[0][1] == str((REPO_ROOT / "examples/attn_moe_overlap/step7_megatron_ep_overlap.py").resolve())
     assert "-m" not in calls[0]
@@ -479,14 +504,21 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert "--overlap-moe-expert-parallel-comm" in calls[0]
     assert calls[0][calls[0].index("--batch-size") + 1] == "4"
     assert calls[0][calls[0].index("--torch-profiler-wait-iters") + 1] == "11"
-    assert calls[0][calls[0].index("--runtime-backends") + 1] == "mps_only"
-    assert calls[1][calls[1].index("--runtime-backends") + 1] == "mps_green_ctx"
-    assert calls[1][calls[1].index("--green-ctx-attn-sms") + 1] == "64"
-    assert calls[1][calls[1].index("--green-ctx-moe-sms") + 1] == "64"
+    assert sorted(cmd[cmd.index("--runtime-backends") + 1] for cmd in calls) == [
+        "mps_green_ctx",
+        "mps_green_ctx",
+        "mps_only",
+        "mps_only",
+    ]
+    green_cmd = next(cmd for cmd in calls if cmd[cmd.index("--runtime-backends") + 1] == "mps_green_ctx")
+    assert green_cmd[green_cmd.index("--green-ctx-attn-sms") + 1] == "64"
+    assert green_cmd[green_cmd.index("--green-ctx-moe-sms") + 1] == "64"
 
     trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
     assert trace_index["status"] == "ok"
+    assert trace_index["selection"] == "all-successful"
     assert all(entry["trace_files"] == [f"{entry['trace_dir']}/worker0.pt.trace.json"] for entry in trace_index["entries"])
+    assert all(entry["profiler_status"] == "ok" for entry in trace_index["entries"])
 
 
 def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
@@ -811,11 +843,13 @@ def test_matrix_summary_persists_backend_pairs_for_same_code_comparisons():
         total_points=4,
     )
 
-    backend_pairs = summary["comparisons"]["backend_pairs"]
+    backend_pairs = summary["backend_pair_rows"]
     assert summary["counts"]["backend_pair_points"] == 1
     assert backend_pairs[0]["pair_status"] == "ok"
-    assert backend_pairs[0]["mps_only_case_id"] == "mps-only-overlap"
-    assert backend_pairs[0]["mps_green_ctx_case_id"] == "green-overlap"
+    assert backend_pairs[0]["mps_only_overlap_case_id"] == "mps-only-overlap"
+    assert backend_pairs[0]["mps_green_ctx_overlap_case_id"] == "green-overlap"
+    assert backend_pairs[0]["mps_only_serial_timed_speedup_vs_serial"] == pytest.approx(1.0)
+    assert backend_pairs[0]["overlap_timed_speedup_mps_green_ctx_vs_mps_only"] == pytest.approx(9.0 / 7.0)
     assert backend_pairs[0]["delta_overlap_timed_wall_ms"] == pytest.approx(2.0)
     assert backend_pairs[0]["delta_timed_speedup_vs_serial"] == pytest.approx(0.32, abs=1e-6)
 
@@ -863,11 +897,11 @@ def test_matrix_summary_marks_backend_pair_as_both_failed_when_both_backends_fai
         total_points=4,
     )
 
-    backend_pairs = summary["comparisons"]["backend_pairs"]
+    backend_pairs = summary["backend_pair_rows"]
     assert summary["counts"]["backend_pair_points"] == 1
     assert backend_pairs[0]["pair_status"] == "both_failed"
-    assert backend_pairs[0]["mps_only_status"] == "runtime_error"
-    assert backend_pairs[0]["mps_green_ctx_status"] == "runtime_error"
+    assert backend_pairs[0]["mps_only_overlap_status"] == "runtime_error"
+    assert backend_pairs[0]["mps_green_ctx_overlap_status"] == "runtime_error"
 
 
 def test_ensure_output_dir_identity_matches_rejects_config_mismatch(tmp_path):
@@ -882,6 +916,10 @@ def test_ensure_output_dir_identity_matches_rejects_config_mismatch(tmp_path):
         "runtime_backends": ["mps_only"],
         "green_ctx_sms": {"attn": None, "moe": None},
         "device_sm_signature": {"0": 132},
+        "capture_torch_profiler": "off",
+        "torch_profiler_selection": None,
+        "torch_profiler_wait_iters": None,
+        "torch_profiler_active_iters": None,
     }
     summary_path.write_text(
         json.dumps(
@@ -917,8 +955,12 @@ def test_build_run_config_persists_identity_fields_and_fingerprint():
         moe_grouped_gemm=True,
         overlap_moe_expert_parallel_comm=False,
         capture_torch_profiler="off",
+        torch_profiler_selection="representative",
         torch_profiler_wait_iters=None,
         torch_profiler_active_iters=2,
+        worker_timeout_s=180.0,
+        num_experts=None,
+        mps_active_thread_pct=None,
     )
     run_config = _build_run_config(
         args=args,
@@ -936,6 +978,7 @@ def test_build_run_config_persists_identity_fields_and_fingerprint():
     assert run_config["runtime_backends"] == ["mps_only", "mps_green_ctx"]
     assert run_config["green_ctx_sms"] == {"attn": 64, "moe": 64}
     assert run_config["device_sm_signature"] == {"0": 132, "1": 132}
+    assert run_config["torch_profiler_selection"] is None
     assert isinstance(run_config["config_fingerprint"], str)
 
 
@@ -952,14 +995,15 @@ def test_legacy_case_payload_is_not_reused_for_resume_or_comparison():
     assert should_skip_existing(payload, rerun_existing=False) is False
 
 
-def test_case_payload_uses_v2_schema():
-    payload = _sample_case_payload("case-v2", "serial", status="ok")
+def test_case_payload_uses_current_schema():
+    payload = _sample_case_payload("case-current", "serial", status="ok")
     assert payload["schema_version"] == CASE_SCHEMA_VERSION
 
 
 def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path):
     args = SimpleNamespace(
         capture_torch_profiler="on",
+        torch_profiler_selection="all-successful",
         output_dir=str(tmp_path / "out"),
         model_name="Qwen/Qwen3-30B-A3B",
         model_type="qwen3_moe",
@@ -977,11 +1021,24 @@ def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path
         torch_profiler_wait_iters=11,
         torch_profiler_active_iters=2,
     )
+    run_config = {
+        "model_name": "Qwen/Qwen3-30B-A3B",
+        "model_type": "qwen3_moe",
+        "topology": {"attn_dp_size": 4, "moe_ep_size": 4, "attn_gpu_ids": [0, 1, 2, 3], "moe_gpu_ids": [0, 1, 2, 3]},
+        "warmup_iters": 1,
+        "timed_iters": 3,
+        "worker_timeout_s": 180.0,
+        "num_experts": None,
+        "mps_active_thread_pct": None,
+        "attention_backend": "auto",
+        "moe_grouped_gemm": True,
+        "moe_token_dispatcher_type": "alltoall",
+        "overlap_moe_expert_parallel_comm": False,
+    }
     status = _run_torch_profiler_capture(
         args=args,
+        run_config=run_config,
         cases=[_sample_case_payload("case-bad", "overlap", status="runtime_error", batch_size=4)],
-        attn_gpu_ids=[0, 1, 2, 3],
-        moe_gpu_ids=[0, 1, 2, 3],
     )
     assert status == "off"
     assert not (tmp_path / "out" / "torch_profiler" / "trace_index.json").exists()

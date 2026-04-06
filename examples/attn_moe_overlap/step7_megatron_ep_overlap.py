@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+TORCH_PROFILER_TRACE_INDEX_SCHEMA_VERSION = "megatron_ep_overlap.torch_profiler.v2"
+
 
 def _early_bootstrap_local_pythonpath() -> list[str]:
     """Ensure sibling repo roots are importable during spawn-time module re-import."""
@@ -67,6 +69,7 @@ try:
         compute_speedup,
         evaluate_stage_diff,
         is_terminal_status,
+        load_case_payload,
         normalize_dtype_name,
         parse_batch_sizes,
         parse_dtypes,
@@ -74,15 +77,16 @@ try:
         parse_nccl_tuples,
         parse_runtime_backends,
         parse_seq_lens,
+        PROFILER_STATUS_KEYS,
         should_retry,
         should_skip_existing,
         tolerance_for_dtype,
+        TORCH_PROFILER_SELECTIONS,
         validate_case_payload,
         write_case_json,
         write_json_atomic,
         write_matrix_summary,
         write_matrix_summary_markdown,
-        load_case_payload,
     )
 except ModuleNotFoundError:
     from green_context_utils import (  # type: ignore[no-redef]
@@ -102,6 +106,7 @@ except ModuleNotFoundError:
         compute_speedup,
         evaluate_stage_diff,
         is_terminal_status,
+        load_case_payload,
         normalize_dtype_name,
         parse_batch_sizes,
         parse_dtypes,
@@ -109,15 +114,16 @@ except ModuleNotFoundError:
         parse_nccl_tuples,
         parse_runtime_backends,
         parse_seq_lens,
+        PROFILER_STATUS_KEYS,
         should_retry,
         should_skip_existing,
         tolerance_for_dtype,
+        TORCH_PROFILER_SELECTIONS,
         validate_case_payload,
         write_case_json,
         write_json_atomic,
         write_matrix_summary,
         write_matrix_summary_markdown,
-        load_case_payload,
     )
 
 
@@ -326,12 +332,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nsys-bin", type=str, default="nsys")
     parser.add_argument("--capture-torch-profiler", choices=["on", "off"], default="off")
     parser.add_argument(
+        "--torch-profiler-selection",
+        choices=TORCH_PROFILER_SELECTIONS,
+        default="representative",
+    )
+    parser.add_argument(
         "--torch-profiler-wait-iters",
         type=int,
         default=None,
         help="Iterations to skip before profiler capture starts; defaults to warmup-iters when unset.",
     )
     parser.add_argument("--torch-profiler-active-iters", type=int, default=5)
+    parser.add_argument("--torch-profiler-recovery", action="store_true")
     parser.add_argument("--torch-profiler-trace-dir", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--single-mode", choices=["serial", "overlap"], default=None)
     parser.add_argument("--output-dir", type=str, required=True)
@@ -366,6 +378,28 @@ def _resolved_green_ctx_sms(args: argparse.Namespace) -> dict[str, int | None]:
     }
 
 
+def _effective_torch_profiler_wait_iters(args: argparse.Namespace) -> int | None:
+    if args.capture_torch_profiler != "on":
+        return None
+    return int(args.warmup_iters if args.torch_profiler_wait_iters is None else args.torch_profiler_wait_iters)
+
+
+def _profiler_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    if args.capture_torch_profiler != "on":
+        return {
+            "capture_requested": False,
+            "selection": None,
+            "wait_iters": None,
+            "active_iters": None,
+        }
+    return {
+        "capture_requested": True,
+        "selection": args.torch_profiler_selection,
+        "wait_iters": _effective_torch_profiler_wait_iters(args),
+        "active_iters": int(args.torch_profiler_active_iters),
+    }
+
+
 def _device_sm_signature(device_total_sms: dict[int, int]) -> dict[str, int]:
     return {str(device_id): int(device_total_sms[device_id]) for device_id in sorted(device_total_sms)}
 
@@ -379,6 +413,10 @@ def _run_config_identity_fields(
     runtime_backends: list[str],
     green_ctx_sms: dict[str, int | None],
     device_sm_signature: dict[str, int],
+    capture_torch_profiler: str,
+    torch_profiler_selection: str | None,
+    torch_profiler_wait_iters: int | None,
+    torch_profiler_active_iters: int | None,
 ) -> dict[str, Any]:
     return {
         "seq_lens": [int(value) for value in seq_lens],
@@ -391,6 +429,10 @@ def _run_config_identity_fields(
             "moe": green_ctx_sms.get("moe"),
         },
         "device_sm_signature": dict(device_sm_signature),
+        "capture_torch_profiler": capture_torch_profiler,
+        "torch_profiler_selection": torch_profiler_selection,
+        "torch_profiler_wait_iters": torch_profiler_wait_iters,
+        "torch_profiler_active_iters": torch_profiler_active_iters,
     }
 
 
@@ -408,6 +450,7 @@ def _build_run_config(
     nsys_status: str | None = None,
     torch_profiler_status: str | None = None,
 ) -> dict[str, Any]:
+    profiler_config = _profiler_config_from_args(args)
     identity_fields = _run_config_identity_fields(
         seq_lens=seq_lens,
         batch_sizes=batch_sizes,
@@ -416,6 +459,10 @@ def _build_run_config(
         runtime_backends=runtime_backends,
         green_ctx_sms=green_ctx_sms,
         device_sm_signature=device_sm_signature,
+        capture_torch_profiler=args.capture_torch_profiler,
+        torch_profiler_selection=profiler_config["selection"],
+        torch_profiler_wait_iters=profiler_config["wait_iters"],
+        torch_profiler_active_iters=profiler_config["active_iters"],
     )
     run_config = {
         "model_name": args.model_name,
@@ -426,6 +473,9 @@ def _build_run_config(
         "modes": [args.single_mode] if args.single_mode is not None else ["serial", "overlap"],
         "warmup_iters": args.warmup_iters,
         "timed_iters": args.timed_iters,
+        "worker_timeout_s": args.worker_timeout_s,
+        "num_experts": args.num_experts,
+        "mps_active_thread_pct": args.mps_active_thread_pct,
         "capture_nsys": args.capture_nsys,
         "nsys_status": nsys_status,
         "attention_backend": args.attention_backend,
@@ -433,8 +483,9 @@ def _build_run_config(
         "moe_grouped_gemm": args.moe_grouped_gemm,
         "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
         "capture_torch_profiler": args.capture_torch_profiler,
-        "torch_profiler_wait_iters": args.torch_profiler_wait_iters,
-        "torch_profiler_active_iters": args.torch_profiler_active_iters,
+        "torch_profiler_selection": profiler_config["selection"],
+        "torch_profiler_wait_iters": profiler_config["wait_iters"],
+        "torch_profiler_active_iters": profiler_config["active_iters"],
         "torch_profiler_status": torch_profiler_status,
     }
     if len(batch_sizes) == 1:
@@ -464,6 +515,10 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "runtime_backends",
             "green_ctx_sms",
             "device_sm_signature",
+            "capture_torch_profiler",
+            "torch_profiler_selection",
+            "torch_profiler_wait_iters",
+            "torch_profiler_active_iters",
             "config_fingerprint",
         )
     }
@@ -477,6 +532,10 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "runtime_backends",
             "green_ctx_sms",
             "device_sm_signature",
+            "capture_torch_profiler",
+            "torch_profiler_selection",
+            "torch_profiler_wait_iters",
+            "torch_profiler_active_iters",
             "config_fingerprint",
         )
     }
@@ -1349,6 +1408,7 @@ def _invalid_env_matrix(
     strict_schema: bool,
     error_message: str,
     topology: dict[str, Any],
+    profiler: dict[str, Any],
 ) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for descriptor in cases:
@@ -1368,10 +1428,22 @@ def _invalid_env_matrix(
                 green_ctx_moe_sms=descriptor.green_ctx_moe_sms,
             ),
             message=error_message,
+            profiler=profiler,
         )
         write_case_json(output_dir=output_dir, payload=payload, strict_schema=strict_schema)
         payloads.append(payload)
     return payloads
+
+
+def _load_case_payloads(output_dir: str | Path) -> list[dict[str, Any]]:
+    return [load_case_payload(path) for path in sorted((Path(output_dir) / "cases").glob("*.json"))]
+
+
+def _load_matrix_summary(output_dir: str | Path) -> dict[str, Any]:
+    summary_path = Path(output_dir) / "matrix_summary.json"
+    if not summary_path.exists():
+        raise RuntimeError(f"{summary_path} does not exist")
+    return json.loads(summary_path.read_text())
 
 
 def _pair_metric(pair: dict[str, Any]) -> float | None:
@@ -1400,7 +1472,7 @@ def _select_profiler_backend_pairs(cases: list[dict[str, Any]]) -> list[dict[str
         cases=cases,
         total_points=len(cases),
     )
-    pair_rows = list((summary.get("comparisons") or {}).get("backend_pairs") or [])
+    pair_rows = list(summary.get("backend_pair_rows") or [])
     if not pair_rows:
         return []
 
@@ -1417,16 +1489,6 @@ def _select_profiler_backend_pairs(cases: list[dict[str, Any]]) -> list[dict[str
         negative_pairs = [pair for pair in successful_pairs if float(_pair_metric(pair) or 0.0) < 0.0]
         if negative_pairs:
             selected.append(min(negative_pairs, key=lambda pair: (float(_pair_metric(pair) or 0.0), pair["pair_id"])))
-        else:
-            failing_pairs = [pair for pair in pair_rows if pair.get("pair_status") != "ok"]
-            if failing_pairs:
-                selected.append(sorted(failing_pairs, key=lambda pair: str(pair.get("pair_id") or ""))[0])
-
-    if not selected:
-        failing_pairs = [pair for pair in pair_rows if pair.get("pair_status") != "ok"]
-        if failing_pairs:
-            selected.append(sorted(failing_pairs, key=lambda pair: str(pair.get("pair_id") or ""))[0])
-
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for pair in selected:
@@ -1438,53 +1500,180 @@ def _select_profiler_backend_pairs(cases: list[dict[str, Any]]) -> list[dict[str
     return deduped
 
 
-def _requested_attention_backend(row: dict[str, Any], args: argparse.Namespace) -> str:
-    requested = (row.get("attention_backend") or {}).get("requested")
-    return str(requested if requested is not None else args.attention_backend)
+def _requested_attention_backend(case_payload: dict[str, Any], run_config: dict[str, Any]) -> str:
+    requested = (case_payload.get("attention_backend") or {}).get("requested")
+    fallback = run_config.get("attention_backend")
+    return str(fallback if requested is None else requested)
 
 
-def _requested_moe_runtime(row: dict[str, Any], args: argparse.Namespace) -> tuple[bool, str, bool]:
-    moe_runtime = row.get("moe_runtime") or {}
+def _requested_moe_runtime(case_payload: dict[str, Any], run_config: dict[str, Any]) -> tuple[bool, str, bool]:
+    moe_runtime = case_payload.get("moe_runtime") or {}
     grouped_gemm = (moe_runtime.get("grouped_gemm") or {}).get("requested")
     token_dispatcher = (moe_runtime.get("token_dispatcher_type") or {}).get("requested")
     overlap_comm = (moe_runtime.get("overlap_expert_parallel_comm") or {}).get("requested")
     return (
-        bool(args.moe_grouped_gemm if grouped_gemm is None else grouped_gemm),
-        str(args.moe_token_dispatcher_type if token_dispatcher is None else token_dispatcher),
-        bool(args.overlap_moe_expert_parallel_comm if overlap_comm is None else overlap_comm),
+        bool(run_config.get("moe_grouped_gemm") if grouped_gemm is None else grouped_gemm),
+        str(run_config.get("moe_token_dispatcher_type") if token_dispatcher is None else token_dispatcher),
+        bool(run_config.get("overlap_moe_expert_parallel_comm") if overlap_comm is None else overlap_comm),
     )
 
 
-def _selected_green_ctx_sms(pair: dict[str, Any]) -> dict[str, int | None]:
-    return dict(pair.get("green_ctx_sms") or {"attn": None, "moe": None})
+def _requested_green_ctx_sms(case_payload: dict[str, Any]) -> dict[str, int | None]:
+    runtime = case_payload.get("runtime") or {}
+    return dict(runtime.get("requested_sms_by_role") or {"attn": None, "moe": None})
 
 
-def _select_torch_profiler_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _case_topology(case_payload: dict[str, Any], run_config: dict[str, Any]) -> dict[str, Any]:
+    topology = dict(run_config.get("topology") or {})
+    topology.update(case_payload.get("topology") or {})
+    return {
+        "attn_dp_size": int(topology["attn_dp_size"]),
+        "moe_ep_size": int(topology["moe_ep_size"]),
+        "attn_gpu_ids": [int(value) for value in topology["attn_gpu_ids"]],
+        "moe_gpu_ids": [int(value) for value in topology["moe_gpu_ids"]],
+    }
+
+
+def _build_case_rerun_command(
+    *,
+    run_config: dict[str, Any],
+    case_payload: dict[str, Any],
+    output_dir: Path,
+    capture_nsys: str,
+    capture_torch_profiler: str,
+    warmup_iters: int,
+    timed_iters: int,
+    profiler_trace_dir: Path | None = None,
+    profiler_wait_iters: int | None = None,
+    profiler_active_iters: int | None = None,
+) -> list[str]:
+    topology = _case_topology(case_payload, run_config)
+    grouped_gemm, token_dispatcher, overlap_comm = _requested_moe_runtime(case_payload, run_config)
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--model-name",
+        str(run_config["model_name"]),
+        "--model-type",
+        str(run_config["model_type"]),
+        "--attn-gpu-ids",
+        ",".join(str(gpu_id) for gpu_id in topology["attn_gpu_ids"]),
+        "--moe-gpu-ids",
+        ",".join(str(gpu_id) for gpu_id in topology["moe_gpu_ids"]),
+        "--attn-dp-size",
+        str(topology["attn_dp_size"]),
+        "--moe-ep-size",
+        str(topology["moe_ep_size"]),
+        "--seq-lens",
+        str(case_payload["seq_len"]),
+        "--dtypes",
+        str(case_payload["dtype"]),
+        "--runtime-backends",
+        str(case_payload["runtime_backend"]),
+        "--single-mode",
+        str(case_payload["mode"]),
+        "--seed",
+        str(case_payload["seed"]),
+        "--batch-size",
+        str(case_payload["batch_size"]),
+        "--warmup-iters",
+        str(warmup_iters),
+        "--timed-iters",
+        str(timed_iters),
+        "--worker-timeout-s",
+        str(run_config.get("worker_timeout_s", 600.0)),
+        "--output-dir",
+        str(output_dir),
+        "--capture-nsys",
+        capture_nsys,
+        "--capture-torch-profiler",
+        capture_torch_profiler,
+        "--attention-backend",
+        _requested_attention_backend(case_payload, run_config),
+        "--moe-token-dispatcher-type",
+        token_dispatcher,
+        "--rerun-existing",
+    ]
+    if run_config.get("num_experts") is not None:
+        cmd.extend(["--num-experts", str(run_config["num_experts"])])
+    if run_config.get("mps_active_thread_pct") is not None:
+        cmd.extend(["--mps-active-thread-pct", str(run_config["mps_active_thread_pct"])])
+    _append_nccl_tuple_args(cmd, str((case_payload.get("nccl") or {}).get("tuple") or "off"))
+    if grouped_gemm:
+        cmd.append("--moe-grouped-gemm")
+    if overlap_comm:
+        cmd.append("--overlap-moe-expert-parallel-comm")
+    if case_payload.get("runtime_backend") == "mps_green_ctx":
+        green_ctx_sms = _requested_green_ctx_sms(case_payload)
+        if green_ctx_sms.get("attn") is not None:
+            cmd.extend(["--green-ctx-attn-sms", str(green_ctx_sms["attn"])])
+        if green_ctx_sms.get("moe") is not None:
+            cmd.extend(["--green-ctx-moe-sms", str(green_ctx_sms["moe"])])
+    if profiler_trace_dir is not None:
+        cmd.extend(["--torch-profiler-trace-dir", str(profiler_trace_dir)])
+        if profiler_wait_iters is not None:
+            cmd.extend(["--torch-profiler-wait-iters", str(profiler_wait_iters)])
+        if profiler_active_iters is not None:
+            cmd.extend(["--torch-profiler-active-iters", str(profiler_active_iters)])
+    return cmd
+
+
+def _load_rerun_case_payload(case_id: str, rerun_output_dir: Path) -> dict[str, Any] | None:
+    case_path = rerun_output_dir / "cases" / f"{case_id}.json"
+    if case_path.exists():
+        return load_case_payload(case_path)
+    candidates = sorted((rerun_output_dir / "cases").glob("*.json"))
+    if len(candidates) == 1:
+        return load_case_payload(candidates[0])
+    return None
+
+
+def _normalize_torch_profiler_status(
+    *,
+    rerun_payload: dict[str, Any] | None,
+    returncode: int,
+    trace_files: list[str],
+) -> str:
+    if rerun_payload is not None:
+        status = str(rerun_payload.get("status") or "")
+        if status in PROFILER_STATUS_KEYS and status != "ok":
+            return status
+    if returncode == 0 and trace_files:
+        return "ok"
+    if rerun_payload is not None:
+        status = str(rerun_payload.get("status") or "")
+        if status in PROFILER_STATUS_KEYS:
+            return status
+    return "torch_profiler_capture_failed"
+
+
+def _select_torch_profiler_cases(cases: list[dict[str, Any]], selection: str) -> list[dict[str, Any]]:
+    cases_by_id = {str(case.get("case_id")): case for case in cases if case.get("case_id")}
+    if selection == "all-successful":
+        return sorted(
+            (case for case in cases_by_id.values() if case.get("status") == "ok"),
+            key=lambda case: str(case.get("case_id") or ""),
+        )
+
     selected_pairs = _select_profiler_backend_pairs(cases)
     if not selected_pairs:
         return []
 
     reruns: list[dict[str, Any]] = []
+    seen_case_ids: set[str] = set()
     for pair in selected_pairs:
-        green_ctx_sms = _selected_green_ctx_sms(pair)
-        for backend in ("mps_only", "mps_green_ctx"):
-            case_id_key = "mps_only_case_id" if backend == "mps_only" else "mps_green_ctx_case_id"
-            if pair.get(case_id_key) is None:
+        for case_id_key in ("mps_only_overlap_case_id", "mps_green_ctx_overlap_case_id"):
+            case_id = pair.get(case_id_key)
+            if case_id is None:
                 continue
-            reruns.append(
-                {
-                    "pair_id": pair["pair_id"],
-                    "runtime_backend": backend,
-                    "case_id": pair[case_id_key],
-                    "mode": "overlap",
-                    "seq_len": pair["seq_len"],
-                    "batch_size": pair["batch_size"],
-                    "dtype": pair["dtype"],
-                    "nccl_tuple": pair["nccl_tuple"],
-                    "green_ctx_sms": green_ctx_sms,
-                    "pair_status": pair["pair_status"],
-                }
-            )
+            case_id_text = str(case_id)
+            if case_id_text in seen_case_ids:
+                continue
+            case_payload = cases_by_id.get(case_id_text)
+            if case_payload is None or case_payload.get("status") != "ok":
+                continue
+            seen_case_ids.add(case_id_text)
+            reruns.append(case_payload)
     return reruns
 
 
@@ -1495,91 +1684,47 @@ def _append_nccl_tuple_args(cmd: list[str], nccl_tuple_token: str) -> None:
 def _run_nsys_capture(
     *,
     args: argparse.Namespace,
+    run_config: dict[str, Any],
     cases: list[dict[str, Any]],
-    attn_gpu_ids: list[int],
-    moe_gpu_ids: list[int],
 ) -> str:
     if args.capture_nsys != "on":
         return "off"
     if shutil.which(args.nsys_bin) is None and not Path(args.nsys_bin).exists():
         return "nsys_capture_failed"
 
-    selected = _select_torch_profiler_cases(cases)
+    selected = _select_torch_profiler_cases(cases, selection="representative")
     if not selected:
         return "off"
     nsys_dir = Path(args.output_dir) / "nsys"
     nsys_dir.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, Any]] = []
-    for row in selected:
-        pair_dir = nsys_dir / row["pair_id"] / row["runtime_backend"]
-        pair_dir.mkdir(parents=True, exist_ok=True)
-        out_prefix = pair_dir / row["case_id"]
+    for case_payload in selected:
+        case_id = str(case_payload["case_id"])
+        case_dir = nsys_dir / case_id
+        case_dir.mkdir(parents=True, exist_ok=True)
+        out_prefix = case_dir / "trace"
+        rerun_output_dir = case_dir / "rerun_output"
         cmd = [
             args.nsys_bin,
             "profile",
             "--force-overwrite=true",
             "-o",
             str(out_prefix),
-            sys.executable,
-            "-m",
-            "examples.attn_moe_overlap.step7_megatron_ep_overlap",
-            "--model-name",
-            args.model_name,
-            "--model-type",
-            args.model_type,
-            "--attn-gpu-ids",
-            ",".join(str(gpu_id) for gpu_id in attn_gpu_ids),
-            "--moe-gpu-ids",
-            ",".join(str(gpu_id) for gpu_id in moe_gpu_ids),
-            "--attn-dp-size",
-            str(args.attn_dp_size),
-            "--moe-ep-size",
-            str(args.moe_ep_size),
-            "--seq-lens",
-            str(row["seq_len"]),
-            "--dtypes",
-            str(row["dtype"]),
-            "--runtime-backends",
-            str(row["runtime_backend"]),
-            "--single-mode",
-            str(row["mode"]),
-            "--seed",
-            str(args.seed),
-            "--batch-size",
-            str(row["batch_size"]),
-            "--warmup-iters",
-            "1",
-            "--timed-iters",
-            "1",
-            "--worker-timeout-s",
-            str(args.worker_timeout_s),
-            "--output-dir",
-            str(pair_dir / "rerun_output"),
-            "--capture-nsys",
-            "off",
-            "--capture-torch-profiler",
-            "off",
-            "--rerun-existing",
-            "--attention-backend",
-            args.attention_backend,
-            "--moe-token-dispatcher-type",
-            args.moe_token_dispatcher_type,
+            *_build_case_rerun_command(
+                run_config=run_config,
+                case_payload=case_payload,
+                output_dir=rerun_output_dir,
+                capture_nsys="off",
+                capture_torch_profiler="off",
+                warmup_iters=1,
+                timed_iters=1,
+            ),
         ]
-        _append_nccl_tuple_args(cmd, str(row["nccl_tuple"]))
-        if args.moe_grouped_gemm:
-            cmd.append("--moe-grouped-gemm")
-        if args.overlap_moe_expert_parallel_comm:
-            cmd.append("--overlap-moe-expert-parallel-comm")
-        if row["runtime_backend"] == "mps_green_ctx":
-            green_ctx_sms = row["green_ctx_sms"]
-            cmd.extend(["--green-ctx-attn-sms", str(green_ctx_sms["attn"])])
-            cmd.extend(["--green-ctx-moe-sms", str(green_ctx_sms["moe"])])
         completed = subprocess.run(cmd, capture_output=True, text=True)
         entries.append(
             {
-                "pair_id": row["pair_id"],
-                "runtime_backend": row["runtime_backend"],
-                "case_id": row["case_id"],
+                "runtime_backend": case_payload["runtime_backend"],
+                "case_id": case_id,
                 "command": cmd,
                 "returncode": completed.returncode,
                 "stdout_tail": completed.stdout[-2000:],
@@ -1595,119 +1740,73 @@ def _run_nsys_capture(
 def _run_torch_profiler_capture(
     *,
     args: argparse.Namespace,
+    run_config: dict[str, Any],
     cases: list[dict[str, Any]],
-    attn_gpu_ids: list[int],
-    moe_gpu_ids: list[int],
 ) -> str:
     if args.capture_torch_profiler != "on":
         return "off"
 
-    selected = _select_torch_profiler_cases(cases)
+    selected = _select_torch_profiler_cases(cases, selection=args.torch_profiler_selection)
     if not selected:
         return "off"
 
     profiler_root = Path(args.output_dir) / "torch_profiler"
     profiler_root.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, Any]] = []
-    step7_script = str(Path(__file__).resolve())
-    for row in selected:
-        pair_dir = profiler_root / row["pair_id"] / row["runtime_backend"]
-        trace_dir = pair_dir / "trace"
-        rerun_output_dir = pair_dir / "rerun_output"
-        cmd = [
-            sys.executable,
-            step7_script,
-            "--model-name",
-            args.model_name,
-            "--model-type",
-            args.model_type,
-            "--attn-gpu-ids",
-            ",".join(str(gpu_id) for gpu_id in attn_gpu_ids),
-            "--moe-gpu-ids",
-            ",".join(str(gpu_id) for gpu_id in moe_gpu_ids),
-            "--attn-dp-size",
-            str(args.attn_dp_size),
-            "--moe-ep-size",
-            str(args.moe_ep_size),
-            "--seq-lens",
-            str(row["seq_len"]),
-            "--dtypes",
-            str(row["dtype"]),
-            "--runtime-backends",
-            str(row["runtime_backend"]),
-            "--single-mode",
-            str(row["mode"]),
-            "--seed",
-            str(args.seed),
-            "--batch-size",
-            str(row["batch_size"]),
-            "--warmup-iters",
-            str(args.warmup_iters),
-            "--timed-iters",
-            str(args.timed_iters),
-            "--worker-timeout-s",
-            str(args.worker_timeout_s),
-            "--output-dir",
-            str(rerun_output_dir),
-            "--capture-nsys",
-            "off",
-            "--capture-torch-profiler",
-            "off",
-            "--attention-backend",
-            args.attention_backend,
-            "--moe-token-dispatcher-type",
-            args.moe_token_dispatcher_type,
-            "--torch-profiler-trace-dir",
-            str(trace_dir),
-            "--torch-profiler-wait-iters",
-            str(args.torch_profiler_wait_iters if args.torch_profiler_wait_iters is not None else args.warmup_iters),
-            "--torch-profiler-active-iters",
-            str(args.torch_profiler_active_iters),
-            "--rerun-existing",
-        ]
-        _append_nccl_tuple_args(cmd, str(row["nccl_tuple"]))
-        if args.moe_grouped_gemm:
-            cmd.append("--moe-grouped-gemm")
-        if args.overlap_moe_expert_parallel_comm:
-            cmd.append("--overlap-moe-expert-parallel-comm")
-        if row["runtime_backend"] == "mps_green_ctx":
-            green_ctx_sms = row["green_ctx_sms"]
-            cmd.extend(["--green-ctx-attn-sms", str(green_ctx_sms["attn"])])
-            cmd.extend(["--green-ctx-moe-sms", str(green_ctx_sms["moe"])])
+    effective_wait_iters = _effective_torch_profiler_wait_iters(args)
+    for case_payload in selected:
+        case_id = str(case_payload["case_id"])
+        trace_dir = profiler_root / case_id
+        rerun_output_dir = profiler_root / "reruns" / case_id
+        cmd = _build_case_rerun_command(
+            run_config=run_config,
+            case_payload=case_payload,
+            output_dir=rerun_output_dir,
+            capture_nsys="off",
+            capture_torch_profiler="off",
+            warmup_iters=int(run_config.get("warmup_iters", args.warmup_iters)),
+            timed_iters=int(run_config.get("timed_iters", args.timed_iters)),
+            profiler_trace_dir=trace_dir,
+            profiler_wait_iters=effective_wait_iters,
+            profiler_active_iters=int(args.torch_profiler_active_iters),
+        )
         completed = subprocess.run(cmd, capture_output=True, text=True)
         trace_files = [str(path) for path in sorted(trace_dir.rglob("*.pt.trace.json"))]
+        rerun_payload = _load_rerun_case_payload(case_id, rerun_output_dir)
+        profiler_status = _normalize_torch_profiler_status(
+            rerun_payload=rerun_payload,
+            returncode=completed.returncode,
+            trace_files=trace_files,
+        )
         entries.append(
             {
-                "pair_id": row["pair_id"],
-                "runtime_backend": row["runtime_backend"],
-                "case_id": row["case_id"],
-                "mode": row["mode"],
+                "case_id": case_id,
+                "mode": case_payload["mode"],
+                "runtime_backend": case_payload["runtime_backend"],
+                "seq_len": case_payload["seq_len"],
+                "batch_size": case_payload["batch_size"],
+                "dtype": case_payload["dtype"],
+                "nccl_tuple": (case_payload.get("nccl") or {}).get("tuple"),
+                "profiler_status": profiler_status,
                 "command": cmd,
                 "returncode": completed.returncode,
                 "stdout_tail": completed.stdout[-2000:],
                 "stderr_tail": completed.stderr[-2000:],
                 "trace_dir": str(trace_dir),
                 "trace_files": trace_files,
-                "tensorboard_logdir": str(trace_dir),
                 "rerun_output_dir": str(rerun_output_dir),
             }
         )
-        if completed.returncode != 0:
-            write_json_atomic(
-                profiler_root / "trace_index.json",
-                {
-                    "status": "torch_profiler_capture_failed",
-                    "active_timed_iters": int(args.torch_profiler_active_iters),
-                    "entries": entries,
-                },
-            )
-            return "torch_profiler_capture_failed"
 
+    overall_status = "ok" if all(entry["profiler_status"] == "ok" for entry in entries) else "partial_failure"
     write_json_atomic(
         profiler_root / "trace_index.json",
         {
-            "status": "ok",
-            "active_timed_iters": int(args.torch_profiler_active_iters),
+            "schema_version": TORCH_PROFILER_TRACE_INDEX_SCHEMA_VERSION,
+            "status": overall_status,
+            "selection": args.torch_profiler_selection,
+            "wait_iters": effective_wait_iters,
+            "active_iters": int(args.torch_profiler_active_iters),
             "viewer": {
                 "type": "tensorboard",
                 "logdir": str(profiler_root),
@@ -1715,7 +1814,7 @@ def _run_torch_profiler_capture(
             "entries": entries,
         },
     )
-    return "ok"
+    return "ok" if overall_status == "ok" else "torch_profiler_capture_failed"
 
 
 def main() -> int:
@@ -1775,6 +1874,7 @@ def main() -> int:
         moe_gpu_ids=moe_gpu_ids,
     )
     total_points = len(cases)
+    profiler_config = _profiler_config_from_args(args)
 
     all_case_payloads: list[dict[str, Any]] = []
     base_run_config = _build_run_config(
@@ -1796,6 +1896,45 @@ def main() -> int:
     except RuntimeError as exc:
         preflight_errors.append(str(exc))
 
+    if args.torch_profiler_recovery:
+        if args.capture_torch_profiler != "on":
+            preflight_errors.append("--torch-profiler-recovery requires --capture-torch-profiler on")
+        if args.torch_profiler_selection != "all-successful":
+            preflight_errors.append(
+                "--torch-profiler-recovery requires --torch-profiler-selection all-successful"
+            )
+        if preflight_errors:
+            print("; ".join(preflight_errors), file=sys.stderr)
+            return 1
+        try:
+            existing_summary = _load_matrix_summary(output_dir)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        persisted_case_payloads = _load_case_payloads(output_dir)
+        if not persisted_case_payloads:
+            print(f"{output_dir}/cases does not contain any case payloads", file=sys.stderr)
+            return 1
+        existing_run_config = dict(existing_summary.get("run_config") or {})
+        torch_profiler_status = _run_torch_profiler_capture(
+            args=args,
+            run_config=existing_run_config,
+            cases=persisted_case_payloads,
+        )
+        existing_run_config["capture_torch_profiler"] = args.capture_torch_profiler
+        existing_run_config["torch_profiler_selection"] = profiler_config["selection"]
+        existing_run_config["torch_profiler_wait_iters"] = profiler_config["wait_iters"]
+        existing_run_config["torch_profiler_active_iters"] = profiler_config["active_iters"]
+        existing_run_config["torch_profiler_status"] = torch_profiler_status
+        summary = build_matrix_summary(
+            run_config=existing_run_config,
+            cases=persisted_case_payloads,
+            total_points=int((existing_summary.get("counts") or {}).get("total_points", len(persisted_case_payloads))),
+        )
+        write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
+        write_matrix_summary_markdown(args.output_dir, summary)
+        return 0 if torch_profiler_status == "ok" else 1
+
     if preflight_errors:
         all_case_payloads = _invalid_env_matrix(
             cases=cases,
@@ -1803,6 +1942,7 @@ def main() -> int:
             strict_schema=args.strict_schema,
             error_message="; ".join(preflight_errors),
             topology=topology,
+            profiler=profiler_config,
         )
         summary = build_matrix_summary(
             run_config=base_run_config,
@@ -1884,6 +2024,7 @@ def main() -> int:
                         finite=attempt_result["finite"],
                         stage_signatures=attempt_result["stage_signatures"],
                         error=attempt_result["error"],
+                        profiler=profiler_config,
                         attempt_count=attempt_count,
                         retry_trigger=retry_trigger,
                     )
@@ -1947,6 +2088,7 @@ def main() -> int:
             strict_schema=args.strict_schema,
             error_message=f"MPS startup or matrix run failed: {exc}",
             topology=topology,
+            profiler=profiler_config,
         )
         all_case_payloads.extend(error_payloads)
         summary = build_matrix_summary(
@@ -1958,17 +2100,16 @@ def main() -> int:
         write_matrix_summary_markdown(args.output_dir, summary)
         return 1
 
+    persisted_case_payloads = _load_case_payloads(output_dir)
     nsys_status = _run_nsys_capture(
         args=args,
-        cases=all_case_payloads,
-        attn_gpu_ids=attn_gpu_ids,
-        moe_gpu_ids=moe_gpu_ids,
+        run_config=base_run_config,
+        cases=persisted_case_payloads,
     )
     torch_profiler_status = _run_torch_profiler_capture(
         args=args,
-        cases=all_case_payloads,
-        attn_gpu_ids=attn_gpu_ids,
-        moe_gpu_ids=moe_gpu_ids,
+        run_config=base_run_config,
+        cases=persisted_case_payloads,
     )
     run_config = _build_run_config(
         args=args,
@@ -1983,7 +2124,7 @@ def main() -> int:
         nsys_status=nsys_status,
         torch_profiler_status=torch_profiler_status,
     )
-    summary = build_matrix_summary(run_config=run_config, cases=all_case_payloads, total_points=total_points)
+    summary = build_matrix_summary(run_config=run_config, cases=persisted_case_payloads, total_points=total_points)
     write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
     write_matrix_summary_markdown(args.output_dir, summary)
 

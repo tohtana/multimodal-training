@@ -10,9 +10,10 @@ from typing import Any, Iterable
 
 import torch
 
-CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v3"
-MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v3"
+CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v4"
+MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v4"
 RUNTIME_BACKENDS = ("mps_only", "mps_green_ctx")
+TORCH_PROFILER_SELECTIONS = ("representative", "all-successful")
 
 REQUIRED_STATUS_KEYS = (
     "ok",
@@ -24,6 +25,7 @@ REQUIRED_STATUS_KEYS = (
     "nsys_capture_failed",
 )
 RETRYABLE_STATUS_KEYS = {"oom", "timeout"}
+PROFILER_STATUS_KEYS = (*REQUIRED_STATUS_KEYS, "torch_profiler_capture_failed")
 
 _DTYPE_ALIASES = {
     "float32": "fp32",
@@ -451,6 +453,7 @@ def build_case_payload(
     stage_signatures: dict[str, Any] | None = None,
     baseline_diff: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
+    profiler: dict[str, Any] | None = None,
     attempt_count: int = 1,
     retry_trigger: str = "none",
     artifact_path: str | None = None,
@@ -501,6 +504,14 @@ def build_case_payload(
             "message": None,
             "traceback": None,
         },
+        "profiler": profiler
+        if profiler is not None
+        else {
+            "capture_requested": False,
+            "selection": None,
+            "wait_iters": None,
+            "active_iters": None,
+        },
         "attempt_count": int(attempt_count),
         "retry_trigger": retry_trigger,
         "artifact_path": artifact_path,
@@ -520,6 +531,7 @@ def build_invalid_environment_payload(
     nccl_env: dict[str, Any],
     runtime: dict[str, Any] | None,
     message: str,
+    profiler: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return build_case_payload(
         case_id=case_id,
@@ -534,6 +546,7 @@ def build_invalid_environment_payload(
         nccl_env=nccl_env,
         runtime=runtime,
         error={"code": "invalid_environment", "message": message, "traceback": None},
+        profiler=profiler,
     )
 
 
@@ -558,6 +571,7 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         "stage_signatures",
         "baseline_diff",
         "error",
+        "profiler",
         "attempt_count",
         "retry_trigger",
         "artifact_path",
@@ -670,6 +684,23 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
             for key in ("attn", "moe"):
                 if key not in stages:
                     errors.append(f"baseline_diff.stages.{key} missing")
+
+    profiler = payload.get("profiler")
+    if not isinstance(profiler, dict):
+        errors.append("profiler must be an object")
+    else:
+        capture_requested = profiler.get("capture_requested")
+        if not isinstance(capture_requested, bool):
+            errors.append("profiler.capture_requested must be a boolean")
+        selection = profiler.get("selection")
+        if selection is not None and selection not in TORCH_PROFILER_SELECTIONS:
+            errors.append(
+                f"profiler.selection must be null or one of {TORCH_PROFILER_SELECTIONS}, got {selection!r}"
+            )
+        for key in ("wait_iters", "active_iters"):
+            value = profiler.get(key)
+            if value is not None and (not isinstance(value, int) or value <= 0):
+                errors.append(f"profiler.{key} must be null or a positive integer")
 
     return errors
 
@@ -851,16 +882,21 @@ def _build_backend_pair_id(
     )
 
 
-def _pair_status(mps_only_row: dict[str, Any] | None, mps_green_ctx_row: dict[str, Any] | None) -> str:
-    if mps_only_row is None:
-        return "missing_mps_only"
-    if mps_green_ctx_row is None:
-        return "missing_mps_green_ctx"
-    mps_only_ok = (mps_only_row.get("serial_status"), mps_only_row.get("overlap_status")) == ("ok", "ok")
-    mps_green_ctx_ok = (mps_green_ctx_row.get("serial_status"), mps_green_ctx_row.get("overlap_status")) == (
-        "ok",
-        "ok",
+def _pair_status(backend_pair_row: dict[str, Any]) -> str:
+    mps_only_serial_status = backend_pair_row.get("mps_only_serial_status")
+    mps_only_overlap_status = backend_pair_row.get("mps_only_overlap_status")
+    mps_green_ctx_serial_status = backend_pair_row.get("mps_green_ctx_serial_status")
+    mps_green_ctx_overlap_status = backend_pair_row.get("mps_green_ctx_overlap_status")
+    mps_only_missing = mps_only_serial_status is None and mps_only_overlap_status is None
+    mps_green_ctx_missing = (
+        mps_green_ctx_serial_status is None and mps_green_ctx_overlap_status is None
     )
+    if mps_only_missing:
+        return "missing_mps_only"
+    if mps_green_ctx_missing:
+        return "missing_mps_green_ctx"
+    mps_only_ok = (mps_only_serial_status, mps_only_overlap_status) == ("ok", "ok")
+    mps_green_ctx_ok = (mps_green_ctx_serial_status, mps_green_ctx_overlap_status) == ("ok", "ok")
     if not mps_only_ok and not mps_green_ctx_ok:
         return "both_failed"
     if not mps_only_ok:
@@ -870,7 +906,7 @@ def _pair_status(mps_only_row: dict[str, Any] | None, mps_green_ctx_row: dict[st
     return "ok"
 
 
-def _build_backend_pairs(run_config: dict[str, Any], comparison_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     runtime_backends = [str(value) for value in run_config.get("runtime_backends") or []]
     if "mps_only" not in runtime_backends or "mps_green_ctx" not in runtime_backends:
         return []
@@ -891,76 +927,98 @@ def _build_backend_pairs(run_config: dict[str, Any], comparison_rows: list[dict[
         seq_len, batch_size, dtype, nccl_tuple = key
         mps_only_row = mps_only_rows.get(key)
         mps_green_ctx_row = mps_green_ctx_rows.get(key)
-        pair_status = _pair_status(mps_only_row, mps_green_ctx_row)
-        pair_rows.append(
-            {
-                "pair_id": _build_backend_pair_id(
-                    seq_len=seq_len,
-                    batch_size=batch_size,
-                    dtype=dtype,
-                    nccl_tuple=nccl_tuple,
-                    green_ctx_attn_sms=requested_green_ctx_sms.get("attn"),
-                    green_ctx_moe_sms=requested_green_ctx_sms.get("moe"),
-                ),
-                "pair_status": pair_status,
-                "seq_len": seq_len,
-                "batch_size": batch_size,
-                "dtype": dtype,
-                "nccl_tuple": nccl_tuple,
-                "green_ctx_sms": requested_green_ctx_sms,
-                "mps_only_case_id": None if mps_only_row is None else mps_only_row.get("overlap_case_id"),
-                "mps_green_ctx_case_id": (
-                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_case_id")
-                ),
-                "mps_only_status": None if mps_only_row is None else mps_only_row.get("overlap_status"),
-                "mps_green_ctx_status": (
-                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_status")
-                ),
-                "mps_only_overlap_total_ms": (
-                    None if mps_only_row is None else mps_only_row.get("overlap_total_ms")
-                ),
-                "mps_green_ctx_overlap_total_ms": (
-                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_total_ms")
-                ),
-                "mps_only_overlap_timed_wall_ms": (
-                    None if mps_only_row is None else mps_only_row.get("overlap_timed_wall_ms")
-                ),
-                "mps_green_ctx_overlap_timed_wall_ms": (
-                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_timed_wall_ms")
-                ),
-                "mps_only_timed_speedup_vs_serial": (
-                    None if mps_only_row is None else mps_only_row.get("timed_speedup_vs_serial")
-                ),
-                "mps_green_ctx_timed_speedup_vs_serial": (
-                    None if mps_green_ctx_row is None else mps_green_ctx_row.get("timed_speedup_vs_serial")
-                ),
-                "delta_overlap_total_ms": (
-                    None
-                    if mps_only_row is None
-                    or mps_green_ctx_row is None
-                    or mps_only_row.get("overlap_total_ms") is None
-                    or mps_green_ctx_row.get("overlap_total_ms") is None
-                    else float(mps_only_row["overlap_total_ms"]) - float(mps_green_ctx_row["overlap_total_ms"])
-                ),
-                "delta_overlap_timed_wall_ms": (
-                    None
-                    if mps_only_row is None
-                    or mps_green_ctx_row is None
-                    or mps_only_row.get("overlap_timed_wall_ms") is None
-                    or mps_green_ctx_row.get("overlap_timed_wall_ms") is None
-                    else float(mps_only_row["overlap_timed_wall_ms"]) - float(mps_green_ctx_row["overlap_timed_wall_ms"])
-                ),
-                "delta_timed_speedup_vs_serial": (
-                    None
-                    if mps_only_row is None
-                    or mps_green_ctx_row is None
-                    or mps_only_row.get("timed_speedup_vs_serial") is None
-                    or mps_green_ctx_row.get("timed_speedup_vs_serial") is None
-                    else float(mps_green_ctx_row["timed_speedup_vs_serial"])
-                    - float(mps_only_row["timed_speedup_vs_serial"])
-                ),
-            }
-        )
+        row = {
+            "pair_id": _build_backend_pair_id(
+                seq_len=seq_len,
+                batch_size=batch_size,
+                dtype=dtype,
+                nccl_tuple=nccl_tuple,
+                green_ctx_attn_sms=requested_green_ctx_sms.get("attn"),
+                green_ctx_moe_sms=requested_green_ctx_sms.get("moe"),
+            ),
+            "seq_len": seq_len,
+            "batch_size": batch_size,
+            "dtype": dtype,
+            "nccl_tuple": nccl_tuple,
+            "green_ctx_sms": requested_green_ctx_sms,
+            "mps_only_serial_case_id": None if mps_only_row is None else mps_only_row.get("serial_case_id"),
+            "mps_only_serial_status": None if mps_only_row is None else mps_only_row.get("serial_status"),
+            "mps_only_serial_timed_wall_ms": (
+                None if mps_only_row is None else mps_only_row.get("serial_timed_wall_ms")
+            ),
+            "mps_only_serial_timed_speedup_vs_serial": (
+                1.0 if mps_only_row is not None and mps_only_row.get("serial_status") == "ok" else None
+            ),
+            "mps_only_overlap_case_id": None if mps_only_row is None else mps_only_row.get("overlap_case_id"),
+            "mps_only_overlap_status": None if mps_only_row is None else mps_only_row.get("overlap_status"),
+            "mps_only_overlap_timed_wall_ms": (
+                None if mps_only_row is None else mps_only_row.get("overlap_timed_wall_ms")
+            ),
+            "mps_only_overlap_timed_speedup_vs_serial": (
+                None if mps_only_row is None else mps_only_row.get("timed_speedup_vs_serial")
+            ),
+            "mps_green_ctx_serial_case_id": (
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_case_id")
+            ),
+            "mps_green_ctx_serial_status": (
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_status")
+            ),
+            "mps_green_ctx_serial_timed_wall_ms": (
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_timed_wall_ms")
+            ),
+            "mps_green_ctx_serial_timed_speedup_vs_serial": (
+                1.0
+                if mps_green_ctx_row is not None and mps_green_ctx_row.get("serial_status") == "ok"
+                else None
+            ),
+            "mps_green_ctx_overlap_case_id": (
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_case_id")
+            ),
+            "mps_green_ctx_overlap_status": (
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_status")
+            ),
+            "mps_green_ctx_overlap_timed_wall_ms": (
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_timed_wall_ms")
+            ),
+            "mps_green_ctx_overlap_timed_speedup_vs_serial": (
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("timed_speedup_vs_serial")
+            ),
+            "serial_timed_speedup_mps_green_ctx_vs_mps_only": compute_speedup(
+                None if mps_only_row is None else mps_only_row.get("serial_timed_wall_ms"),
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_timed_wall_ms"),
+            ),
+            "overlap_timed_speedup_mps_green_ctx_vs_mps_only": compute_speedup(
+                None if mps_only_row is None else mps_only_row.get("overlap_timed_wall_ms"),
+                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_timed_wall_ms"),
+            ),
+            "delta_overlap_total_ms": (
+                None
+                if mps_only_row is None
+                or mps_green_ctx_row is None
+                or mps_only_row.get("overlap_total_ms") is None
+                or mps_green_ctx_row.get("overlap_total_ms") is None
+                else float(mps_only_row["overlap_total_ms"]) - float(mps_green_ctx_row["overlap_total_ms"])
+            ),
+            "delta_overlap_timed_wall_ms": (
+                None
+                if mps_only_row is None
+                or mps_green_ctx_row is None
+                or mps_only_row.get("overlap_timed_wall_ms") is None
+                or mps_green_ctx_row.get("overlap_timed_wall_ms") is None
+                else float(mps_only_row["overlap_timed_wall_ms"]) - float(mps_green_ctx_row["overlap_timed_wall_ms"])
+            ),
+            "delta_timed_speedup_vs_serial": (
+                None
+                if mps_only_row is None
+                or mps_green_ctx_row is None
+                or mps_only_row.get("timed_speedup_vs_serial") is None
+                or mps_green_ctx_row.get("timed_speedup_vs_serial") is None
+                else float(mps_green_ctx_row["timed_speedup_vs_serial"])
+                - float(mps_only_row["timed_speedup_vs_serial"])
+            ),
+        }
+        row["pair_status"] = _pair_status(row)
+        pair_rows.append(row)
     return pair_rows
 
 
@@ -980,7 +1038,7 @@ def build_matrix_summary(
         attempted_cases += max(int(case.get("attempt_count", 1)), 1)
 
     comparison_rows = _build_comparison_rows(cases)
-    backend_pairs = _build_backend_pairs(run_config, comparison_rows)
+    backend_pair_rows = _build_backend_pair_rows(run_config, comparison_rows)
     summary = {
         "schema_version": MATRIX_SCHEMA_VERSION,
         "run_config": run_config,
@@ -989,13 +1047,14 @@ def build_matrix_summary(
             "attempted_cases": int(attempted_cases),
             "completed_cases": len(cases),
             "comparison_points": len(comparison_rows),
-            "backend_pair_points": len(backend_pairs),
+            "backend_pair_points": len(backend_pair_rows),
             "by_status": by_status,
         },
         "cases": [_compact_case_row(case) for case in cases],
         "comparison_rows": comparison_rows,
+        "backend_pair_rows": backend_pair_rows,
         "comparisons": {
-            "backend_pairs": backend_pairs,
+            "backend_pairs": backend_pair_rows,
         },
         "generated_at": now_utc_iso(),
     }
@@ -1004,7 +1063,16 @@ def build_matrix_summary(
 
 def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    required_top = ("schema_version", "run_config", "counts", "cases", "comparison_rows", "comparisons", "generated_at")
+    required_top = (
+        "schema_version",
+        "run_config",
+        "counts",
+        "cases",
+        "comparison_rows",
+        "backend_pair_rows",
+        "comparisons",
+        "generated_at",
+    )
     for key in required_top:
         if key not in summary:
             errors.append(f"missing key: {key}")
@@ -1120,40 +1188,62 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
                 "counts.comparison_points must equal len(comparison_rows): "
                 f"{counts.get('comparison_points')} != {len(comparison_rows)}"
             )
+    backend_pair_rows = summary.get("backend_pair_rows")
+    if not isinstance(backend_pair_rows, list):
+        errors.append("backend_pair_rows must be an array")
+    else:
+        required_pair_keys = (
+            "seq_len",
+            "batch_size",
+            "mps_only_serial_case_id",
+            "mps_only_serial_status",
+            "mps_only_serial_timed_wall_ms",
+            "mps_only_serial_timed_speedup_vs_serial",
+            "mps_only_overlap_case_id",
+            "mps_only_overlap_status",
+            "mps_only_overlap_timed_wall_ms",
+            "mps_only_overlap_timed_speedup_vs_serial",
+            "mps_green_ctx_serial_case_id",
+            "mps_green_ctx_serial_status",
+            "mps_green_ctx_serial_timed_wall_ms",
+            "mps_green_ctx_overlap_case_id",
+            "mps_green_ctx_overlap_status",
+            "mps_green_ctx_overlap_timed_wall_ms",
+            "mps_green_ctx_overlap_timed_speedup_vs_serial",
+            "serial_timed_speedup_mps_green_ctx_vs_mps_only",
+            "overlap_timed_speedup_mps_green_ctx_vs_mps_only",
+        )
+        for index, row in enumerate(backend_pair_rows):
+            if not isinstance(row, dict):
+                errors.append(f"backend_pair_rows[{index}] must be an object")
+                continue
+            for key in required_pair_keys:
+                if key not in row:
+                    errors.append(f"backend_pair_rows[{index}].{key} missing")
+            for status_key in (
+                "mps_only_serial_status",
+                "mps_only_overlap_status",
+                "mps_green_ctx_serial_status",
+                "mps_green_ctx_overlap_status",
+            ):
+                status = row.get(status_key)
+                if status is not None and status not in REQUIRED_STATUS_KEYS:
+                    errors.append(
+                        f"backend_pair_rows[{index}].{status_key} must be one of {REQUIRED_STATUS_KEYS} or null"
+                    )
+        if int(counts.get("backend_pair_points", 0)) != len(backend_pair_rows):
+            errors.append(
+                "counts.backend_pair_points must equal len(backend_pair_rows): "
+                f"{counts.get('backend_pair_points')} != {len(backend_pair_rows)}"
+            )
+
     comparisons = summary.get("comparisons")
     if not isinstance(comparisons, dict):
         errors.append("comparisons must be an object")
     else:
         backend_pairs = comparisons.get("backend_pairs")
-        if not isinstance(backend_pairs, list):
-            errors.append("comparisons.backend_pairs must be an array")
-        else:
-            required_pair_keys = (
-                "pair_id",
-                "pair_status",
-                "seq_len",
-                "batch_size",
-                "dtype",
-                "nccl_tuple",
-                "green_ctx_sms",
-                "mps_only_case_id",
-                "mps_green_ctx_case_id",
-                "delta_overlap_total_ms",
-                "delta_overlap_timed_wall_ms",
-                "delta_timed_speedup_vs_serial",
-            )
-            for index, row in enumerate(backend_pairs):
-                if not isinstance(row, dict):
-                    errors.append(f"comparisons.backend_pairs[{index}] must be an object")
-                    continue
-                for key in required_pair_keys:
-                    if key not in row:
-                        errors.append(f"comparisons.backend_pairs[{index}].{key} missing")
-            if int(counts.get("backend_pair_points", 0)) != len(backend_pairs):
-                errors.append(
-                    "counts.backend_pair_points must equal len(comparisons.backend_pairs): "
-                    f"{counts.get('backend_pair_points')} != {len(backend_pairs)}"
-                )
+        if backend_pairs != backend_pair_rows:
+            errors.append("comparisons.backend_pairs must mirror backend_pair_rows")
     return errors
 
 
@@ -1228,21 +1318,24 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
             )
         )
     lines.append("")
-    lines.append("## Backend Pairs")
+    lines.append("## Backend Pair Rows")
     lines.append("")
     lines.append(
-        "| pair_id | pair_status | seq_len | batch_size | delta_overlap_timed_wall_ms | delta_timed_speedup_vs_serial |"
+        "| pair_id | pair_status | seq_len | batch_size | mps_only_overlap_status | mps_green_ctx_overlap_status | overlap_timed_speedup_mps_green_ctx_vs_mps_only |"
     )
-    lines.append("|---|---|---:|---:|---:|---:|")
-    for row in (summary.get("comparisons") or {}).get("backend_pairs", []):
+    lines.append("|---|---|---:|---:|---|---|---:|")
+    for row in summary.get("backend_pair_rows", []):
         lines.append(
-            "| {pair_id} | {pair_status} | {seq_len} | {batch_size} | {delta_overlap_timed_wall_ms} | {delta_timed_speedup_vs_serial} |".format(
+            "| {pair_id} | {pair_status} | {seq_len} | {batch_size} | {mps_only_overlap_status} | {mps_green_ctx_overlap_status} | {overlap_timed_speedup_mps_green_ctx_vs_mps_only} |".format(
                 pair_id=row.get("pair_id"),
                 pair_status=row.get("pair_status"),
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
-                delta_overlap_timed_wall_ms=row.get("delta_overlap_timed_wall_ms"),
-                delta_timed_speedup_vs_serial=row.get("delta_timed_speedup_vs_serial"),
+                mps_only_overlap_status=row.get("mps_only_overlap_status"),
+                mps_green_ctx_overlap_status=row.get("mps_green_ctx_overlap_status"),
+                overlap_timed_speedup_mps_green_ctx_vs_mps_only=row.get(
+                    "overlap_timed_speedup_mps_green_ctx_vs_mps_only"
+                ),
             )
         )
     lines.append("")
