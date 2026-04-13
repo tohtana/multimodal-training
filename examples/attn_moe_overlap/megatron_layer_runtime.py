@@ -7,6 +7,7 @@ import time
 import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any, Callable
 from threading import BrokenBarrierError
 
@@ -192,6 +193,47 @@ class RuntimeConfig:
     green_ctx_attn_sms: int | None = None
     green_ctx_moe_sms: int | None = None
     num_experts: int | None = None
+    moe_routing_mode: str = "normal"
+
+
+@dataclass
+class EqualTokenRoutingState:
+    assigned_expert_ids: torch.Tensor
+    probs: torch.Tensor
+    routing_map: torch.Tensor
+    tokens_per_expert: list[int]
+    local_tokens_per_expert: list[int]
+
+
+def _build_equal_token_routing_state(
+    *,
+    hidden_states: torch.Tensor,
+    num_experts: int,
+    local_expert_indices: list[int],
+) -> EqualTokenRoutingState:
+    if hidden_states.ndim < 2:
+        raise RuntimeError("equal_tokens requires hidden_states with an explicit hidden dimension")
+    if int(num_experts) <= 0:
+        raise RuntimeError("equal_tokens requires num_experts > 0")
+    num_tokens = int(hidden_states.numel() // hidden_states.shape[-1])
+    device = hidden_states.device
+    assigned_expert_ids = torch.arange(num_tokens, device=device, dtype=torch.long) % int(num_experts)
+    routing_map = torch.zeros((num_tokens, int(num_experts)), device=device, dtype=torch.bool)
+    routing_map.scatter_(1, assigned_expert_ids.unsqueeze(1), True)
+    probs = torch.zeros((num_tokens, int(num_experts)), device=device, dtype=hidden_states.dtype)
+    probs.scatter_(1, assigned_expert_ids.unsqueeze(1), 1.0)
+    global_counts = torch.bincount(assigned_expert_ids, minlength=int(num_experts)).to(dtype=torch.int64)
+    local_counts = torch.zeros_like(global_counts)
+    if local_expert_indices:
+        local_idx = torch.tensor(local_expert_indices, device=device, dtype=torch.long)
+        local_counts[local_idx] = global_counts[local_idx]
+    return EqualTokenRoutingState(
+        assigned_expert_ids=assigned_expert_ids,
+        probs=probs,
+        routing_map=routing_map,
+        tokens_per_expert=[int(value) for value in global_counts.cpu().tolist()],
+        local_tokens_per_expert=[int(value) for value in local_counts.cpu().tolist()],
+    )
 
 
 class _SingleLayerMegatronTrainer:
@@ -244,6 +286,7 @@ class MegatronSingleLayerRuntime:
         self.trainer.build_model()
         self.layer = self._resolve_decoder_layer(self.trainer.megatron_model)
         self.layer.eval()
+        self._validate_moe_routing_mode_support()
         self.attention_runtime = describe_attention_runtime(self.layer, self.config.attention_backend)
         hidden_size = int(self.layer.config.hidden_size)
         self.hidden_states = self._build_hidden_states(hidden_size)
@@ -299,6 +342,9 @@ class MegatronSingleLayerRuntime:
         }
         if self.config.num_experts is not None:
             engine_config["num_experts"] = int(self.config.num_experts)
+        if self.config.moe_routing_mode == "equal_tokens":
+            engine_config["megatron_moe_router_topk"] = 1
+            engine_config["megatron_moe_router_pre_softmax"] = True
 
         return {
             "model_name": self.config.model_name,
@@ -315,6 +361,29 @@ class MegatronSingleLayerRuntime:
             "parallel_size": 1,
             "text_seq_len": int(self.config.seq_len),
         }
+
+    def _validate_moe_routing_mode_support(self) -> None:
+        if self.config.moe_routing_mode == "normal" or self.config.stage_role != "moe":
+            return
+        if self.config.moe_routing_mode != "equal_tokens":
+            raise RuntimeError(f"Unsupported moe_routing_mode={self.config.moe_routing_mode}")
+        if self.config.num_experts is None or int(self.config.num_experts) <= 0:
+            raise RuntimeError("equal_tokens requires --num-experts > 0")
+        if int(self.config.num_experts) % int(self.config.expert_model_parallel_size) != 0:
+            raise RuntimeError(
+                "equal_tokens requires num_experts to be divisible by expert_model_parallel_size"
+            )
+        mlp = getattr(self.layer, "mlp", None)
+        router = getattr(mlp, "router", None) if mlp is not None else None
+        token_dispatcher = getattr(mlp, "token_dispatcher", None) if mlp is not None else None
+        if mlp is None or router is None or token_dispatcher is None:
+            raise RuntimeError("equal_tokens requires layer.mlp.router and layer.mlp.token_dispatcher")
+        router_topk = getattr(getattr(self.layer, "config", None), "moe_router_topk", None)
+        if int(router_topk or 0) != 1:
+            raise RuntimeError("equal_tokens requires an effective moe_router_topk == 1")
+        local_expert_indices = getattr(token_dispatcher, "local_expert_indices", None)
+        if not isinstance(local_expert_indices, list) or not local_expert_indices:
+            raise RuntimeError("equal_tokens requires token_dispatcher.local_expert_indices")
 
     def _resolve_decoder_layer(self, megatron_model):
         model = megatron_model
@@ -382,6 +451,8 @@ class MegatronSingleLayerRuntime:
         first_nonfinite: dict[str, Any] | None = None
         output_tensor: torch.Tensor | None = None
         profiler: Any | None = None
+        stable_tokens_per_expert: list[int] | None = None
+        local_tokens_per_expert: list[int] | None = None
 
         import torch.distributed as dist
 
@@ -438,6 +509,7 @@ class MegatronSingleLayerRuntime:
 
             def _run_forward_phase(_phase_name: str, iter_idx: int, is_timed: bool) -> None:
                 nonlocal first_nonfinite, output_tensor, timed_start_s, timed_end_s
+                nonlocal stable_tokens_per_expert, local_tokens_per_expert
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
 
@@ -461,7 +533,39 @@ class MegatronSingleLayerRuntime:
                                 attention_mask=self.attention_mask,
                             )
                         else:
-                            output_tensor = self.layer._forward_mlp(self.hidden_states, inference_context=None)
+                            if self.config.moe_routing_mode == "equal_tokens":
+                                mlp = self.layer.mlp
+                                router = mlp.router
+                                local_expert_indices = list(getattr(mlp.token_dispatcher, "local_expert_indices"))
+                                state = _build_equal_token_routing_state(
+                                    hidden_states=self.hidden_states,
+                                    num_experts=int(self.config.num_experts or 0),
+                                    local_expert_indices=local_expert_indices,
+                                )
+                                original_forward = router.forward
+
+                                def _equal_tokens_forward(_router_self: Any, input_tensor: torch.Tensor):
+                                    del input_tensor
+                                    return state.probs, state.routing_map
+
+                                router.forward = MethodType(_equal_tokens_forward, router)
+                                try:
+                                    output_tensor = self.layer._forward_mlp(
+                                        self.hidden_states, inference_context=None
+                                    )
+                                finally:
+                                    router.forward = original_forward
+
+                                if is_timed:
+                                    if stable_tokens_per_expert is None:
+                                        stable_tokens_per_expert = list(state.tokens_per_expert)
+                                    elif stable_tokens_per_expert != state.tokens_per_expert:
+                                        raise RuntimeError(
+                                            "equal_tokens produced inconsistent tokens_per_expert across timed iterations"
+                                        )
+                                    local_tokens_per_expert = list(state.local_tokens_per_expert)
+                            else:
+                                output_tensor = self.layer._forward_mlp(self.hidden_states, inference_context=None)
                 enqueue_end = time.perf_counter()
                 end_event.record(active_stream)
                 active_stream.synchronize()
@@ -532,6 +636,9 @@ class MegatronSingleLayerRuntime:
                 "first_nonfinite": first_nonfinite,
             },
             "output_signature": tensor_signature(output_tensor),
+            "moe_routing_mode": self.config.moe_routing_mode,
+            "tokens_per_expert": stable_tokens_per_expert,
+            "local_tokens_per_expert": local_tokens_per_expert,
         }
 
 

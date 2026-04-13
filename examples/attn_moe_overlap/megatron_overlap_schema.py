@@ -14,6 +14,7 @@ CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v4"
 MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v4"
 RUNTIME_BACKENDS = ("mps_only", "mps_green_ctx")
 TORCH_PROFILER_SELECTIONS = ("representative", "all-successful")
+MOE_ROUTING_MODES = ("normal", "equal_tokens")
 
 REQUIRED_STATUS_KEYS = (
     "ok",
@@ -76,6 +77,13 @@ def normalize_runtime_backend(runtime_backend: str) -> str:
     normalized = runtime_backend.strip().lower()
     if normalized not in RUNTIME_BACKENDS:
         raise ValueError(f"Unsupported runtime backend: {runtime_backend}")
+    return normalized
+
+
+def normalize_moe_routing_mode(moe_routing_mode: str) -> str:
+    normalized = moe_routing_mode.strip().lower()
+    if normalized not in MOE_ROUTING_MODES:
+        raise ValueError(f"Unsupported MoE routing mode: {moe_routing_mode}")
     return normalized
 
 
@@ -251,6 +259,7 @@ def build_case_id(
     attn_gpu_ids: Iterable[int],
     moe_gpu_ids: Iterable[int],
     nccl_tuple: tuple[int, int, int] | None,
+    moe_routing_mode: str = "normal",
 ) -> str:
     nccl_fragment = "off" if nccl_tuple is None else f"{nccl_tuple[0]}_{nccl_tuple[1]}_{nccl_tuple[2]}"
     runtime_backend = normalize_runtime_backend(runtime_backend)
@@ -261,6 +270,7 @@ def build_case_id(
     return "__".join(
         (
             f"mode-{mode}",
+            f"routing-{normalize_moe_routing_mode(moe_routing_mode)}",
             f"seq-{seq_len}",
             f"batch-{batch_size}",
             f"backend-{runtime_backend}",
@@ -446,6 +456,7 @@ def build_case_payload(
     seed: int,
     topology: dict[str, Any],
     nccl_env: dict[str, Any],
+    moe_routing_mode: str = "normal",
     runtime: dict[str, Any] | None = None,
     timing_ms: dict[str, Any] | None = None,
     overlap_ms: float | None = None,
@@ -457,14 +468,20 @@ def build_case_payload(
     attempt_count: int = 1,
     retry_trigger: str = "none",
     artifact_path: str | None = None,
+    tokens_per_expert: list[int] | None = None,
+    tokens_per_expert_min: int | None = None,
+    tokens_per_expert_max: int | None = None,
+    tokens_per_expert_spread: int | None = None,
 ) -> dict[str, Any]:
     normalized_dtype = normalize_dtype_name(dtype)
     normalized_runtime_backend = normalize_runtime_backend(runtime_backend)
+    normalized_moe_routing_mode = normalize_moe_routing_mode(moe_routing_mode)
     return {
         "schema_version": CASE_SCHEMA_VERSION,
         "case_id": case_id,
         "status": status,
         "mode": mode,
+        "moe_routing_mode": normalized_moe_routing_mode,
         "seq_len": int(seq_len),
         "batch_size": int(batch_size),
         "runtime_backend": normalized_runtime_backend,
@@ -515,6 +532,10 @@ def build_case_payload(
         "attempt_count": int(attempt_count),
         "retry_trigger": retry_trigger,
         "artifact_path": artifact_path,
+        "tokens_per_expert": tokens_per_expert,
+        "tokens_per_expert_min": tokens_per_expert_min,
+        "tokens_per_expert_max": tokens_per_expert_max,
+        "tokens_per_expert_spread": tokens_per_expert_spread,
     }
 
 
@@ -531,6 +552,7 @@ def build_invalid_environment_payload(
     nccl_env: dict[str, Any],
     runtime: dict[str, Any] | None,
     message: str,
+    moe_routing_mode: str = "normal",
     profiler: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return build_case_payload(
@@ -544,6 +566,7 @@ def build_invalid_environment_payload(
         seed=seed,
         topology=topology,
         nccl_env=nccl_env,
+        moe_routing_mode=moe_routing_mode,
         runtime=runtime,
         error={"code": "invalid_environment", "message": message, "traceback": None},
         profiler=profiler,
@@ -557,6 +580,7 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         "case_id",
         "status",
         "mode",
+        "moe_routing_mode",
         "seq_len",
         "batch_size",
         "runtime_backend",
@@ -575,6 +599,10 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         "attempt_count",
         "retry_trigger",
         "artifact_path",
+        "tokens_per_expert",
+        "tokens_per_expert_min",
+        "tokens_per_expert_max",
+        "tokens_per_expert_spread",
     )
     for key in required:
         if key not in payload:
@@ -588,6 +616,10 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     status = payload.get("status")
     if status not in REQUIRED_STATUS_KEYS:
         errors.append(f"status must be one of {REQUIRED_STATUS_KEYS}, got {status!r}")
+
+    moe_routing_mode = payload.get("moe_routing_mode")
+    if moe_routing_mode not in MOE_ROUTING_MODES:
+        errors.append(f"moe_routing_mode must be one of {MOE_ROUTING_MODES}, got {moe_routing_mode!r}")
 
     batch_size = payload.get("batch_size")
     if not isinstance(batch_size, int) or batch_size <= 0:
@@ -702,6 +734,44 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
             if value is not None and (not isinstance(value, int) or value <= 0):
                 errors.append(f"profiler.{key} must be null or a positive integer")
 
+    tokens_per_expert = payload.get("tokens_per_expert")
+    tokens_per_expert_min = payload.get("tokens_per_expert_min")
+    tokens_per_expert_max = payload.get("tokens_per_expert_max")
+    tokens_per_expert_spread = payload.get("tokens_per_expert_spread")
+    if moe_routing_mode == "equal_tokens":
+        if not isinstance(tokens_per_expert, list) or not tokens_per_expert:
+            errors.append("tokens_per_expert must be a non-empty list for equal_tokens cases")
+        elif any(not isinstance(value, int) or value < 0 for value in tokens_per_expert):
+            errors.append("tokens_per_expert must contain non-negative integers")
+        if not isinstance(tokens_per_expert_min, int) or tokens_per_expert_min < 0:
+            errors.append("tokens_per_expert_min must be a non-negative integer for equal_tokens cases")
+        if not isinstance(tokens_per_expert_max, int) or tokens_per_expert_max < 0:
+            errors.append("tokens_per_expert_max must be a non-negative integer for equal_tokens cases")
+        if not isinstance(tokens_per_expert_spread, int) or tokens_per_expert_spread < 0:
+            errors.append("tokens_per_expert_spread must be a non-negative integer for equal_tokens cases")
+        if (
+            isinstance(tokens_per_expert, list)
+            and tokens_per_expert
+            and isinstance(tokens_per_expert_min, int)
+            and isinstance(tokens_per_expert_max, int)
+            and isinstance(tokens_per_expert_spread, int)
+        ):
+            if tokens_per_expert_min != min(tokens_per_expert):
+                errors.append("tokens_per_expert_min must equal min(tokens_per_expert)")
+            if tokens_per_expert_max != max(tokens_per_expert):
+                errors.append("tokens_per_expert_max must equal max(tokens_per_expert)")
+            if tokens_per_expert_spread != (tokens_per_expert_max - tokens_per_expert_min):
+                errors.append("tokens_per_expert_spread must equal tokens_per_expert_max - tokens_per_expert_min")
+    else:
+        for key, value in (
+            ("tokens_per_expert", tokens_per_expert),
+            ("tokens_per_expert_min", tokens_per_expert_min),
+            ("tokens_per_expert_max", tokens_per_expert_max),
+            ("tokens_per_expert_spread", tokens_per_expert_spread),
+        ):
+            if value is not None:
+                errors.append(f"{key} must be null for normal routing cases")
+
     return errors
 
 
@@ -764,6 +834,7 @@ def _compact_case_row(payload: dict[str, Any]) -> dict[str, Any]:
         "case_id": payload.get("case_id"),
         "status": payload.get("status"),
         "mode": payload.get("mode"),
+        "moe_routing_mode": payload.get("moe_routing_mode"),
         "seq_len": payload.get("seq_len"),
         "batch_size": payload.get("batch_size"),
         "runtime_backend": payload.get("runtime_backend"),
@@ -771,6 +842,7 @@ def _compact_case_row(payload: dict[str, Any]) -> dict[str, Any]:
         "dtype": payload.get("dtype"),
         "nccl_tuple": payload.get("nccl", {}).get("tuple"),
         "attempt_count": payload.get("attempt_count", 1),
+        "tokens_per_expert_spread": payload.get("tokens_per_expert_spread"),
         "artifact_path": payload.get("artifact_path"),
     }
 
@@ -784,12 +856,15 @@ def _comparison_green_ctx_sms(payload: dict[str, Any]) -> tuple[int | None, int 
     )
 
 
-def _comparison_group_key(payload: dict[str, Any]) -> tuple[int, int, str, str, str, int | None, int | None]:
+def _comparison_group_key(
+    payload: dict[str, Any],
+) -> tuple[int, int, str, str, str, str, int | None, int | None]:
     green_ctx_attn_sms, green_ctx_moe_sms = _comparison_green_ctx_sms(payload)
     return (
         int(payload.get("seq_len") or 0),
         int(payload.get("batch_size") or 0),
         str(payload.get("runtime_backend") or ""),
+        str(payload.get("moe_routing_mode") or "normal"),
         str(payload.get("dtype") or ""),
         str(payload.get("nccl", {}).get("tuple") or ""),
         -1 if green_ctx_attn_sms is None else green_ctx_attn_sms,
@@ -803,6 +878,7 @@ def _comparison_row_template(payload: dict[str, Any]) -> dict[str, Any]:
         "seq_len": int(payload.get("seq_len") or 0),
         "batch_size": int(payload.get("batch_size") or 0),
         "runtime_backend": payload.get("runtime_backend"),
+        "moe_routing_mode": payload.get("moe_routing_mode"),
         "green_ctx_sms": {
             "attn": green_ctx_attn_sms,
             "moe": green_ctx_moe_sms,
@@ -849,10 +925,11 @@ def _build_comparison_rows(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _backend_pair_common_key(row: dict[str, Any]) -> tuple[int, int, str, str]:
+def _backend_pair_common_key(row: dict[str, Any]) -> tuple[int, int, str, str, str]:
     return (
         int(row.get("seq_len") or 0),
         int(row.get("batch_size") or 0),
+        str(row.get("moe_routing_mode") or "normal"),
         str(row.get("dtype") or ""),
         str(row.get("nccl_tuple") or ""),
     )
@@ -862,6 +939,7 @@ def _build_backend_pair_id(
     *,
     seq_len: int,
     batch_size: int,
+    moe_routing_mode: str,
     dtype: str,
     nccl_tuple: str,
     green_ctx_attn_sms: int | None,
@@ -871,6 +949,7 @@ def _build_backend_pair_id(
         (
             f"pair-seq-{seq_len}",
             f"batch-{batch_size}",
+            f"routing-{normalize_moe_routing_mode(moe_routing_mode)}",
             f"dtype-{dtype}",
             f"nccl-{nccl_tuple.replace(',', '_')}",
             (
@@ -924,13 +1003,14 @@ def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[d
     requested_green_ctx_sms = dict(run_config.get("green_ctx_sms") or {"attn": None, "moe": None})
     pair_rows: list[dict[str, Any]] = []
     for key in sorted(set(mps_only_rows) | set(mps_green_ctx_rows)):
-        seq_len, batch_size, dtype, nccl_tuple = key
+        seq_len, batch_size, moe_routing_mode, dtype, nccl_tuple = key
         mps_only_row = mps_only_rows.get(key)
         mps_green_ctx_row = mps_green_ctx_rows.get(key)
         row = {
             "pair_id": _build_backend_pair_id(
                 seq_len=seq_len,
                 batch_size=batch_size,
+                moe_routing_mode=moe_routing_mode,
                 dtype=dtype,
                 nccl_tuple=nccl_tuple,
                 green_ctx_attn_sms=requested_green_ctx_sms.get("attn"),
@@ -938,6 +1018,7 @@ def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[d
             ),
             "seq_len": seq_len,
             "batch_size": batch_size,
+            "moe_routing_mode": moe_routing_mode,
             "dtype": dtype,
             "nccl_tuple": nccl_tuple,
             "green_ctx_sms": requested_green_ctx_sms,
@@ -1139,6 +1220,9 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         config_fingerprint = run_config.get("config_fingerprint")
         if not isinstance(config_fingerprint, str) or not config_fingerprint.strip():
             errors.append("run_config.config_fingerprint missing or invalid")
+        moe_routing_mode = run_config.get("moe_routing_mode")
+        if moe_routing_mode not in MOE_ROUTING_MODES:
+            errors.append(f"run_config.moe_routing_mode must be one of {MOE_ROUTING_MODES}")
 
     cases = summary.get("cases")
     if not isinstance(cases, list):
@@ -1152,6 +1236,8 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
                 errors.append(f"cases[{index}].batch_size missing")
             if "runtime_backend" not in row:
                 errors.append(f"cases[{index}].runtime_backend missing")
+            if "moe_routing_mode" not in row:
+                errors.append(f"cases[{index}].moe_routing_mode missing")
 
     comparison_rows = summary.get("comparison_rows")
     if not isinstance(comparison_rows, list):
@@ -1161,6 +1247,7 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
             "seq_len",
             "batch_size",
             "runtime_backend",
+            "moe_routing_mode",
             "green_ctx_sms",
             "serial_case_id",
             "serial_status",
@@ -1195,6 +1282,7 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         required_pair_keys = (
             "seq_len",
             "batch_size",
+            "moe_routing_mode",
             "mps_only_serial_case_id",
             "mps_only_serial_status",
             "mps_only_serial_timed_wall_ms",
@@ -1279,10 +1367,11 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append("|---|---|---|---:|---:|---|---|---|---:|")
     for row in summary.get("cases", []):
         lines.append(
-            "| {case_id} | {status} | {mode} | {seq_len} | {batch_size} | {runtime_backend} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
+            "| {case_id} | {status} | {mode}/{moe_routing_mode} | {seq_len} | {batch_size} | {runtime_backend} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
                 case_id=row.get("case_id"),
                 status=row.get("status"),
                 mode=row.get("mode"),
+                moe_routing_mode=row.get("moe_routing_mode"),
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
                 runtime_backend=row.get("runtime_backend"),
@@ -1295,17 +1384,18 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append("## Comparison Rows")
     lines.append("")
     lines.append(
-        "| seq_len | batch_size | runtime_backend | serial_status | serial_attn_ms | serial_moe_ms | serial_total_ms | overlap_status | overlap_attn_ms | overlap_moe_ms | overlap_total_ms | timed_speedup_vs_serial |"
+        "| seq_len | batch_size | runtime_backend | moe_routing_mode | serial_status | serial_attn_ms | serial_moe_ms | serial_total_ms | overlap_status | overlap_attn_ms | overlap_moe_ms | overlap_total_ms | timed_speedup_vs_serial |"
     )
     lines.append(
-        "|---:|---:|---|---|---:|---:|---:|---|---:|---:|---:|---:|"
+        "|---:|---:|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|"
     )
     for row in summary.get("comparison_rows", []):
         lines.append(
-            "| {seq_len} | {batch_size} | {runtime_backend} | {serial_status} | {serial_attn_ms} | {serial_moe_ms} | {serial_total_ms} | {overlap_status} | {overlap_attn_ms} | {overlap_moe_ms} | {overlap_total_ms} | {timed_speedup_vs_serial} |".format(
+            "| {seq_len} | {batch_size} | {runtime_backend} | {moe_routing_mode} | {serial_status} | {serial_attn_ms} | {serial_moe_ms} | {serial_total_ms} | {overlap_status} | {overlap_attn_ms} | {overlap_moe_ms} | {overlap_total_ms} | {timed_speedup_vs_serial} |".format(
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
                 runtime_backend=row.get("runtime_backend"),
+                moe_routing_mode=row.get("moe_routing_mode"),
                 serial_status=row.get("serial_status"),
                 serial_attn_ms=row.get("serial_attn_ms"),
                 serial_moe_ms=row.get("serial_moe_ms"),
@@ -1321,16 +1411,17 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append("## Backend Pair Rows")
     lines.append("")
     lines.append(
-        "| pair_id | pair_status | seq_len | batch_size | mps_only_overlap_status | mps_green_ctx_overlap_status | overlap_timed_speedup_mps_green_ctx_vs_mps_only |"
+        "| pair_id | pair_status | seq_len | batch_size | moe_routing_mode | mps_only_overlap_status | mps_green_ctx_overlap_status | overlap_timed_speedup_mps_green_ctx_vs_mps_only |"
     )
-    lines.append("|---|---|---:|---:|---|---|---:|")
+    lines.append("|---|---|---:|---:|---|---|---|---:|")
     for row in summary.get("backend_pair_rows", []):
         lines.append(
-            "| {pair_id} | {pair_status} | {seq_len} | {batch_size} | {mps_only_overlap_status} | {mps_green_ctx_overlap_status} | {overlap_timed_speedup_mps_green_ctx_vs_mps_only} |".format(
+            "| {pair_id} | {pair_status} | {seq_len} | {batch_size} | {moe_routing_mode} | {mps_only_overlap_status} | {mps_green_ctx_overlap_status} | {overlap_timed_speedup_mps_green_ctx_vs_mps_only} |".format(
                 pair_id=row.get("pair_id"),
                 pair_status=row.get("pair_status"),
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
+                moe_routing_mode=row.get("moe_routing_mode"),
                 mps_only_overlap_status=row.get("mps_only_overlap_status"),
                 mps_green_ctx_overlap_status=row.get("mps_green_ctx_overlap_status"),
                 overlap_timed_speedup_mps_green_ctx_vs_mps_only=row.get(

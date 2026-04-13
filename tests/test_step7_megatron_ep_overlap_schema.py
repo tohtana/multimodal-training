@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -23,6 +24,7 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     build_runtime_metadata,
     compute_speedup,
     evaluate_stage_diff,
+    normalize_moe_routing_mode,
     parse_batch_sizes,
     parse_nccl_tuples,
     parse_runtime_backends,
@@ -33,12 +35,14 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
 )
 from examples.attn_moe_overlap.megatron_layer_runtime import (
     RuntimeConfig,
+    _build_equal_token_routing_state,
     describe_attention_runtime,
     _resolve_profiler_schedule,
     _run_iteration_schedule,
 )
 from examples.attn_moe_overlap.step7_megatron_ep_overlap import (
     _build_run_config,
+    _build_case_rerun_command,
     _collapse_timed_window_s,
     _ensure_output_dir_identity_matches,
     _normalize_launch_failure,
@@ -102,6 +106,7 @@ def _sample_case_payload(
         seed=1234,
         topology=_sample_topology(),
         nccl_env=_sample_nccl(),
+        moe_routing_mode="normal",
         runtime=build_runtime_metadata(
             runtime_backend=runtime_backend,
             green_ctx_attn_sms=green_ctx_attn_sms,
@@ -195,6 +200,13 @@ def test_parse_runtime_backends_dedupes_and_validates_values():
     assert parse_runtime_backends("mps_only,mps_green_ctx,mps_only") == ["mps_only", "mps_green_ctx"]
     with pytest.raises(ValueError):
         parse_runtime_backends("mps_only,unknown")
+
+
+def test_normalize_moe_routing_mode_validates_values():
+    assert normalize_moe_routing_mode("equal_tokens") == "equal_tokens"
+    assert normalize_moe_routing_mode("NORMAL") == "normal"
+    with pytest.raises(ValueError):
+        normalize_moe_routing_mode("weird")
 
 
 def test_build_runtime_metadata_omits_green_ctx_request_when_backend_disabled():
@@ -301,6 +313,9 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "enqueue_windows": [(1.0, 1.1)],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 1.0, "mean": 0.1, "std": 0.2, "max_abs": 1.5},
+                    "moe_routing_mode": "normal",
+                    "tokens_per_expert": None,
+                    "local_tokens_per_expert": None,
                 },
                 {
                     "role": "moe",
@@ -326,6 +341,9 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                     "enqueue_windows": [(1.2, 1.4)],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 2.0, "mean": 0.2, "std": 0.3, "max_abs": 2.5},
+                    "moe_routing_mode": "normal",
+                    "tokens_per_expert": None,
+                    "local_tokens_per_expert": None,
                 },
             ],
         }
@@ -351,6 +369,7 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
             "timed_iters": 3,
             "moe_ep_size": 4,
             "num_experts": None,
+            "moe_routing_mode": "normal",
             "moe_grouped_gemm": True,
             "moe_token_dispatcher_type": "alltoall",
             "overlap_moe_expert_parallel_comm": True,
@@ -383,6 +402,7 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
     assert result["timing_ms"]["moe"] == pytest.approx(2.5)
     assert result["overlap_ms"] == pytest.approx(0.0)
     assert result["runtime"]["green_ctx_enabled"] is False
+    assert result["tokens_per_expert"] is None
 
 
 def test_normalize_launch_failure_prefers_root_cause_worker_error():
@@ -410,6 +430,183 @@ def test_normalize_launch_failure_prefers_root_cause_worker_error():
 
     assert normalized["status"] == "oom"
     assert normalized["error"]["message"] == "CUDA out of memory"
+
+
+def test_run_case_attempt_reduces_equal_tokens_counts(monkeypatch):
+    def _fake_launch_workers(*, stage_specs, common_config, timeout_s, mps_env):
+        del stage_specs, common_config, timeout_s, mps_env
+        return {
+            "status": "ok",
+            "schedule_timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+            "results": [
+                {
+                    "role": "attn",
+                    "rank": 0,
+                    "status": "ok",
+                    "timing_ms": {"cuda": 1.0, "step_total": 1.0},
+                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 1.0},
+                    "moe_routing_mode": "equal_tokens",
+                    "tokens_per_expert": None,
+                    "local_tokens_per_expert": None,
+                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                },
+                {
+                    "role": "moe",
+                    "rank": 0,
+                    "status": "ok",
+                    "timing_ms": {"cuda": 2.0, "step_total": 2.0},
+                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 2.0},
+                    "moe_routing_mode": "equal_tokens",
+                    "tokens_per_expert": [2, 2, 1, 1],
+                    "local_tokens_per_expert": [2, 2, 0, 0],
+                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                },
+                {
+                    "role": "moe",
+                    "rank": 1,
+                    "status": "ok",
+                    "timing_ms": {"cuda": 2.0, "step_total": 2.0},
+                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 2.0},
+                    "moe_routing_mode": "equal_tokens",
+                    "tokens_per_expert": [2, 2, 1, 1],
+                    "local_tokens_per_expert": [0, 0, 1, 1],
+                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(
+        "examples.attn_moe_overlap.step7_megatron_ep_overlap._launch_workers",
+        _fake_launch_workers,
+    )
+
+    result = _run_case_attempt(
+        mode="overlap",
+        common_config={
+            "model_name": "repo/model",
+            "model_type": "dummy",
+            "runtime_backend": "mps_only",
+            "green_ctx_attn_sms": None,
+            "green_ctx_moe_sms": None,
+            "dtype": "bf16",
+            "seq_len": 8,
+            "batch_size": 1,
+            "seed": 1234,
+            "warmup_iters": 1,
+            "timed_iters": 2,
+            "moe_ep_size": 2,
+            "num_experts": 4,
+            "moe_routing_mode": "equal_tokens",
+            "moe_grouped_gemm": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "overlap_moe_expert_parallel_comm": False,
+            "attention_backend": "auto",
+            "nccl_tuple": None,
+        },
+        attn_gpu_ids=[0],
+        moe_gpu_ids=[0, 1],
+        timeout_s=10.0,
+        mps_env={},
+    )
+
+    assert result["tokens_per_expert"] == [2, 2, 1, 1]
+
+
+def test_run_case_attempt_rejects_mismatched_equal_tokens_vectors(monkeypatch):
+    def _fake_launch_workers(*, stage_specs, common_config, timeout_s, mps_env):
+        del stage_specs, common_config, timeout_s, mps_env
+        return {
+            "status": "ok",
+            "schedule_timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+            "results": [
+                {
+                    "role": "attn",
+                    "rank": 0,
+                    "status": "ok",
+                    "timing_ms": {"cuda": 1.0, "step_total": 1.0},
+                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 1.0},
+                    "moe_routing_mode": "equal_tokens",
+                    "tokens_per_expert": None,
+                    "local_tokens_per_expert": None,
+                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                },
+                {
+                    "role": "moe",
+                    "rank": 0,
+                    "status": "ok",
+                    "timing_ms": {"cuda": 2.0, "step_total": 2.0},
+                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 2.0},
+                    "moe_routing_mode": "equal_tokens",
+                    "tokens_per_expert": [2, 2, 1, 1],
+                    "local_tokens_per_expert": [2, 2, 0, 0],
+                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                },
+                {
+                    "role": "moe",
+                    "rank": 1,
+                    "status": "ok",
+                    "timing_ms": {"cuda": 2.0, "step_total": 2.0},
+                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "enqueue_windows": [],
+                    "finite": {"all_finite": True, "first_nonfinite": None},
+                    "output_signature": {"sum": 2.0},
+                    "moe_routing_mode": "equal_tokens",
+                    "tokens_per_expert": [2, 2, 1, 1],
+                    "local_tokens_per_expert": [0, 0, 1],
+                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(
+        "examples.attn_moe_overlap.step7_megatron_ep_overlap._launch_workers",
+        _fake_launch_workers,
+    )
+
+    with pytest.raises(RuntimeError, match="identical lengths"):
+        _run_case_attempt(
+            mode="overlap",
+            common_config={
+                "model_name": "repo/model",
+                "model_type": "dummy",
+                "runtime_backend": "mps_only",
+                "green_ctx_attn_sms": None,
+                "green_ctx_moe_sms": None,
+                "dtype": "bf16",
+                "seq_len": 8,
+                "batch_size": 1,
+                "seed": 1234,
+                "warmup_iters": 1,
+                "timed_iters": 2,
+                "moe_ep_size": 2,
+                "num_experts": 4,
+                "moe_routing_mode": "equal_tokens",
+                "moe_grouped_gemm": False,
+                "moe_token_dispatcher_type": "alltoall",
+                "overlap_moe_expert_parallel_comm": False,
+                "attention_backend": "auto",
+                "nccl_tuple": None,
+            },
+            attn_gpu_ids=[0],
+            moe_gpu_ids=[0, 1],
+            timeout_s=10.0,
+            mps_env={},
+        )
 
 
 def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypatch):
@@ -458,6 +655,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         "timed_iters": 3,
         "worker_timeout_s": 180.0,
         "num_experts": None,
+        "moe_routing_mode": "equal_tokens",
         "mps_active_thread_pct": None,
         "attention_backend": "fused",
         "moe_grouped_gemm": True,
@@ -466,6 +664,8 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     }
     serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=2048, batch_size=4)
     overlap = _sample_case_payload("case-overlap", "overlap", status="ok", seq_len=2048, batch_size=4)
+    serial["moe_routing_mode"] = "equal_tokens"
+    overlap["moe_routing_mode"] = "equal_tokens"
     green_serial = _sample_case_payload(
         "green-serial",
         "serial",
@@ -476,6 +676,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         green_ctx_attn_sms=64,
         green_ctx_moe_sms=64,
     )
+    green_serial["moe_routing_mode"] = "equal_tokens"
     green_overlap = _sample_case_payload(
         "green-overlap",
         "overlap",
@@ -486,6 +687,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         green_ctx_attn_sms=64,
         green_ctx_moe_sms=64,
     )
+    green_overlap["moe_routing_mode"] = "equal_tokens"
 
     status = _run_torch_profiler_capture(
         args=args,
@@ -500,6 +702,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert "-m" not in calls[0]
     assert calls[0][calls[0].index("--attention-backend") + 1] == "fused"
     assert calls[0][calls[0].index("--moe-token-dispatcher-type") + 1] == "alltoall"
+    assert calls[0][calls[0].index("--moe-routing-mode") + 1] == "equal_tokens"
     assert "--moe-grouped-gemm" in calls[0]
     assert "--overlap-moe-expert-parallel-comm" in calls[0]
     assert calls[0][calls[0].index("--batch-size") + 1] == "4"
@@ -529,6 +732,7 @@ def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
         "runtime_backend": "mps_only",
         "green_ctx_attn_sms": None,
         "green_ctx_moe_sms": None,
+        "moe_routing_mode": "normal",
         "dtype": "bf16",
         "seed": 1234,
         "attn_dp_size": 2,
@@ -544,10 +748,12 @@ def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
         **{**kwargs, "runtime_backend": "mps_green_ctx", "green_ctx_attn_sms": 64, "green_ctx_moe_sms": 64},
         nccl_tuple=(4, 16, 32),
     )
+    case_id_f = build_case_id(**{**kwargs, "moe_routing_mode": "equal_tokens"}, nccl_tuple=(4, 16, 32))
     assert case_id_a == case_id_b
     assert case_id_a != case_id_c
     assert case_id_a != case_id_d
     assert case_id_a != case_id_e
+    assert case_id_a != case_id_f
 
 
 def test_case_id_supports_disabled_nccl_tuning():
@@ -558,6 +764,7 @@ def test_case_id_supports_disabled_nccl_tuning():
         runtime_backend="mps_only",
         green_ctx_attn_sms=None,
         green_ctx_moe_sms=None,
+        moe_routing_mode="normal",
         dtype="bf16",
         seed=1234,
         attn_dp_size=2,
@@ -575,6 +782,45 @@ def test_case_payload_validation_requires_contract_keys():
     del payload["timing_ms"]
     errors = validate_case_payload(payload)
     assert any("timing_ms" in error for error in errors)
+
+
+def test_validate_case_payload_rejects_missing_equal_tokens_metadata():
+    payload = build_case_payload(
+        case_id="eq-case",
+        status="ok",
+        mode="overlap",
+        seq_len=512,
+        batch_size=1,
+        runtime_backend="mps_only",
+        dtype="bf16",
+        seed=1234,
+        topology=_sample_topology(),
+        nccl_env=_sample_nccl(),
+        moe_routing_mode="equal_tokens",
+        timing_ms={"total": 1.0, "timed_wall": 0.9, "attn": 0.4, "moe": 0.5},
+        overlap_ms=0.0,
+        finite={"all_finite": True, "first_nonfinite": None},
+        stage_signatures={"attn": None, "moe": None},
+        error={"code": None, "message": None, "traceback": None},
+    )
+
+    errors = validate_case_payload(payload)
+    assert any("tokens_per_expert" in error for error in errors)
+
+
+def test_build_equal_token_routing_state_balances_tokens():
+    hidden_states = torch.zeros((7, 1, 8), dtype=torch.bfloat16)
+    state = _build_equal_token_routing_state(
+        hidden_states=hidden_states,
+        num_experts=4,
+        local_expert_indices=[2, 3],
+    )
+
+    assert state.tokens_per_expert == [2, 2, 2, 1]
+    assert state.local_tokens_per_expert == [0, 0, 2, 1]
+    assert max(state.tokens_per_expert) - min(state.tokens_per_expert) == 1
+    assert state.routing_map.dtype == torch.bool
+    assert torch.allclose(state.probs.sum(dim=1), torch.ones(7, dtype=hidden_states.dtype))
 
 
 def test_speedup_and_stage_diff_tolerance_mapping():
@@ -658,6 +904,32 @@ def test_runtime_config_omits_false_boolean_moe_overrides():
     assert trainer_config["engine_config"]["megatron_moe_grouped_gemm"] is None
     assert trainer_config["engine_config"]["megatron_moe_token_dispatcher_type"] == "alltoall"
     assert trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"] is None
+
+
+def test_runtime_config_equal_tokens_forces_effective_topk_one():
+    runtime_config = RuntimeConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        stage_role="moe",
+        runtime_backend="mps_only",
+        attention_backend="auto",
+        moe_grouped_gemm=False,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=False,
+        dtype="bf16",
+        seq_len=1024,
+        batch_size=1,
+        seed=1234,
+        expert_model_parallel_size=2,
+        num_experts=8,
+        moe_routing_mode="equal_tokens",
+    )
+
+    from examples.attn_moe_overlap.megatron_layer_runtime import MegatronSingleLayerRuntime
+
+    trainer_config = MegatronSingleLayerRuntime(runtime_config)._build_trainer_config()
+    assert trainer_config["engine_config"]["megatron_moe_router_topk"] == 1
+    assert trainer_config["engine_config"]["megatron_moe_router_pre_softmax"] is True
 
 
 def test_invalid_environment_payload_contract():
@@ -762,6 +1034,7 @@ def test_matrix_summary_contract_and_status_count_invariant():
         "runtime_backends": ["mps_only"],
         "green_ctx_sms": {"attn": None, "moe": None},
         "device_sm_signature": {"0": 132, "1": 132},
+        "moe_routing_mode": "normal",
     }
     summary = build_matrix_summary(
         run_config={
@@ -920,6 +1193,7 @@ def test_ensure_output_dir_identity_matches_rejects_config_mismatch(tmp_path):
         "torch_profiler_selection": None,
         "torch_profiler_wait_iters": None,
         "torch_profiler_active_iters": None,
+        "moe_routing_mode": "normal",
     }
     summary_path.write_text(
         json.dumps(
@@ -960,6 +1234,7 @@ def test_build_run_config_persists_identity_fields_and_fingerprint():
         torch_profiler_active_iters=2,
         worker_timeout_s=180.0,
         num_experts=None,
+        moe_routing_mode="normal",
         mps_active_thread_pct=None,
     )
     run_config = _build_run_config(
@@ -979,6 +1254,7 @@ def test_build_run_config_persists_identity_fields_and_fingerprint():
     assert run_config["green_ctx_sms"] == {"attn": 64, "moe": 64}
     assert run_config["device_sm_signature"] == {"0": 132, "1": 132}
     assert run_config["torch_profiler_selection"] is None
+    assert run_config["moe_routing_mode"] == "normal"
     assert isinstance(run_config["config_fingerprint"], str)
 
 

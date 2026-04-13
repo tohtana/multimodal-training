@@ -70,6 +70,7 @@ try:
         evaluate_stage_diff,
         is_terminal_status,
         load_case_payload,
+        normalize_moe_routing_mode,
         normalize_dtype_name,
         parse_batch_sizes,
         parse_dtypes,
@@ -107,6 +108,7 @@ except ModuleNotFoundError:
         evaluate_stage_diff,
         is_terminal_status,
         load_case_payload,
+        normalize_moe_routing_mode,
         normalize_dtype_name,
         parse_batch_sizes,
         parse_dtypes,
@@ -276,6 +278,7 @@ class CaseDescriptor:
     green_ctx_moe_sms: int | None
     dtype: str
     nccl_tuple: tuple[int, int, int] | None
+    moe_routing_mode: str
     case_id: str
     baseline_key: str
 
@@ -305,6 +308,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nccl-max-nchannels", type=int, default=None)
     parser.add_argument("--nccl-max-ctas", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
+    parser.add_argument("--moe-routing-mode", choices=["normal", "equal_tokens"], default="normal")
     parser.add_argument(
         "--moe-token-dispatcher-type",
         choices=["allgather", "alltoall", "flex"],
@@ -417,6 +421,7 @@ def _run_config_identity_fields(
     torch_profiler_selection: str | None,
     torch_profiler_wait_iters: int | None,
     torch_profiler_active_iters: int | None,
+    moe_routing_mode: str,
 ) -> dict[str, Any]:
     return {
         "seq_lens": [int(value) for value in seq_lens],
@@ -433,6 +438,7 @@ def _run_config_identity_fields(
         "torch_profiler_selection": torch_profiler_selection,
         "torch_profiler_wait_iters": torch_profiler_wait_iters,
         "torch_profiler_active_iters": torch_profiler_active_iters,
+        "moe_routing_mode": normalize_moe_routing_mode(moe_routing_mode),
     }
 
 
@@ -463,6 +469,7 @@ def _build_run_config(
         torch_profiler_selection=profiler_config["selection"],
         torch_profiler_wait_iters=profiler_config["wait_iters"],
         torch_profiler_active_iters=profiler_config["active_iters"],
+        moe_routing_mode=args.moe_routing_mode,
     )
     run_config = {
         "model_name": args.model_name,
@@ -475,6 +482,7 @@ def _build_run_config(
         "timed_iters": args.timed_iters,
         "worker_timeout_s": args.worker_timeout_s,
         "num_experts": args.num_experts,
+        "moe_routing_mode": normalize_moe_routing_mode(args.moe_routing_mode),
         "mps_active_thread_pct": args.mps_active_thread_pct,
         "capture_nsys": args.capture_nsys,
         "nsys_status": nsys_status,
@@ -519,6 +527,7 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "torch_profiler_selection",
             "torch_profiler_wait_iters",
             "torch_profiler_active_iters",
+            "moe_routing_mode",
             "config_fingerprint",
         )
     }
@@ -536,6 +545,7 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "torch_profiler_selection",
             "torch_profiler_wait_iters",
             "torch_profiler_active_iters",
+            "moe_routing_mode",
             "config_fingerprint",
         )
     }
@@ -666,6 +676,7 @@ def _baseline_key(
     runtime_backend: str,
     green_ctx_attn_sms: int | None,
     green_ctx_moe_sms: int | None,
+    moe_routing_mode: str,
     dtype: str,
     nccl_tuple: tuple[int, int, int] | None,
 ) -> str:
@@ -676,6 +687,7 @@ def _baseline_key(
     )
     return (
         f"seq={seq_len}|batch={batch_size}|backend={runtime_backend}|{green_ctx_fragment}|"
+        f"routing={normalize_moe_routing_mode(moe_routing_mode)}|"
         f"dtype={normalize_dtype_name(dtype)}|"
         f"nccl={canonical_nccl_tuple(nccl_tuple)}"
     )
@@ -695,6 +707,7 @@ def _build_case_descriptors(
     moe_ep_size: int,
     attn_gpu_ids: list[int],
     moe_gpu_ids: list[int],
+    moe_routing_mode: str,
 ) -> list[CaseDescriptor]:
     cases: list[CaseDescriptor] = []
     for seq_len in seq_lens:
@@ -709,6 +722,7 @@ def _build_case_descriptors(
                                 runtime_backend,
                                 green_ctx_sms.get("attn"),
                                 green_ctx_sms.get("moe"),
+                                moe_routing_mode,
                                 dtype,
                                 nccl_tuple,
                             )
@@ -726,6 +740,7 @@ def _build_case_descriptors(
                                 attn_gpu_ids=attn_gpu_ids,
                                 moe_gpu_ids=moe_gpu_ids,
                                 nccl_tuple=nccl_tuple,
+                                moe_routing_mode=moe_routing_mode,
                             )
                             cases.append(
                                 CaseDescriptor(
@@ -737,6 +752,7 @@ def _build_case_descriptors(
                                     green_ctx_moe_sms=green_ctx_sms.get("moe"),
                                     dtype=dtype,
                                     nccl_tuple=nccl_tuple,
+                                    moe_routing_mode=moe_routing_mode,
                                     case_id=case_id,
                                     baseline_key=baseline_key,
                                 )
@@ -869,6 +885,7 @@ def _worker_main(
     profiler_wait_iters: int | None,
     profiler_active_timed_iters: int | None,
     worker_result_dir: str,
+    moe_routing_mode: str,
 ) -> None:
     try:
         from examples.attn_moe_overlap.megatron_layer_runtime import (
@@ -926,6 +943,7 @@ def _worker_main(
                 green_ctx_attn_sms=green_ctx_attn_sms,
                 green_ctx_moe_sms=green_ctx_moe_sms,
                 num_experts=num_experts,
+                moe_routing_mode=moe_routing_mode,
             )
         )
         payload = runtime.run_stage(
@@ -971,6 +989,7 @@ def _worker_main(
                 "status": status,
                 "failure_origin": failure_origin,
                 "attention_backend": attention_backend,
+                "moe_routing_mode": moe_routing_mode,
                 "moe_grouped_gemm": moe_grouped_gemm,
                 "moe_token_dispatcher_type": moe_token_dispatcher_type,
                 "overlap_moe_expert_parallel_comm": overlap_moe_expert_parallel_comm,
@@ -1038,6 +1057,7 @@ def _launch_workers(
                         "profiler_wait_iters": common_config.get("profiler_wait_iters"),
                         "profiler_active_timed_iters": common_config.get("profiler_active_timed_iters"),
                         "worker_result_dir": str(worker_result_dir),
+                        "moe_routing_mode": common_config["moe_routing_mode"],
                     },
                 )
                 process.start()
@@ -1161,6 +1181,7 @@ def _aggregate_stage_results(
         "error": {"code": None, "message": None, "traceback": None},
         "attention_backend": rank0.get("attention_backend"),
         "attention_impl": rank0.get("attention_impl"),
+        "moe_routing_mode": rank0.get("moe_routing_mode", "normal"),
         "moe_grouped_gemm": rank0.get("moe_grouped_gemm"),
         "moe_token_dispatcher_type": rank0.get("moe_token_dispatcher_type"),
         "overlap_moe_expert_parallel_comm": rank0.get("overlap_moe_expert_parallel_comm"),
@@ -1174,6 +1195,10 @@ def _aggregate_stage_results(
         "output_signature": rank0.get("output_signature"),
         "finite": {"all_finite": all_finite, "first_nonfinite": first_nonfinite},
         "runtime": role_runtime,
+        "tokens_per_expert": rank0.get("tokens_per_expert"),
+        "local_tokens_per_expert_by_rank": [
+            item.get("local_tokens_per_expert") for item in role_results if item.get("local_tokens_per_expert") is not None
+        ],
     }
 
 
@@ -1259,6 +1284,19 @@ def _run_case_attempt(
         fallback_status=fallback_status,
         fallback_error=fallback_error,
     )
+    tokens_per_expert: list[int] | None = None
+    if common_config["moe_routing_mode"] == "equal_tokens":
+        local_vectors = moe_stage.get("local_tokens_per_expert_by_rank") or []
+        if not local_vectors:
+            raise RuntimeError("equal_tokens expected per-rank local_tokens_per_expert vectors")
+        lengths = {len(vector) for vector in local_vectors}
+        if len(lengths) != 1:
+            raise RuntimeError("equal_tokens local_tokens_per_expert vectors must have identical lengths")
+        tokens_per_expert = [0 for _ in range(lengths.pop())]
+        for vector in local_vectors:
+            for index, value in enumerate(vector):
+                tokens_per_expert[index] += int(value)
+
     case_timed_wall_ms = (launch_result.get("schedule_timed_window_s") or {}).get("duration_ms")
     host_overlap_ms = 0.0
     if mode == "overlap":
@@ -1339,6 +1377,7 @@ def _run_case_attempt(
                 "moe": moe_stage.get("overlap_moe_expert_parallel_comm"),
             },
         },
+        "moe_routing_mode": common_config["moe_routing_mode"],
         "timing_ms": {
             "total": wall_ms,
             "timed_wall": case_timed_wall_ms,
@@ -1351,6 +1390,7 @@ def _run_case_attempt(
             "attn": attn_stage["output_signature"],
             "moe": moe_stage["output_signature"],
         },
+        "tokens_per_expert": tokens_per_expert,
     }
 
 
@@ -1428,6 +1468,7 @@ def _invalid_env_matrix(
                 green_ctx_moe_sms=descriptor.green_ctx_moe_sms,
             ),
             message=error_message,
+            moe_routing_mode=descriptor.moe_routing_mode,
             profiler=profiler,
         )
         write_case_json(output_dir=output_dir, payload=payload, strict_schema=strict_schema)
@@ -1518,6 +1559,12 @@ def _requested_moe_runtime(case_payload: dict[str, Any], run_config: dict[str, A
     )
 
 
+def _requested_moe_routing_mode(case_payload: dict[str, Any], run_config: dict[str, Any]) -> str:
+    requested = case_payload.get("moe_routing_mode")
+    fallback = run_config.get("moe_routing_mode", "normal")
+    return normalize_moe_routing_mode(str(fallback if requested is None else requested))
+
+
 def _requested_green_ctx_sms(case_payload: dict[str, Any]) -> dict[str, int | None]:
     runtime = case_payload.get("runtime") or {}
     return dict(runtime.get("requested_sms_by_role") or {"attn": None, "moe": None})
@@ -1592,6 +1639,8 @@ def _build_case_rerun_command(
         _requested_attention_backend(case_payload, run_config),
         "--moe-token-dispatcher-type",
         token_dispatcher,
+        "--moe-routing-mode",
+        _requested_moe_routing_mode(case_payload, run_config),
         "--rerun-existing",
     ]
     if run_config.get("num_experts") is not None:
@@ -1821,6 +1870,7 @@ def main() -> int:
     args = _parse_args()
     mp.set_start_method("spawn", force=True)
     _bootstrap_local_pythonpath()
+    args.moe_routing_mode = normalize_moe_routing_mode(args.moe_routing_mode)
 
     attn_gpu_ids = parse_gpu_ids(args.attn_gpu_ids, field_name="attn-gpu-ids")
     moe_gpu_ids = parse_gpu_ids(args.moe_gpu_ids, field_name="moe-gpu-ids")
@@ -1858,6 +1908,11 @@ def main() -> int:
         runtime_backends=runtime_backends,
         green_ctx_sms=green_ctx_sms,
     )
+    if args.moe_routing_mode == "equal_tokens":
+        if args.num_experts is None or int(args.num_experts) <= 0:
+            preflight_errors.append("--moe-routing-mode equal_tokens requires --num-experts > 0")
+        elif int(args.num_experts) % int(args.moe_ep_size) != 0:
+            preflight_errors.append("--num-experts must be divisible by --moe-ep-size for equal_tokens")
     device_sm_signature = _device_sm_signature(device_total_sms)
     cases = _build_case_descriptors(
         modes=modes,
@@ -1872,6 +1927,7 @@ def main() -> int:
         moe_ep_size=args.moe_ep_size,
         attn_gpu_ids=attn_gpu_ids,
         moe_gpu_ids=moe_gpu_ids,
+        moe_routing_mode=args.moe_routing_mode,
     )
     total_points = len(cases)
     profiler_config = _profiler_config_from_args(args)
@@ -1986,6 +2042,7 @@ def main() -> int:
                     "timed_iters": args.timed_iters,
                     "moe_ep_size": args.moe_ep_size,
                     "num_experts": args.num_experts,
+                    "moe_routing_mode": args.moe_routing_mode,
                     "moe_grouped_gemm": args.moe_grouped_gemm,
                     "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
                     "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
@@ -2018,6 +2075,7 @@ def main() -> int:
                         seed=args.seed,
                         topology=topology,
                         nccl_env=nccl_meta,
+                        moe_routing_mode=descriptor.moe_routing_mode,
                         runtime=attempt_result["runtime"],
                         timing_ms=attempt_result["timing_ms"],
                         overlap_ms=attempt_result["overlap_ms"],
@@ -2027,6 +2085,23 @@ def main() -> int:
                         profiler=profiler_config,
                         attempt_count=attempt_count,
                         retry_trigger=retry_trigger,
+                        tokens_per_expert=attempt_result["tokens_per_expert"],
+                        tokens_per_expert_min=(
+                            None
+                            if attempt_result["tokens_per_expert"] is None
+                            else min(attempt_result["tokens_per_expert"])
+                        ),
+                        tokens_per_expert_max=(
+                            None
+                            if attempt_result["tokens_per_expert"] is None
+                            else max(attempt_result["tokens_per_expert"])
+                        ),
+                        tokens_per_expert_spread=(
+                            None
+                            if attempt_result["tokens_per_expert"] is None
+                            else max(attempt_result["tokens_per_expert"])
+                            - min(attempt_result["tokens_per_expert"])
+                        ),
                     )
                     payload["attention_backend"] = attempt_result["attention_backend"]
                     payload["attention_impl"] = attempt_result["attention_impl"]
