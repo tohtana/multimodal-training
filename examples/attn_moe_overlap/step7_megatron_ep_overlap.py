@@ -355,6 +355,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--strict-schema", dest="strict_schema", action="store_true", default=True)
     parser.add_argument("--no-strict-schema", dest="strict_schema", action="store_false")
     parser.add_argument("--mps-active-thread-pct", type=int, default=None)
+    parser.add_argument(
+        "--attn-mps-active-thread-pct",
+        type=int,
+        default=None,
+        help="Override CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for attention workers only.",
+    )
     return parser.parse_args()
 
 
@@ -484,6 +490,7 @@ def _build_run_config(
         "num_experts": args.num_experts,
         "moe_routing_mode": normalize_moe_routing_mode(args.moe_routing_mode),
         "mps_active_thread_pct": args.mps_active_thread_pct,
+        "attn_mps_active_thread_pct": args.attn_mps_active_thread_pct,
         "capture_nsys": args.capture_nsys,
         "nsys_status": nsys_status,
         "attention_backend": args.attention_backend,
@@ -877,6 +884,7 @@ def _worker_main(
     attention_backend: str,
     nccl_tuple: tuple[int, int, int] | None,
     mps_env: dict[str, str],
+    attn_mps_active_thread_pct: int | None,
     execution_schedule: str,
     iteration_barrier: Any | None,
     abort_event: Any | None,
@@ -910,6 +918,11 @@ def _worker_main(
     try:
         _bootstrap_local_pythonpath()
         os.environ.update(mps_env)
+        if role == "attn":
+            if attn_mps_active_thread_pct is None:
+                os.environ.pop("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", None)
+            else:
+                os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(attn_mps_active_thread_pct)
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         os.environ["LOCAL_RANK"] = "0"
         os.environ["RANK"] = str(rank)
@@ -1049,6 +1062,7 @@ def _launch_workers(
                         "attention_backend": common_config["attention_backend"],
                         "nccl_tuple": common_config["nccl_tuple"],
                         "mps_env": mps_env,
+                        "attn_mps_active_thread_pct": common_config["attn_mps_active_thread_pct"],
                         "execution_schedule": common_config["execution_schedule"],
                         "iteration_barrier": iteration_barrier,
                         "abort_event": abort_event,
@@ -1651,6 +1665,8 @@ def _build_case_rerun_command(
         cmd.extend(["--num-experts", str(run_config["num_experts"])])
     if run_config.get("mps_active_thread_pct") is not None:
         cmd.extend(["--mps-active-thread-pct", str(run_config["mps_active_thread_pct"])])
+    if run_config.get("attn_mps_active_thread_pct") is not None:
+        cmd.extend(["--attn-mps-active-thread-pct", str(run_config["attn_mps_active_thread_pct"])])
     _append_nccl_tuple_args(cmd, str((case_payload.get("nccl") or {}).get("tuple") or "off"))
     if grouped_gemm:
         cmd.append("--moe-grouped-gemm")
@@ -2047,6 +2063,7 @@ def main() -> int:
                     "moe_ep_size": args.moe_ep_size,
                     "num_experts": args.num_experts,
                     "moe_routing_mode": args.moe_routing_mode,
+                    "attn_mps_active_thread_pct": args.attn_mps_active_thread_pct,
                     "moe_grouped_gemm": args.moe_grouped_gemm,
                     "moe_token_dispatcher_type": args.moe_token_dispatcher_type,
                     "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,

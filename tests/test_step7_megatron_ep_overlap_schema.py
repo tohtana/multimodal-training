@@ -506,6 +506,7 @@ def test_run_case_attempt_reduces_equal_tokens_counts(monkeypatch):
             "moe_ep_size": 2,
             "num_experts": 4,
             "moe_routing_mode": "equal_tokens",
+            "attn_mps_active_thread_pct": None,
             "moe_grouped_gemm": False,
             "moe_token_dispatcher_type": "alltoall",
             "overlap_moe_expert_parallel_comm": False,
@@ -596,6 +597,7 @@ def test_run_case_attempt_rejects_mismatched_equal_tokens_vectors(monkeypatch):
                 "moe_ep_size": 2,
                 "num_experts": 4,
                 "moe_routing_mode": "equal_tokens",
+                "attn_mps_active_thread_pct": None,
                 "moe_grouped_gemm": False,
                 "moe_token_dispatcher_type": "alltoall",
                 "overlap_moe_expert_parallel_comm": False,
@@ -754,6 +756,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         "num_experts": None,
         "moe_routing_mode": "equal_tokens",
         "mps_active_thread_pct": None,
+        "attn_mps_active_thread_pct": 80,
         "attention_backend": "fused",
         "moe_grouped_gemm": True,
         "moe_token_dispatcher_type": "alltoall",
@@ -804,6 +807,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert "--overlap-moe-expert-parallel-comm" in calls[0]
     assert calls[0][calls[0].index("--batch-size") + 1] == "4"
     assert calls[0][calls[0].index("--torch-profiler-wait-iters") + 1] == "11"
+    assert calls[0][calls[0].index("--attn-mps-active-thread-pct") + 1] == "80"
     assert sorted(cmd[cmd.index("--runtime-backends") + 1] for cmd in calls) == [
         "mps_green_ctx",
         "mps_green_ctx",
@@ -1358,6 +1362,7 @@ def test_build_run_config_persists_identity_fields_and_fingerprint():
         num_experts=None,
         moe_routing_mode="normal",
         mps_active_thread_pct=None,
+        attn_mps_active_thread_pct=None,
     )
     run_config = _build_run_config(
         args=args,
@@ -1428,6 +1433,7 @@ def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path
         "worker_timeout_s": 180.0,
         "num_experts": None,
         "mps_active_thread_pct": None,
+        "attn_mps_active_thread_pct": None,
         "attention_backend": "auto",
         "moe_grouped_gemm": True,
         "moe_token_dispatcher_type": "alltoall",
