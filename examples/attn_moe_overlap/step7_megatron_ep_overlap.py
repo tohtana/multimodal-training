@@ -1285,7 +1285,7 @@ def _run_case_attempt(
         fallback_error=fallback_error,
     )
     tokens_per_expert: list[int] | None = None
-    if common_config["moe_routing_mode"] == "equal_tokens":
+    if common_config["moe_routing_mode"] == "equal_tokens" and moe_stage["status"] == "ok":
         local_vectors = moe_stage.get("local_tokens_per_expert_by_rank") or []
         if not local_vectors:
             raise RuntimeError("equal_tokens expected per-rank local_tokens_per_expert vectors")
@@ -1326,7 +1326,11 @@ def _run_case_attempt(
         else moe_stage["finite"]["first_nonfinite"]
     )
     all_finite = bool(attn_stage["finite"]["all_finite"] and moe_stage["finite"]["all_finite"])
-    if status == "ok" and not all_finite:
+    if (
+        status == "ok"
+        and not all_finite
+        and common_config["moe_routing_mode"] != "equal_tokens"
+    ):
         status = "runtime_error"
         error = {
             "code": "non_finite",

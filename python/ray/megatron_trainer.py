@@ -1,4 +1,5 @@
 import logging
+import inspect
 import time
 from collections import deque
 
@@ -91,7 +92,28 @@ class MegatronBaseTrainer(Trainer):
             "expert_model_parallel_size": ep_size,
         }
         if num_experts is not None:
-            convert_kwargs["num_experts"] = int(num_experts)
+            resolved_num_experts = int(num_experts)
+            if "num_experts" in megatron_kwargs:
+                if int(megatron_kwargs["num_experts"]) != resolved_num_experts:
+                    logger.info(
+                        f"[r{self.rank}] Overriding converted HF num_experts="
+                        f"{megatron_kwargs['num_experts']} with engine_config value {resolved_num_experts}"
+                    )
+                megatron_kwargs["num_experts"] = resolved_num_experts
+            else:
+                convert_kwargs["num_experts"] = resolved_num_experts
+
+        supported_args = set(inspect.signature(MegatronArguments).parameters)
+        combined_kwargs = {**megatron_kwargs, **convert_kwargs}
+        dropped_kwargs = {
+            key: value for key, value in combined_kwargs.items() if key not in supported_args
+        }
+        if dropped_kwargs:
+            logger.warning(
+                f"[r{self.rank}] Dropping unsupported MegatronArguments kwargs: {sorted(dropped_kwargs)}"
+            )
+        megatron_kwargs = {key: value for key, value in megatron_kwargs.items() if key in supported_args}
+        convert_kwargs = {key: value for key, value in convert_kwargs.items() if key in supported_args}
 
         megatron_args = MegatronArguments(
             model=model_name,

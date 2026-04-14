@@ -209,20 +209,27 @@ def _build_equal_token_routing_state(
     *,
     hidden_states: torch.Tensor,
     num_experts: int,
+    top_k: int,
     local_expert_indices: list[int],
 ) -> EqualTokenRoutingState:
     if hidden_states.ndim < 2:
         raise RuntimeError("equal_tokens requires hidden_states with an explicit hidden dimension")
     if int(num_experts) <= 0:
         raise RuntimeError("equal_tokens requires num_experts > 0")
+    if int(top_k) <= 0:
+        raise RuntimeError("equal_tokens requires top_k > 0")
+    if int(top_k) > int(num_experts):
+        raise RuntimeError("equal_tokens requires top_k <= num_experts")
     num_tokens = int(hidden_states.numel() // hidden_states.shape[-1])
     device = hidden_states.device
-    assigned_expert_ids = torch.arange(num_tokens, device=device, dtype=torch.long) % int(num_experts)
+    token_indices = torch.arange(num_tokens, device=device, dtype=torch.long).unsqueeze(1)
+    expert_offsets = torch.arange(int(top_k), device=device, dtype=torch.long).unsqueeze(0)
+    assigned_expert_ids = (token_indices + expert_offsets) % int(num_experts)
     routing_map = torch.zeros((num_tokens, int(num_experts)), device=device, dtype=torch.bool)
-    routing_map.scatter_(1, assigned_expert_ids.unsqueeze(1), True)
+    routing_map.scatter_(1, assigned_expert_ids, True)
     probs = torch.zeros((num_tokens, int(num_experts)), device=device, dtype=hidden_states.dtype)
-    probs.scatter_(1, assigned_expert_ids.unsqueeze(1), 1.0)
-    global_counts = torch.bincount(assigned_expert_ids, minlength=int(num_experts)).to(dtype=torch.int64)
+    probs.scatter_(1, assigned_expert_ids, 1.0 / float(top_k))
+    global_counts = torch.bincount(assigned_expert_ids.reshape(-1), minlength=int(num_experts)).to(dtype=torch.int64)
     local_counts = torch.zeros_like(global_counts)
     if local_expert_indices:
         local_idx = torch.tensor(local_expert_indices, device=device, dtype=torch.long)
@@ -342,9 +349,6 @@ class MegatronSingleLayerRuntime:
         }
         if self.config.num_experts is not None:
             engine_config["num_experts"] = int(self.config.num_experts)
-        if self.config.moe_routing_mode == "equal_tokens":
-            engine_config["megatron_moe_router_topk"] = 1
-            engine_config["megatron_moe_router_pre_softmax"] = True
 
         return {
             "model_name": self.config.model_name,
@@ -379,8 +383,10 @@ class MegatronSingleLayerRuntime:
         if mlp is None or router is None or token_dispatcher is None:
             raise RuntimeError("equal_tokens requires layer.mlp.router and layer.mlp.token_dispatcher")
         router_topk = getattr(getattr(self.layer, "config", None), "moe_router_topk", None)
-        if int(router_topk or 0) != 1:
-            raise RuntimeError("equal_tokens requires an effective moe_router_topk == 1")
+        if int(router_topk or 0) <= 0:
+            raise RuntimeError("equal_tokens requires an effective moe_router_topk > 0")
+        if int(router_topk or 0) > int(self.config.num_experts):
+            raise RuntimeError("equal_tokens requires moe_router_topk <= num_experts")
         local_expert_indices = getattr(token_dispatcher, "local_expert_indices", None)
         if not isinstance(local_expert_indices, list) or not local_expert_indices:
             raise RuntimeError("equal_tokens requires token_dispatcher.local_expert_indices")
@@ -540,6 +546,7 @@ class MegatronSingleLayerRuntime:
                                 state = _build_equal_token_routing_state(
                                     hidden_states=self.hidden_states,
                                     num_experts=int(self.config.num_experts or 0),
+                                    top_k=int(getattr(self.layer.config, "moe_router_topk", 0) or 0),
                                     local_expert_indices=local_expert_indices,
                                 )
                                 original_forward = router.forward

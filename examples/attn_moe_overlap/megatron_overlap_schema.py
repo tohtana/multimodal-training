@@ -738,7 +738,11 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     tokens_per_expert_min = payload.get("tokens_per_expert_min")
     tokens_per_expert_max = payload.get("tokens_per_expert_max")
     tokens_per_expert_spread = payload.get("tokens_per_expert_spread")
-    if moe_routing_mode == "equal_tokens":
+    requires_equal_token_metadata = moe_routing_mode == "equal_tokens" and status in {
+        "ok",
+        "numerical_mismatch",
+    }
+    if requires_equal_token_metadata:
         if not isinstance(tokens_per_expert, list) or not tokens_per_expert:
             errors.append("tokens_per_expert must be a non-empty list for equal_tokens cases")
         elif any(not isinstance(value, int) or value < 0 for value in tokens_per_expert):
@@ -762,7 +766,7 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
                 errors.append("tokens_per_expert_max must equal max(tokens_per_expert)")
             if tokens_per_expert_spread != (tokens_per_expert_max - tokens_per_expert_min):
                 errors.append("tokens_per_expert_spread must equal tokens_per_expert_max - tokens_per_expert_min")
-    else:
+    elif moe_routing_mode == "normal":
         for key, value in (
             ("tokens_per_expert", tokens_per_expert),
             ("tokens_per_expert_min", tokens_per_expert_min),
