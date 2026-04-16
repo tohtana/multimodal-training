@@ -71,6 +71,7 @@ try:
         is_terminal_status,
         load_case_payload,
         normalize_moe_routing_mode,
+        normalize_torch_compile_requested,
         normalize_dtype_name,
         parse_batch_sizes,
         parse_dtypes,
@@ -109,6 +110,7 @@ except ModuleNotFoundError:
         is_terminal_status,
         load_case_payload,
         normalize_moe_routing_mode,
+        normalize_torch_compile_requested,
         normalize_dtype_name,
         parse_batch_sizes,
         parse_dtypes,
@@ -335,6 +337,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-nsys", choices=["on", "off"], default="off")
     parser.add_argument("--nsys-bin", type=str, default="nsys")
     parser.add_argument("--capture-torch-profiler", choices=["on", "off"], default="off")
+    parser.add_argument("--torch-compile", choices=["on", "off"], default="off")
     parser.add_argument(
         "--torch-profiler-selection",
         choices=TORCH_PROFILER_SELECTIONS,
@@ -428,6 +431,7 @@ def _run_config_identity_fields(
     torch_profiler_wait_iters: int | None,
     torch_profiler_active_iters: int | None,
     moe_routing_mode: str,
+    torch_compile: str,
 ) -> dict[str, Any]:
     return {
         "seq_lens": [int(value) for value in seq_lens],
@@ -445,6 +449,7 @@ def _run_config_identity_fields(
         "torch_profiler_wait_iters": torch_profiler_wait_iters,
         "torch_profiler_active_iters": torch_profiler_active_iters,
         "moe_routing_mode": normalize_moe_routing_mode(moe_routing_mode),
+        "torch_compile": normalize_torch_compile_requested(torch_compile),
     }
 
 
@@ -476,6 +481,7 @@ def _build_run_config(
         torch_profiler_wait_iters=profiler_config["wait_iters"],
         torch_profiler_active_iters=profiler_config["active_iters"],
         moe_routing_mode=args.moe_routing_mode,
+        torch_compile=args.torch_compile,
     )
     run_config = {
         "model_name": args.model_name,
@@ -535,6 +541,7 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "torch_profiler_wait_iters",
             "torch_profiler_active_iters",
             "moe_routing_mode",
+            "torch_compile",
             "config_fingerprint",
         )
     }
@@ -553,6 +560,7 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "torch_profiler_wait_iters",
             "torch_profiler_active_iters",
             "moe_routing_mode",
+            "torch_compile",
             "config_fingerprint",
         )
     }
@@ -787,6 +795,7 @@ def _empty_stage_result(
     status: str,
     error: dict[str, Any] | None,
     runtime: dict[str, Any] | None = None,
+    torch_compile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -805,6 +814,11 @@ def _empty_stage_result(
         "moe_token_dispatcher_type": None,
         "overlap_moe_expert_parallel_comm": None,
         "attention_impl": None,
+        "torch_compile": torch_compile
+        or {
+            "requested": "off",
+            "status": "eager",
+        },
         "runtime": runtime
         or {
             "requested_sms_by_rank": [],
@@ -812,6 +826,43 @@ def _empty_stage_result(
             "device_total_sms_by_rank": [],
         },
     }
+
+
+def _aggregate_role_torch_compile(
+    role_results: list[dict[str, Any]],
+    *,
+    torch_compile_requested: str,
+    aggregated_error_code: str | None = None,
+) -> tuple[dict[str, str], bool]:
+    requested = normalize_torch_compile_requested(torch_compile_requested)
+    successful_statuses: set[str] = set()
+    any_compile_failed = aggregated_error_code == "torch_compile_failed"
+
+    for result in role_results:
+        worker_payload = result.get("torch_compile") or {}
+        worker_status = worker_payload.get("status")
+        if worker_status not in {"eager", "compiled", "compile_failed"}:
+            worker_error_code = (result.get("error") or {}).get("code")
+            if worker_error_code == "torch_compile_failed":
+                worker_status = "compile_failed"
+            elif result.get("status") == "ok" and requested == "on":
+                worker_status = "compiled"
+            else:
+                worker_status = "eager"
+        worker_status = str(worker_status)
+        if worker_status == "compile_failed":
+            any_compile_failed = True
+        if result.get("status") == "ok":
+            successful_statuses.add(worker_status)
+
+    if any_compile_failed:
+        status = "compile_failed"
+    elif successful_statuses == {"compiled"} and successful_statuses:
+        status = "compiled"
+    else:
+        status = "eager"
+
+    return {"requested": requested, "status": status}, len(successful_statuses) > 1
 
 
 def _select_root_cause_worker_result(results: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -894,6 +945,7 @@ def _worker_main(
     profiler_active_timed_iters: int | None,
     worker_result_dir: str,
     moe_routing_mode: str,
+    torch_compile_enabled: bool,
 ) -> None:
     try:
         from examples.attn_moe_overlap.megatron_layer_runtime import (
@@ -915,6 +967,7 @@ def _worker_main(
     status = "ok"
     payload: dict[str, Any] = {}
     failure_origin = False
+    runtime: Any | None = None
     try:
         _bootstrap_local_pythonpath()
         os.environ.update(mps_env)
@@ -957,6 +1010,7 @@ def _worker_main(
                 green_ctx_moe_sms=green_ctx_moe_sms,
                 num_experts=num_experts,
                 moe_routing_mode=moe_routing_mode,
+                torch_compile_enabled=bool(torch_compile_enabled),
             )
         )
         payload = runtime.run_stage(
@@ -982,6 +1036,14 @@ def _worker_main(
                 iteration_barrier.abort()
             except Exception:
                 pass
+        torch_compile_payload = (
+            runtime.torch_compile_payload()
+            if runtime is not None
+            else {
+                "requested": "on" if torch_compile_enabled else "off",
+                "status": "compile_failed" if torch_compile_enabled else "eager",
+            }
+        )
         payload = {
             "status": status,
             "timing_ms": {"cuda": None, "step_total": None, "timed_wall": None},
@@ -990,6 +1052,7 @@ def _worker_main(
             "enqueue_windows": [],
             "finite": {"all_finite": False, "first_nonfinite": None},
             "output_signature": None,
+            "torch_compile": torch_compile_payload,
             "error": error,
         }
     finally:
@@ -1072,6 +1135,7 @@ def _launch_workers(
                         "profiler_active_timed_iters": common_config.get("profiler_active_timed_iters"),
                         "worker_result_dir": str(worker_result_dir),
                         "moe_routing_mode": common_config["moe_routing_mode"],
+                        "torch_compile_enabled": common_config.get("torch_compile_enabled", False),
                     },
                 )
                 process.start()
@@ -1138,6 +1202,7 @@ def _aggregate_stage_results(
     expected_world_size: int | None = None,
     fallback_status: str | None = None,
     fallback_error: dict[str, Any] | None = None,
+    torch_compile_requested: str = "off",
 ) -> dict[str, Any]:
     role_results = sorted((item for item in results if item.get("role") == role), key=lambda item: item["rank"])
     role_runtime = {
@@ -1146,10 +1211,16 @@ def _aggregate_stage_results(
         "device_total_sms_by_rank": [((item.get("runtime") or {}).get("device_total_sms")) for item in role_results],
     }
     if not role_results:
+        role_torch_compile, _ = _aggregate_role_torch_compile(
+            role_results,
+            torch_compile_requested=torch_compile_requested,
+            aggregated_error_code=(fallback_error or {}).get("code"),
+        )
         return _empty_stage_result(
             role=role,
             status=fallback_status or "runtime_error",
             error=fallback_error,
+            torch_compile=role_torch_compile,
         )
 
     if expected_world_size is not None and len(role_results) < int(expected_world_size):
@@ -1161,12 +1232,29 @@ def _aggregate_stage_results(
                 "message": f"{role} rank {failing.get('rank')} failed",
                 "traceback": None,
             }
-            return _empty_stage_result(role=role, status=status, error=error, runtime=role_runtime)
+            role_torch_compile, _ = _aggregate_role_torch_compile(
+                role_results,
+                torch_compile_requested=torch_compile_requested,
+                aggregated_error_code=error.get("code"),
+            )
+            return _empty_stage_result(
+                role=role,
+                status=status,
+                error=error,
+                runtime=role_runtime,
+                torch_compile=role_torch_compile,
+            )
+        role_torch_compile, _ = _aggregate_role_torch_compile(
+            role_results,
+            torch_compile_requested=torch_compile_requested,
+            aggregated_error_code=(fallback_error or {}).get("code"),
+        )
         return _empty_stage_result(
             role=role,
             status=fallback_status or "runtime_error",
             error=fallback_error,
             runtime=role_runtime,
+            torch_compile=role_torch_compile,
         )
 
     failing = _select_root_cause_worker_result(role_results)
@@ -1177,7 +1265,35 @@ def _aggregate_stage_results(
             "message": f"{role} rank {failing.get('rank')} failed",
             "traceback": None,
         }
-        return _empty_stage_result(role=role, status=status, error=error, runtime=role_runtime)
+        role_torch_compile, _ = _aggregate_role_torch_compile(
+            role_results,
+            torch_compile_requested=torch_compile_requested,
+            aggregated_error_code=error.get("code"),
+        )
+        return _empty_stage_result(
+            role=role,
+            status=status,
+            error=error,
+            runtime=role_runtime,
+            torch_compile=role_torch_compile,
+        )
+
+    role_torch_compile, mixed_successful_compile_statuses = _aggregate_role_torch_compile(
+        role_results,
+        torch_compile_requested=torch_compile_requested,
+    )
+    if mixed_successful_compile_statuses:
+        return _empty_stage_result(
+            role=role,
+            status="runtime_error",
+            error={
+                "code": "torch_compile_status_mismatch",
+                "message": f"{role} workers reported mixed torch compile statuses",
+                "traceback": None,
+            },
+            runtime=role_runtime,
+            torch_compile=role_torch_compile,
+        )
 
     timed_window = _collapse_timed_window_s([item.get("timed_window_s") for item in role_results])
     rank0 = role_results[0]
@@ -1195,6 +1311,7 @@ def _aggregate_stage_results(
         "error": {"code": None, "message": None, "traceback": None},
         "attention_backend": rank0.get("attention_backend"),
         "attention_impl": rank0.get("attention_impl"),
+        "torch_compile": role_torch_compile,
         "moe_routing_mode": rank0.get("moe_routing_mode", "normal"),
         "moe_grouped_gemm": rank0.get("moe_grouped_gemm"),
         "moe_token_dispatcher_type": rank0.get("moe_token_dispatcher_type"),
@@ -1284,12 +1401,14 @@ def _run_case_attempt(
         fallback_status = None
         fallback_error = None
 
+    requested_torch_compile = normalize_torch_compile_requested(str(common_config.get("torch_compile", "off")))
     attn_stage = _aggregate_stage_results(
         "attn",
         results,
         expected_world_size=attn_spec["world_size"],
         fallback_status=fallback_status,
         fallback_error=fallback_error,
+        torch_compile_requested=requested_torch_compile,
     )
     moe_stage = _aggregate_stage_results(
         "moe",
@@ -1297,6 +1416,7 @@ def _run_case_attempt(
         expected_world_size=moe_spec["world_size"],
         fallback_status=fallback_status,
         fallback_error=fallback_error,
+        torch_compile_requested=requested_torch_compile,
     )
     tokens_per_expert: list[int] | None = None
     if common_config["moe_routing_mode"] == "equal_tokens" and moe_stage["status"] == "ok":
@@ -1329,7 +1449,12 @@ def _run_case_attempt(
         error = attn_stage["error"] if attn_stage["status"] == "timeout" else moe_stage["error"]
     elif any(status != "ok" for status in stage_statuses):
         status = "runtime_error"
-        error = attn_stage["error"] if attn_stage["status"] != "ok" else moe_stage["error"]
+        stage_errors = [attn_stage.get("error") or {}, moe_stage.get("error") or {}]
+        compile_error = next((item for item in stage_errors if item.get("code") == "torch_compile_failed"), None)
+        if compile_error is not None:
+            error = compile_error
+        else:
+            error = attn_stage["error"] if attn_stage["status"] != "ok" else moe_stage["error"]
     else:
         status = "ok"
         error = {"code": None, "message": None, "traceback": None}
@@ -1396,6 +1521,13 @@ def _run_case_attempt(
             },
         },
         "moe_routing_mode": common_config["moe_routing_mode"],
+        "torch_compile": {
+            "requested": requested_torch_compile,
+            "by_role": {
+                "attn": {"status": str((attn_stage.get("torch_compile") or {}).get("status", "eager"))},
+                "moe": {"status": str((moe_stage.get("torch_compile") or {}).get("status", "eager"))},
+            },
+        },
         "timing_ms": {
             "total": wall_ms,
             "timed_wall": case_timed_wall_ms,
@@ -1467,6 +1599,7 @@ def _invalid_env_matrix(
     error_message: str,
     topology: dict[str, Any],
     profiler: dict[str, Any],
+    torch_compile_requested: str,
 ) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for descriptor in cases:
@@ -1488,6 +1621,10 @@ def _invalid_env_matrix(
             message=error_message,
             moe_routing_mode=descriptor.moe_routing_mode,
             profiler=profiler,
+            torch_compile={
+                "requested": normalize_torch_compile_requested(torch_compile_requested),
+                "by_role": {"attn": {"status": "eager"}, "moe": {"status": "eager"}},
+            },
         )
         write_case_json(output_dir=output_dir, payload=payload, strict_schema=strict_schema)
         payloads.append(payload)
@@ -1659,6 +1796,8 @@ def _build_case_rerun_command(
         token_dispatcher,
         "--moe-routing-mode",
         _requested_moe_routing_mode(case_payload, run_config),
+        "--torch-compile",
+        str(run_config.get("torch_compile", "off")),
         "--rerun-existing",
     ]
     if run_config.get("num_experts") is not None:
@@ -2019,6 +2158,7 @@ def main() -> int:
             error_message="; ".join(preflight_errors),
             topology=topology,
             profiler=profiler_config,
+            torch_compile_requested=args.torch_compile,
         )
         summary = build_matrix_summary(
             run_config=base_run_config,
@@ -2069,6 +2209,8 @@ def main() -> int:
                     "overlap_moe_expert_parallel_comm": args.overlap_moe_expert_parallel_comm,
                     "attention_backend": args.attention_backend,
                     "nccl_tuple": nccl_tuple,
+                    "torch_compile": args.torch_compile,
+                    "torch_compile_enabled": args.torch_compile == "on",
                     "profiler_trace_root": args.torch_profiler_trace_dir,
                     "profiler_wait_iters": args.torch_profiler_wait_iters,
                     "profiler_active_timed_iters": args.torch_profiler_active_iters,
@@ -2104,6 +2246,7 @@ def main() -> int:
                         stage_signatures=attempt_result["stage_signatures"],
                         error=attempt_result["error"],
                         profiler=profiler_config,
+                        torch_compile=attempt_result["torch_compile"],
                         attempt_count=attempt_count,
                         retry_trigger=retry_trigger,
                         tokens_per_expert=attempt_result["tokens_per_expert"],
@@ -2185,6 +2328,7 @@ def main() -> int:
             error_message=f"MPS startup or matrix run failed: {exc}",
             topology=topology,
             profiler=profiler_config,
+            torch_compile_requested=args.torch_compile,
         )
         all_case_payloads.extend(error_payloads)
         summary = build_matrix_summary(

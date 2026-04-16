@@ -194,6 +194,7 @@ class RuntimeConfig:
     green_ctx_moe_sms: int | None = None
     num_experts: int | None = None
     moe_routing_mode: str = "normal"
+    torch_compile_enabled: bool = False
 
 
 @dataclass
@@ -243,6 +244,102 @@ def _build_equal_token_routing_state(
     )
 
 
+class TorchCompileFailure(RuntimeError):
+    """Raised when torch.compile preparation or preflight fails."""
+
+
+@dataclass
+class PreparedStageCallable:
+    run: Callable[[], torch.Tensor]
+    compile_payload: dict[str, str]
+    consume_equal_token_routing_state: Callable[[], EqualTokenRoutingState | None]
+
+
+def _torch_compile_requested(torch_compile_enabled: bool) -> str:
+    return "on" if torch_compile_enabled else "off"
+
+
+def _prepare_stage_callable(
+    *,
+    config: RuntimeConfig,
+    layer: Any,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    compile_fn: Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]] | None = None,
+) -> PreparedStageCallable:
+    stage_state: dict[str, EqualTokenRoutingState | None] = {"equal_token_routing_state": None}
+
+    def _consume_equal_token_routing_state() -> EqualTokenRoutingState | None:
+        state = stage_state["equal_token_routing_state"]
+        stage_state["equal_token_routing_state"] = None
+        return state
+
+    if config.stage_role == "attn":
+        def stage_impl(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+            stage_state["equal_token_routing_state"] = None
+            output_tensor, _ = layer._forward_attention(hidden_states, attention_mask=attention_mask)
+            return output_tensor
+
+        eager_runner = lambda: stage_impl(hidden_states, attention_mask)
+    elif config.stage_role == "moe":
+        def stage_impl(hidden_states: torch.Tensor) -> torch.Tensor:
+            stage_state["equal_token_routing_state"] = None
+            if config.moe_routing_mode == "equal_tokens":
+                mlp = layer.mlp
+                router = mlp.router
+                local_expert_indices = list(getattr(mlp.token_dispatcher, "local_expert_indices"))
+                state = _build_equal_token_routing_state(
+                    hidden_states=hidden_states,
+                    num_experts=int(config.num_experts or 0),
+                    top_k=int(getattr(layer.config, "moe_router_topk", 0) or 0),
+                    local_expert_indices=local_expert_indices,
+                )
+                stage_state["equal_token_routing_state"] = state
+                original_forward = router.forward
+
+                def _equal_tokens_forward(_router_self: Any, input_tensor: torch.Tensor):
+                    del input_tensor
+                    return state.probs, state.routing_map
+
+                router.forward = MethodType(_equal_tokens_forward, router)
+                try:
+                    return layer._forward_mlp(hidden_states, inference_context=None)
+                finally:
+                    router.forward = original_forward
+            return layer._forward_mlp(hidden_states, inference_context=None)
+
+        eager_runner = lambda: stage_impl(hidden_states)
+    else:
+        raise ValueError(f"Unsupported stage_role: {config.stage_role}")
+
+    if not config.torch_compile_enabled:
+        return PreparedStageCallable(
+            run=eager_runner,
+            compile_payload={"requested": _torch_compile_requested(False), "status": "eager"},
+            consume_equal_token_routing_state=_consume_equal_token_routing_state,
+        )
+
+    compile_driver = compile_fn if compile_fn is not None else getattr(torch, "compile", None)
+    if compile_driver is None:
+        raise TorchCompileFailure("torch.compile is unavailable in this environment")
+
+    try:
+        compiled_impl = compile_driver(stage_impl)
+    except Exception as exc:
+        raise TorchCompileFailure(f"torch.compile failed during stage preparation: {exc}") from exc
+
+    if config.stage_role == "attn":
+        runner = lambda: compiled_impl(hidden_states, attention_mask)
+    else:
+        runner = lambda: compiled_impl(hidden_states)
+
+    return PreparedStageCallable(
+        run=runner,
+        compile_payload={"requested": _torch_compile_requested(True), "status": "compiled"},
+        consume_equal_token_routing_state=_consume_equal_token_routing_state,
+    )
+
+
 class _SingleLayerMegatronTrainer:
     """Thin wrapper over MegatronBaseTrainer for non-Ray local process usage."""
 
@@ -284,6 +381,10 @@ class MegatronSingleLayerRuntime:
             "granted_sms": None,
             "device_total_sms": None,
         }
+        self._stage_runner: Callable[[], torch.Tensor] | None = None
+        self._consume_equal_token_routing_state: Callable[[], EqualTokenRoutingState | None] = lambda: None
+        self._torch_compile_status = "eager"
+        self._torch_compile_preflight_done = False
 
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
@@ -299,6 +400,47 @@ class MegatronSingleLayerRuntime:
         self.hidden_states = self._build_hidden_states(hidden_size)
         self.attention_mask = self._build_attention_mask()
         self._initialize_execution_stream()
+        try:
+            prepared_stage = _prepare_stage_callable(
+                config=self.config,
+                layer=self.layer,
+                hidden_states=self.hidden_states,
+                attention_mask=self.attention_mask,
+            )
+        except TorchCompileFailure:
+            self._torch_compile_status = "compile_failed"
+            raise
+        self._stage_runner = prepared_stage.run
+        self._consume_equal_token_routing_state = prepared_stage.consume_equal_token_routing_state
+        self._torch_compile_status = str(prepared_stage.compile_payload["status"])
+
+    def torch_compile_payload(self) -> dict[str, str]:
+        return {
+            "requested": _torch_compile_requested(self.config.torch_compile_enabled),
+            "status": self._torch_compile_status,
+        }
+
+    def _run_torch_compile_preflight(self) -> None:
+        if not self.config.torch_compile_enabled or self._torch_compile_preflight_done:
+            return
+        if self._stage_runner is None or self.execution_stream is None:
+            raise RuntimeError("torch.compile preflight requires initialized stage runner and execution stream")
+
+        import torch.distributed as dist
+
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            with torch.cuda.stream(self.execution_stream), torch.no_grad():
+                _ = self._stage_runner()
+            self.execution_stream.synchronize()
+            self._consume_equal_token_routing_state()
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            self._torch_compile_preflight_done = True
+        except Exception as exc:
+            self._torch_compile_status = "compile_failed"
+            raise TorchCompileFailure(f"torch.compile preflight failed: {exc}") from exc
 
     def _requested_green_ctx_sms(self) -> int | None:
         if self.config.stage_role == "attn":
@@ -444,10 +586,13 @@ class MegatronSingleLayerRuntime:
         assert self.hidden_states is not None
         assert self.attention_mask is not None
         assert self.execution_stream is not None
+        assert self._stage_runner is not None
 
         total_iters = int(warmup_iters) + int(timed_iters)
         if total_iters <= 0:
             raise ValueError("warmup_iters + timed_iters must be > 0")
+
+        self._run_torch_compile_preflight()
 
         cuda_ms: list[float] = []
         step_ms: list[float] = []
@@ -533,46 +678,22 @@ class MegatronSingleLayerRuntime:
                 )
                 with record_ctx:
                     with torch.cuda.stream(active_stream), torch.no_grad():
-                        if self.config.stage_role == "attn":
-                            output_tensor, _ = self.layer._forward_attention(
-                                self.hidden_states,
-                                attention_mask=self.attention_mask,
+                        output_tensor = self._stage_runner()
+
+                if self.config.stage_role == "moe" and self.config.moe_routing_mode == "equal_tokens":
+                    state = self._consume_equal_token_routing_state()
+                    if state is None:
+                        raise RuntimeError("equal_tokens stage runner did not produce routing state")
+                    if is_timed:
+                        if stable_tokens_per_expert is None:
+                            stable_tokens_per_expert = list(state.tokens_per_expert)
+                        elif stable_tokens_per_expert != state.tokens_per_expert:
+                            raise RuntimeError(
+                                "equal_tokens produced inconsistent tokens_per_expert across timed iterations"
                             )
-                        else:
-                            if self.config.moe_routing_mode == "equal_tokens":
-                                mlp = self.layer.mlp
-                                router = mlp.router
-                                local_expert_indices = list(getattr(mlp.token_dispatcher, "local_expert_indices"))
-                                state = _build_equal_token_routing_state(
-                                    hidden_states=self.hidden_states,
-                                    num_experts=int(self.config.num_experts or 0),
-                                    top_k=int(getattr(self.layer.config, "moe_router_topk", 0) or 0),
-                                    local_expert_indices=local_expert_indices,
-                                )
-                                original_forward = router.forward
-
-                                def _equal_tokens_forward(_router_self: Any, input_tensor: torch.Tensor):
-                                    del input_tensor
-                                    return state.probs, state.routing_map
-
-                                router.forward = MethodType(_equal_tokens_forward, router)
-                                try:
-                                    output_tensor = self.layer._forward_mlp(
-                                        self.hidden_states, inference_context=None
-                                    )
-                                finally:
-                                    router.forward = original_forward
-
-                                if is_timed:
-                                    if stable_tokens_per_expert is None:
-                                        stable_tokens_per_expert = list(state.tokens_per_expert)
-                                    elif stable_tokens_per_expert != state.tokens_per_expert:
-                                        raise RuntimeError(
-                                            "equal_tokens produced inconsistent tokens_per_expert across timed iterations"
-                                        )
-                                    local_tokens_per_expert = list(state.local_tokens_per_expert)
-                            else:
-                                output_tensor = self.layer._forward_mlp(self.hidden_states, inference_context=None)
+                        local_tokens_per_expert = list(state.local_tokens_per_expert)
+                else:
+                    self._consume_equal_token_routing_state()
                 enqueue_end = time.perf_counter()
                 end_event.record(active_stream)
                 active_stream.synchronize()
@@ -643,6 +764,7 @@ class MegatronSingleLayerRuntime:
                 "first_nonfinite": first_nonfinite,
             },
             "output_signature": tensor_signature(output_tensor),
+            "torch_compile": self.torch_compile_payload(),
             "moe_routing_mode": self.config.moe_routing_mode,
             "tokens_per_expert": stable_tokens_per_expert,
             "local_tokens_per_expert": local_tokens_per_expert,
@@ -669,14 +791,18 @@ def cleanup_distributed_state() -> None:
 def classify_exception(exc: BaseException) -> tuple[str, dict[str, Any]]:
     message = str(exc)
     lower = message.lower()
-    if "out of memory" in lower:
+    if isinstance(exc, TorchCompileFailure):
+        status = "oom" if "out of memory" in lower else "runtime_error"
+        code = "torch_compile_failed"
+    elif "out of memory" in lower:
         status = "oom"
+        code = status
     else:
         status = "runtime_error"
-    code = status
+        code = status
     if isinstance(exc, GreenContextError):
         code = exc.code
-    elif status == "runtime_error" and ":" in message:
+    elif status == "runtime_error" and ":" in message and not isinstance(exc, TorchCompileFailure):
         possible_code, _, remainder = message.partition(":")
         if possible_code.startswith("green_context_") and remainder.strip():
             code = possible_code
