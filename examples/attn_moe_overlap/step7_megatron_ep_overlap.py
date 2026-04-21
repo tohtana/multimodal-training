@@ -1056,6 +1056,11 @@ def _worker_main(
             "error": error,
         }
     finally:
+        if runtime is not None:
+            try:
+                runtime.cleanup()
+            except Exception:
+                pass
         cleanup_distributed_state()
         write_json_atomic(
             _worker_result_path(Path(worker_result_dir), role, rank),

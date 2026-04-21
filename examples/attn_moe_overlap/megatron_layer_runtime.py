@@ -253,6 +253,122 @@ class PreparedStageCallable:
     run: Callable[[], torch.Tensor]
     compile_payload: dict[str, str]
     consume_equal_token_routing_state: Callable[[], EqualTokenRoutingState | None]
+    cleanup: Callable[[], None]
+
+
+def _noop_cleanup() -> None:
+    return None
+
+
+def _chain_cleanups(*cleanups: Callable[[], None]) -> Callable[[], None]:
+    active_cleanups = [cleanup for cleanup in cleanups if cleanup is not _noop_cleanup]
+    if not active_cleanups:
+        return _noop_cleanup
+
+    def _restore() -> None:
+        for cleanup in reversed(active_cleanups):
+            cleanup()
+
+    return _restore
+
+
+def _install_torch_compile_safe_global(
+    method: Any,
+    global_name: str,
+    marker_name: str,
+) -> Callable[[], None]:
+    method_globals = getattr(getattr(method, "__func__", None), "__globals__", None)
+    disable_driver = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    if not isinstance(method_globals, dict) or disable_driver is None:
+        return _noop_cleanup
+
+    original = method_globals.get(global_name)
+    if not callable(original) or getattr(original, marker_name, False):
+        return _noop_cleanup
+
+    compile_safe_wrapper = disable_driver(original)
+    setattr(compile_safe_wrapper, marker_name, True)
+    method_globals[global_name] = compile_safe_wrapper
+
+    def _restore() -> None:
+        if method_globals.get(global_name) is compile_safe_wrapper:
+            method_globals[global_name] = original
+
+    return _restore
+
+
+def _install_torch_compile_safe_method(
+    target: Any,
+    method_name: str,
+    marker_name: str,
+) -> Callable[[], None]:
+    disable_driver = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    bound_method = getattr(target, method_name, None)
+    method = getattr(bound_method, "__func__", None)
+    if not callable(method) or disable_driver is None or getattr(method, marker_name, False):
+        return _noop_cleanup
+
+    target_dict = getattr(target, "__dict__", None)
+    had_instance_attr = isinstance(target_dict, dict) and method_name in target_dict
+    original_instance_attr = target_dict.get(method_name) if had_instance_attr else None
+
+    compile_safe_method = disable_driver(method)
+    setattr(compile_safe_method, marker_name, True)
+    setattr(target, method_name, MethodType(compile_safe_method, target))
+
+    def _restore() -> None:
+        current = getattr(target, method_name, None)
+        if getattr(current, "__func__", None) is not compile_safe_method:
+            return
+        if had_instance_attr and isinstance(target_dict, dict):
+            target_dict[method_name] = original_instance_attr
+            return
+        try:
+            delattr(target, method_name)
+        except AttributeError:
+            pass
+
+    return _restore
+
+
+def _install_torch_compile_safe_moe_cpu_handoff(token_dispatcher: Any) -> Callable[[], None]:
+    return _chain_cleanups(
+        _install_torch_compile_safe_global(
+            getattr(token_dispatcher, "_maybe_dtoh_and_synchronize", None),
+            "maybe_move_tensor_to_cpu",
+            "__codex_compile_safe_moe_cpu_handoff__",
+        ),
+        _install_torch_compile_safe_method(
+            token_dispatcher,
+            "dispatch_preprocess",
+            "__codex_compile_safe_dispatch_preprocess__",
+        ),
+        _install_torch_compile_safe_method(
+            token_dispatcher,
+            "token_dispatch",
+            "__codex_compile_safe_token_dispatch__",
+        ),
+        _install_torch_compile_safe_method(
+            token_dispatcher,
+            "dispatch_postprocess",
+            "__codex_compile_safe_dispatch_postprocess__",
+        ),
+        _install_torch_compile_safe_method(
+            token_dispatcher,
+            "combine_preprocess",
+            "__codex_compile_safe_combine_preprocess__",
+        ),
+        _install_torch_compile_safe_method(
+            token_dispatcher,
+            "token_combine",
+            "__codex_compile_safe_token_combine__",
+        ),
+        _install_torch_compile_safe_method(
+            token_dispatcher,
+            "combine_postprocess",
+            "__codex_compile_safe_combine_postprocess__",
+        ),
+    )
 
 
 def _torch_compile_requested(torch_compile_enabled: bool) -> str:
@@ -268,75 +384,94 @@ def _prepare_stage_callable(
     compile_fn: Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]] | None = None,
 ) -> PreparedStageCallable:
     stage_state: dict[str, EqualTokenRoutingState | None] = {"equal_token_routing_state": None}
+    cleanup = _noop_cleanup
 
     def _consume_equal_token_routing_state() -> EqualTokenRoutingState | None:
         state = stage_state["equal_token_routing_state"]
         stage_state["equal_token_routing_state"] = None
         return state
 
-    if config.stage_role == "attn":
-        def stage_impl(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-            stage_state["equal_token_routing_state"] = None
-            output_tensor, _ = layer._forward_attention(hidden_states, attention_mask=attention_mask)
-            return output_tensor
+    try:
+        if config.stage_role == "attn":
+            def stage_impl(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+                stage_state["equal_token_routing_state"] = None
+                output_tensor, _ = layer._forward_attention(hidden_states, attention_mask=attention_mask)
+                return output_tensor
 
-        eager_runner = lambda: stage_impl(hidden_states, attention_mask)
-    elif config.stage_role == "moe":
-        def stage_impl(hidden_states: torch.Tensor) -> torch.Tensor:
-            stage_state["equal_token_routing_state"] = None
+            eager_runner = lambda: stage_impl(hidden_states, attention_mask)
+        elif config.stage_role == "moe":
+            mlp = layer.mlp
+            router = mlp.router
+            token_dispatcher = mlp.token_dispatcher
+            if config.torch_compile_enabled:
+                cleanup = _install_torch_compile_safe_moe_cpu_handoff(token_dispatcher)
+
+            def stage_impl(hidden_states: torch.Tensor) -> torch.Tensor:
+                return layer._forward_mlp(hidden_states, inference_context=None)
+
+            equal_token_state: EqualTokenRoutingState | None = None
             if config.moe_routing_mode == "equal_tokens":
-                mlp = layer.mlp
-                router = mlp.router
-                local_expert_indices = list(getattr(mlp.token_dispatcher, "local_expert_indices"))
-                state = _build_equal_token_routing_state(
+                local_expert_indices = list(getattr(token_dispatcher, "local_expert_indices"))
+                equal_token_state = _build_equal_token_routing_state(
                     hidden_states=hidden_states,
                     num_experts=int(config.num_experts or 0),
                     top_k=int(getattr(layer.config, "moe_router_topk", 0) or 0),
                     local_expert_indices=local_expert_indices,
                 )
-                stage_state["equal_token_routing_state"] = state
+
+            def _run_moe_impl(stage_callable: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+                stage_state["equal_token_routing_state"] = equal_token_state
+                if equal_token_state is None:
+                    return stage_callable(hidden_states)
+
                 original_forward = router.forward
 
                 def _equal_tokens_forward(_router_self: Any, input_tensor: torch.Tensor):
                     del input_tensor
-                    return state.probs, state.routing_map
+                    return equal_token_state.probs, equal_token_state.routing_map
 
                 router.forward = MethodType(_equal_tokens_forward, router)
                 try:
-                    return layer._forward_mlp(hidden_states, inference_context=None)
+                    return stage_callable(hidden_states)
                 finally:
                     router.forward = original_forward
-            return layer._forward_mlp(hidden_states, inference_context=None)
 
-        eager_runner = lambda: stage_impl(hidden_states)
-    else:
-        raise ValueError(f"Unsupported stage_role: {config.stage_role}")
+            eager_runner = lambda: _run_moe_impl(stage_impl)
+        else:
+            raise ValueError(f"Unsupported stage_role: {config.stage_role}")
+    except Exception:
+        cleanup()
+        raise
 
     if not config.torch_compile_enabled:
         return PreparedStageCallable(
             run=eager_runner,
             compile_payload={"requested": _torch_compile_requested(False), "status": "eager"},
             consume_equal_token_routing_state=_consume_equal_token_routing_state,
+            cleanup=cleanup,
         )
 
     compile_driver = compile_fn if compile_fn is not None else getattr(torch, "compile", None)
     if compile_driver is None:
+        cleanup()
         raise TorchCompileFailure("torch.compile is unavailable in this environment")
 
     try:
         compiled_impl = compile_driver(stage_impl)
     except Exception as exc:
+        cleanup()
         raise TorchCompileFailure(f"torch.compile failed during stage preparation: {exc}") from exc
 
     if config.stage_role == "attn":
         runner = lambda: compiled_impl(hidden_states, attention_mask)
     else:
-        runner = lambda: compiled_impl(hidden_states)
+        runner = lambda: _run_moe_impl(compiled_impl)
 
     return PreparedStageCallable(
         run=runner,
         compile_payload={"requested": _torch_compile_requested(True), "status": "compiled"},
         consume_equal_token_routing_state=_consume_equal_token_routing_state,
+        cleanup=cleanup,
     )
 
 
@@ -383,6 +518,7 @@ class MegatronSingleLayerRuntime:
         }
         self._stage_runner: Callable[[], torch.Tensor] | None = None
         self._consume_equal_token_routing_state: Callable[[], EqualTokenRoutingState | None] = lambda: None
+        self._stage_cleanup: Callable[[], None] = _noop_cleanup
         self._torch_compile_status = "eager"
         self._torch_compile_preflight_done = False
 
@@ -412,7 +548,17 @@ class MegatronSingleLayerRuntime:
             raise
         self._stage_runner = prepared_stage.run
         self._consume_equal_token_routing_state = prepared_stage.consume_equal_token_routing_state
+        self._stage_cleanup = prepared_stage.cleanup
         self._torch_compile_status = str(prepared_stage.compile_payload["status"])
+
+    def cleanup(self) -> None:
+        try:
+            self._stage_cleanup()
+        finally:
+            self._stage_cleanup = _noop_cleanup
+            if self.green_ctx_stream_owner is not None:
+                self.green_ctx_stream_owner.cleanup()
+                self.green_ctx_stream_owner = None
 
     def torch_compile_payload(self) -> dict[str, str]:
         return {
@@ -728,9 +874,7 @@ class MegatronSingleLayerRuntime:
         finally:
             if profiler is not None:
                 profiler.__exit__(None, None, None)
-            if self.green_ctx_stream_owner is not None:
-                self.green_ctx_stream_owner.cleanup()
-                self.green_ctx_stream_owner = None
+            self.cleanup()
 
         mean_cuda_ms = float(sum(cuda_ms) / len(cuda_ms)) if cuda_ms else None
         mean_step_ms = float(sum(step_ms) / len(step_ms)) if step_ms else None

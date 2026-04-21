@@ -38,6 +38,7 @@ from examples.attn_moe_overlap.megatron_layer_runtime import (
     RuntimeConfig,
     TorchCompileFailure,
     _build_equal_token_routing_state,
+    _install_torch_compile_safe_moe_cpu_handoff,
     _prepare_stage_callable,
     classify_exception,
     describe_attention_runtime,
@@ -1651,6 +1652,146 @@ def test_prepare_stage_callable_compiles_requested_role(stage_role, expected_bia
     assert prepared.compile_payload == {"requested": "on", "status": "compiled"}
     assert len(compile_calls) == 1
     assert prepared.consume_equal_token_routing_state() is None
+
+
+def test_install_torch_compile_safe_moe_cpu_handoff_wraps_and_restores(monkeypatch):
+    module_globals: dict[str, object] = {}
+    exec(
+        """
+def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
+    return tensor, as_numpy, record_stream
+
+class FakeTokenDispatcher:
+    def dispatch_preprocess(self, hidden_states, routing_map, probs):
+        return hidden_states, probs
+
+    def token_dispatch(self, hidden_states, probs):
+        return hidden_states, probs
+
+    def dispatch_postprocess(self, hidden_states, probs):
+        return hidden_states, probs
+
+    def combine_preprocess(self, hidden_states):
+        return hidden_states
+
+    def token_combine(self, hidden_states):
+        return hidden_states
+
+    def combine_postprocess(self, hidden_states):
+        return hidden_states
+
+    def _maybe_dtoh_and_synchronize(self, point, tokens_per_expert=None):
+        del point
+        return maybe_move_tensor_to_cpu(tokens_per_expert, as_numpy=True, record_stream=True)
+""",
+        module_globals,
+    )
+    fake_dispatcher = module_globals["FakeTokenDispatcher"]()
+    dispatcher_cls = module_globals["FakeTokenDispatcher"]
+    original = module_globals["maybe_move_tensor_to_cpu"]
+    wrapped_by_name: dict[str, object] = {}
+
+    def _fake_disable(fn):
+        def _wrapped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        wrapped_by_name[fn.__name__] = _wrapped
+        return _wrapped
+
+    monkeypatch.setattr(torch._dynamo, "disable", _fake_disable)
+
+    restore = _install_torch_compile_safe_moe_cpu_handoff(fake_dispatcher)
+
+    assert module_globals["maybe_move_tensor_to_cpu"] is wrapped_by_name["maybe_move_tensor_to_cpu"]
+    for method_name in [
+        "dispatch_preprocess",
+        "token_dispatch",
+        "dispatch_postprocess",
+        "combine_preprocess",
+        "token_combine",
+        "combine_postprocess",
+    ]:
+        assert getattr(fake_dispatcher, method_name).__func__ is wrapped_by_name[method_name]
+
+    restore()
+
+    assert module_globals["maybe_move_tensor_to_cpu"] is original
+    for method_name in [
+        "dispatch_preprocess",
+        "token_dispatch",
+        "dispatch_postprocess",
+        "combine_preprocess",
+        "token_combine",
+        "combine_postprocess",
+    ]:
+        assert getattr(fake_dispatcher, method_name).__func__ is dispatcher_cls.__dict__[method_name]
+
+
+def test_prepare_stage_callable_compiles_equal_tokens_moe_with_router_override():
+    class FakeLayer:
+        def __init__(self):
+            self.config = SimpleNamespace(moe_router_topk=1)
+            self.mlp = SimpleNamespace(
+                router=SimpleNamespace(forward=lambda input_tensor: (_ for _ in ()).throw(AssertionError("router override missing"))),
+                token_dispatcher=SimpleNamespace(local_expert_indices=[0, 1]),
+            )
+
+        def _forward_mlp(self, hidden_states, inference_context=None):
+            del inference_context
+            probs, routing_map = self.mlp.router.forward(hidden_states)
+            assert routing_map.dtype == torch.bool
+            return hidden_states + probs.sum()
+
+    compile_calls: list[object] = []
+
+    def _fake_compile(fn):
+        compile_calls.append(fn)
+
+        def _wrapped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    hidden_states = torch.ones((2, 1, 3), dtype=torch.float32)
+    attention_mask = torch.zeros((1, 1, 2, 2), dtype=torch.bool)
+    layer = FakeLayer()
+    original_forward = layer.mlp.router.forward
+    config = RuntimeConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        stage_role="moe",
+        runtime_backend="mps_only",
+        attention_backend="auto",
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=False,
+        dtype="bf16",
+        seq_len=2,
+        batch_size=1,
+        seed=1234,
+        expert_model_parallel_size=1,
+        num_experts=2,
+        moe_routing_mode="equal_tokens",
+        torch_compile_enabled=True,
+    )
+
+    prepared = _prepare_stage_callable(
+        config=config,
+        layer=layer,
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        compile_fn=_fake_compile,
+    )
+
+    output_tensor = prepared.run()
+    state = prepared.consume_equal_token_routing_state()
+
+    assert torch.allclose(output_tensor, hidden_states + 2.0)
+    assert compile_calls
+    assert layer.mlp.router.forward is original_forward
+    assert state is not None
+    assert state.tokens_per_expert == [1, 1]
+    assert state.local_tokens_per_expert == [1, 1]
 
 
 def test_prepare_stage_callable_compile_failure_classifies_as_torch_compile_failed():
