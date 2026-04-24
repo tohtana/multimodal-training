@@ -10,8 +10,8 @@ from typing import Any, Iterable
 
 import torch
 
-CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v4"
-MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v4"
+CASE_SCHEMA_VERSION = "megatron_ep_overlap.case.v5"
+MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v5"
 RUNTIME_BACKENDS = ("mps_only", "mps_green_ctx")
 TORCH_PROFILER_SELECTIONS = ("representative", "all-successful")
 MOE_ROUTING_MODES = ("normal", "equal_tokens")
@@ -96,7 +96,9 @@ def parse_int_csv(raw: str, *, field_name: str) -> list[int]:
         try:
             value = int(text)
         except ValueError as exc:
-            raise ValueError(f"{field_name} must be comma-separated integers: {raw!r}") from exc
+            raise ValueError(
+                f"{field_name} must be comma-separated integers: {raw!r}"
+            ) from exc
         values.append(value)
     if not values:
         raise ValueError(f"{field_name} must not be empty")
@@ -142,7 +144,9 @@ def parse_gpu_ids(raw: str, *, field_name: str) -> list[int]:
     deduped: list[int] = []
     for value in values:
         if value < 0:
-            raise ValueError(f"{field_name} must contain non-negative GPU ids: got {value}")
+            raise ValueError(
+                f"{field_name} must contain non-negative GPU ids: got {value}"
+            )
         if value in seen:
             raise ValueError(f"{field_name} contains duplicate GPU id: {value}")
         seen.add(value)
@@ -181,10 +185,13 @@ def parse_nccl_tuples(
     nccl_max_ctas: int | None,
 ) -> list[tuple[int, int, int] | None]:
     has_fallback = any(
-        value is not None for value in (nccl_socket_nthreads, nccl_max_nchannels, nccl_max_ctas)
+        value is not None
+        for value in (nccl_socket_nthreads, nccl_max_nchannels, nccl_max_ctas)
     )
     if nccl_tuples and has_fallback:
-        raise ValueError("Do not mix --nccl-tuples with --nccl-socket-nthreads/--nccl-max-nchannels/--nccl-max-ctas")
+        raise ValueError(
+            "Do not mix --nccl-tuples with --nccl-socket-nthreads/--nccl-max-nchannels/--nccl-max-ctas"
+        )
 
     parsed: list[tuple[int, int, int] | None] = []
     if nccl_tuples:
@@ -197,11 +204,15 @@ def parse_nccl_tuples(
                 continue
             parts = [part.strip() for part in token.split(",")]
             if len(parts) != 3:
-                raise ValueError(f"Invalid NCCL tuple {token!r}: expected socket_nthreads,max_nchannels,max_ctas")
+                raise ValueError(
+                    f"Invalid NCCL tuple {token!r}: expected socket_nthreads,max_nchannels,max_ctas"
+                )
             try:
                 triple = tuple(int(part) for part in parts)
             except ValueError as exc:
-                raise ValueError(f"Invalid NCCL tuple {token!r}: values must be integers") from exc
+                raise ValueError(
+                    f"Invalid NCCL tuple {token!r}: values must be integers"
+                ) from exc
             parsed.append(triple)  # type: ignore[arg-type]
     elif has_fallback:
         triple = (
@@ -260,11 +271,18 @@ def build_case_id(
     moe_gpu_ids: Iterable[int],
     nccl_tuple: tuple[int, int, int] | None,
     moe_routing_mode: str = "normal",
+    num_layer_pairs: int = 1,
 ) -> str:
-    nccl_fragment = "off" if nccl_tuple is None else f"{nccl_tuple[0]}_{nccl_tuple[1]}_{nccl_tuple[2]}"
+    nccl_fragment = (
+        "off"
+        if nccl_tuple is None
+        else f"{nccl_tuple[0]}_{nccl_tuple[1]}_{nccl_tuple[2]}"
+    )
     runtime_backend = normalize_runtime_backend(runtime_backend)
     if runtime_backend == "mps_green_ctx":
-        green_ctx_fragment = f"gc-{int(green_ctx_attn_sms or 0)}_{int(green_ctx_moe_sms or 0)}"
+        green_ctx_fragment = (
+            f"gc-{int(green_ctx_attn_sms or 0)}_{int(green_ctx_moe_sms or 0)}"
+        )
     else:
         green_ctx_fragment = "gc-off"
     return "__".join(
@@ -273,6 +291,7 @@ def build_case_id(
             f"routing-{normalize_moe_routing_mode(moe_routing_mode)}",
             f"seq-{seq_len}",
             f"batch-{batch_size}",
+            f"pairs-{int(num_layer_pairs)}",
             f"backend-{runtime_backend}",
             green_ctx_fragment,
             f"dtype-{normalize_dtype_name(dtype)}",
@@ -382,7 +401,9 @@ def evaluate_stage_diff(
     }
 
 
-def compute_speedup(serial_total_ms: float | None, overlap_total_ms: float | None) -> float | None:
+def compute_speedup(
+    serial_total_ms: float | None, overlap_total_ms: float | None
+) -> float | None:
     if serial_total_ms is None or overlap_total_ms is None:
         return None
     if overlap_total_ms <= 0:
@@ -396,7 +417,9 @@ def compute_host_enqueue_overlap_ms(
 ) -> float:
     overlap_values_ms: list[float] = []
     for attn_window, moe_window in zip(attn_windows, moe_windows):
-        overlap_s = max(0.0, min(attn_window[1], moe_window[1]) - max(attn_window[0], moe_window[0]))
+        overlap_s = max(
+            0.0, min(attn_window[1], moe_window[1]) - max(attn_window[0], moe_window[0])
+        )
         overlap_values_ms.append(overlap_s * 1000.0)
     if not overlap_values_ms:
         return 0.0
@@ -425,8 +448,12 @@ def build_runtime_metadata(
     return {
         "green_ctx_enabled": green_ctx_enabled,
         "requested_sms_by_role": {
-            "attn": None if not green_ctx_enabled or green_ctx_attn_sms is None else int(green_ctx_attn_sms),
-            "moe": None if not green_ctx_enabled or green_ctx_moe_sms is None else int(green_ctx_moe_sms),
+            "attn": None
+            if not green_ctx_enabled or green_ctx_attn_sms is None
+            else int(green_ctx_attn_sms),
+            "moe": None
+            if not green_ctx_enabled or green_ctx_moe_sms is None
+            else int(green_ctx_moe_sms),
         },
         "granted_sms_by_role": {
             "attn": _normalize_worker_sms((granted_sms_by_role or {}).get("attn")),
@@ -440,8 +467,41 @@ def build_runtime_metadata(
 
 
 def build_config_fingerprint(identity_fields: dict[str, Any]) -> str:
-    encoded = json.dumps(identity_fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(identity_fields, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _pair_index_entries(
+    num_layer_pairs: int, stage_kind: str, value_key: str, value: Any = None
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "pair_index": int(pair_index),
+            "stage_label": f"{stage_kind}_{pair_index}",
+            value_key: value,
+        }
+        for pair_index in range(int(num_layer_pairs))
+    ]
+
+
+def _default_stage_signatures(num_layer_pairs: int) -> dict[str, Any]:
+    return {
+        "attn": _pair_index_entries(num_layer_pairs, "attn", "signature", None),
+        "moe": _pair_index_entries(num_layer_pairs, "moe", "signature", None),
+    }
+
+
+def _default_baseline_diff(num_layer_pairs: int) -> dict[str, Any]:
+    return {
+        "baseline_case_id": None,
+        "all_within_tolerance": None,
+        "stages": {
+            "attn": _pair_index_entries(num_layer_pairs, "attn", "diff", None),
+            "moe": _pair_index_entries(num_layer_pairs, "moe", "diff", None),
+        },
+    }
 
 
 def build_case_payload(
@@ -457,8 +517,11 @@ def build_case_payload(
     topology: dict[str, Any],
     nccl_env: dict[str, Any],
     moe_routing_mode: str = "normal",
+    num_layer_pairs: int = 1,
     runtime: dict[str, Any] | None = None,
     timing_ms: dict[str, Any] | None = None,
+    layer_timings_ms: dict[str, Any] | None = None,
+    throughput: dict[str, Any] | None = None,
     overlap_ms: float | None = None,
     finite: dict[str, Any] | None = None,
     stage_signatures: dict[str, Any] | None = None,
@@ -476,6 +539,7 @@ def build_case_payload(
     normalized_dtype = normalize_dtype_name(dtype)
     normalized_runtime_backend = normalize_runtime_backend(runtime_backend)
     normalized_moe_routing_mode = normalize_moe_routing_mode(moe_routing_mode)
+    num_layer_pairs = int(num_layer_pairs)
     return {
         "schema_version": CASE_SCHEMA_VERSION,
         "case_id": case_id,
@@ -487,6 +551,7 @@ def build_case_payload(
         "runtime_backend": normalized_runtime_backend,
         "dtype": normalized_dtype,
         "seed": int(seed),
+        "num_layer_pairs": num_layer_pairs,
         "topology": topology,
         "nccl": nccl_env,
         "runtime": runtime
@@ -495,8 +560,16 @@ def build_case_payload(
         "timing_ms": timing_ms
         if timing_ms is not None
         else {"total": None, "timed_wall": None, "attn": None, "moe": None},
+        "layer_timings_ms": layer_timings_ms
+        if layer_timings_ms is not None
+        else {"attn": [], "moe": []},
+        "throughput": throughput
+        if throughput is not None
+        else {"tokens_per_iter": None, "timed_tokens": None, "tokens_per_s": None},
         "overlap": {
-            "host_enqueue_overlap_ms": float(overlap_ms) if overlap_ms is not None else 0.0,
+            "host_enqueue_overlap_ms": float(overlap_ms)
+            if overlap_ms is not None
+            else 0.0,
             "speedup_vs_serial": None,
             "timed_speedup_vs_serial": None,
         },
@@ -506,14 +579,14 @@ def build_case_payload(
             "all_finite": False,
             "first_nonfinite": None,
         },
-        "stage_signatures": stage_signatures if stage_signatures is not None else {"attn": None, "moe": None},
+        "stage_signatures": (
+            stage_signatures
+            if stage_signatures is not None
+            else _default_stage_signatures(num_layer_pairs)
+        ),
         "baseline_diff": baseline_diff
         if baseline_diff is not None
-        else {
-            "baseline_case_id": None,
-            "all_within_tolerance": None,
-            "stages": {"attn": None, "moe": None},
-        },
+        else _default_baseline_diff(num_layer_pairs),
         "error": error
         if error is not None
         else {
@@ -567,6 +640,7 @@ def build_invalid_environment_payload(
         topology=topology,
         nccl_env=nccl_env,
         moe_routing_mode=moe_routing_mode,
+        num_layer_pairs=int(topology.get("num_layer_pairs") or 1),
         runtime=runtime,
         error={"code": "invalid_environment", "message": message, "traceback": None},
         profiler=profiler,
@@ -586,10 +660,13 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         "runtime_backend",
         "dtype",
         "seed",
+        "num_layer_pairs",
         "topology",
         "nccl",
         "runtime",
         "timing_ms",
+        "layer_timings_ms",
+        "throughput",
         "overlap",
         "finite",
         "stage_signatures",
@@ -616,18 +693,35 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     status = payload.get("status")
     if status not in REQUIRED_STATUS_KEYS:
         errors.append(f"status must be one of {REQUIRED_STATUS_KEYS}, got {status!r}")
+    timing_usable = status in {"ok", "numerical_mismatch"}
 
     moe_routing_mode = payload.get("moe_routing_mode")
     if moe_routing_mode not in MOE_ROUTING_MODES:
-        errors.append(f"moe_routing_mode must be one of {MOE_ROUTING_MODES}, got {moe_routing_mode!r}")
+        errors.append(
+            f"moe_routing_mode must be one of {MOE_ROUTING_MODES}, got {moe_routing_mode!r}"
+        )
 
+    seq_len = payload.get("seq_len")
+    if not isinstance(seq_len, int) or seq_len <= 0:
+        errors.append(f"seq_len must be a positive integer, got {seq_len!r}")
     batch_size = payload.get("batch_size")
     if not isinstance(batch_size, int) or batch_size <= 0:
         errors.append(f"batch_size must be a positive integer, got {batch_size!r}")
 
+    num_layer_pairs = payload.get("num_layer_pairs")
+    if not isinstance(num_layer_pairs, int) or num_layer_pairs <= 0:
+        errors.append(
+            f"num_layer_pairs must be a positive integer, got {num_layer_pairs!r}"
+        )
+        expected_pair_indices: set[int] = set()
+    else:
+        expected_pair_indices = set(range(int(num_layer_pairs)))
+
     runtime_backend = payload.get("runtime_backend")
     if runtime_backend not in RUNTIME_BACKENDS:
-        errors.append(f"runtime_backend must be one of {RUNTIME_BACKENDS}, got {runtime_backend!r}")
+        errors.append(
+            f"runtime_backend must be one of {RUNTIME_BACKENDS}, got {runtime_backend!r}"
+        )
 
     runtime = payload.get("runtime")
     if not isinstance(runtime, dict):
@@ -651,20 +745,35 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
                     errors.append(f"runtime.{key}.{role} missing")
         for role in ("attn", "moe"):
             requested_value = (requested_sms or {}).get(role)
-            if requested_value is not None and (not isinstance(requested_value, int) or requested_value <= 0):
-                errors.append(f"runtime.requested_sms_by_role.{role} must be null or a positive integer")
+            if requested_value is not None and (
+                not isinstance(requested_value, int) or requested_value <= 0
+            ):
+                errors.append(
+                    f"runtime.requested_sms_by_role.{role} must be null or a positive integer"
+                )
             granted_value = (granted_sms or {}).get(role)
             if granted_value is not None:
                 if not isinstance(granted_value, list):
                     errors.append(f"runtime.granted_sms_by_role.{role} must be a list")
-                elif any(not isinstance(item, int) or item <= 0 for item in granted_value):
-                    errors.append(f"runtime.granted_sms_by_role.{role} must contain positive integers")
+                elif any(
+                    not isinstance(item, int) or item <= 0 for item in granted_value
+                ):
+                    errors.append(
+                        f"runtime.granted_sms_by_role.{role} must contain positive integers"
+                    )
             device_total_value = (device_total_sms or {}).get(role)
             if device_total_value is not None:
                 if not isinstance(device_total_value, list):
-                    errors.append(f"runtime.device_total_sms_by_role.{role} must be a list")
-                elif any(not isinstance(item, int) or item <= 0 for item in device_total_value):
-                    errors.append(f"runtime.device_total_sms_by_role.{role} must contain positive integers")
+                    errors.append(
+                        f"runtime.device_total_sms_by_role.{role} must be a list"
+                    )
+                elif any(
+                    not isinstance(item, int) or item <= 0
+                    for item in device_total_value
+                ):
+                    errors.append(
+                        f"runtime.device_total_sms_by_role.{role} must contain positive integers"
+                    )
 
     timing_ms = payload.get("timing_ms")
     if not isinstance(timing_ms, dict):
@@ -674,16 +783,112 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
             if key not in timing_ms:
                 errors.append(f"timing_ms.{key} missing")
 
+    layer_timings_ms = payload.get("layer_timings_ms")
+    if not isinstance(layer_timings_ms, dict):
+        errors.append("layer_timings_ms must be an object")
+    else:
+        for stage_kind in ("attn", "moe"):
+            rows = layer_timings_ms.get(stage_kind)
+            if not isinstance(rows, list):
+                errors.append(f"layer_timings_ms.{stage_kind} must be an array")
+                continue
+            pair_indices: set[int] = set()
+            for index, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    errors.append(
+                        f"layer_timings_ms.{stage_kind}[{index}] must be an object"
+                    )
+                    continue
+                for key in (
+                    "pair_index",
+                    "stage_label",
+                    "cuda",
+                    "step_total",
+                    "timed_wall",
+                ):
+                    if key not in row:
+                        errors.append(
+                            f"layer_timings_ms.{stage_kind}[{index}].{key} missing"
+                        )
+                pair_index = row.get("pair_index")
+                if isinstance(pair_index, int):
+                    pair_indices.add(pair_index)
+                else:
+                    errors.append(
+                        f"layer_timings_ms.{stage_kind}[{index}].pair_index must be an integer"
+                    )
+                if not isinstance(row.get("stage_label"), str):
+                    errors.append(
+                        f"layer_timings_ms.{stage_kind}[{index}].stage_label must be a string"
+                    )
+            if timing_usable and pair_indices != expected_pair_indices:
+                errors.append(
+                    f"layer_timings_ms.{stage_kind} must cover pair indices {sorted(expected_pair_indices)}, got {sorted(pair_indices)}"
+                )
+
+    throughput = payload.get("throughput")
+    if not isinstance(throughput, dict):
+        errors.append("throughput must be an object")
+    else:
+        for key in ("tokens_per_iter", "timed_tokens", "tokens_per_s"):
+            if key not in throughput:
+                errors.append(f"throughput.{key} missing")
+        tokens_per_iter = throughput.get("tokens_per_iter")
+        timed_tokens = throughput.get("timed_tokens")
+        tokens_per_s = throughput.get("tokens_per_s")
+        if timing_usable:
+            expected_tokens_per_iter = (
+                int(seq_len) * int(batch_size)
+                if isinstance(seq_len, int) and isinstance(batch_size, int)
+                else None
+            )
+            if not isinstance(tokens_per_iter, int) or tokens_per_iter <= 0:
+                errors.append(
+                    "throughput.tokens_per_iter must be a positive integer for successful cases"
+                )
+            elif (
+                expected_tokens_per_iter is not None
+                and tokens_per_iter != expected_tokens_per_iter
+            ):
+                errors.append(
+                    "throughput.tokens_per_iter must equal seq_len * batch_size"
+                )
+            if timed_tokens is None:
+                errors.append(
+                    "throughput.timed_tokens must be present for successful cases"
+                )
+            if tokens_per_s is None:
+                errors.append(
+                    "throughput.tokens_per_s must be present for successful cases"
+                )
+            if (
+                isinstance(timed_tokens, (int, float))
+                and isinstance(tokens_per_s, (int, float))
+                and isinstance(timing_ms, dict)
+                and isinstance(timing_ms.get("timed_wall"), (int, float))
+                and float(timing_ms["timed_wall"]) > 0
+            ):
+                expected_tokens_per_s = float(timed_tokens) / (
+                    float(timing_ms["timed_wall"]) / 1000.0
+                )
+                if abs(float(tokens_per_s) - expected_tokens_per_s) > 1e-6 * max(
+                    1.0, expected_tokens_per_s
+                ):
+                    errors.append(
+                        "throughput.tokens_per_s must match timed_tokens / timed_wall_s"
+                    )
+
     overlap = payload.get("overlap")
     if not isinstance(overlap, dict):
         errors.append("overlap must be an object")
     else:
-        if "host_enqueue_overlap_ms" not in overlap:
-            errors.append("overlap.host_enqueue_overlap_ms missing")
-        if "speedup_vs_serial" not in overlap:
-            errors.append("overlap.speedup_vs_serial missing")
-        if "timed_speedup_vs_serial" not in overlap:
-            errors.append("overlap.timed_speedup_vs_serial missing")
+        for key in (
+            "host_enqueue_overlap_ms",
+            "speedup_vs_serial",
+            "timed_speedup_vs_serial",
+        ):
+            if key not in overlap:
+                errors.append(f"overlap.{key} missing")
 
     finite = payload.get("finite")
     if not isinstance(finite, dict):
@@ -698,9 +903,42 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     if not isinstance(stage_signatures, dict):
         errors.append("stage_signatures must be an object")
     else:
-        for key in ("attn", "moe"):
-            if key not in stage_signatures:
-                errors.append(f"stage_signatures.{key} missing")
+        for stage_kind in ("attn", "moe"):
+            rows = stage_signatures.get(stage_kind)
+            if not isinstance(rows, list):
+                errors.append(f"stage_signatures.{stage_kind} must be an array")
+                continue
+            pair_indices: set[int] = set()
+            for index, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    errors.append(
+                        f"stage_signatures.{stage_kind}[{index}] must be an object"
+                    )
+                    continue
+                for key in ("pair_index", "stage_label", "signature"):
+                    if key not in row:
+                        errors.append(
+                            f"stage_signatures.{stage_kind}[{index}].{key} missing"
+                        )
+                pair_index = row.get("pair_index")
+                if isinstance(pair_index, int):
+                    pair_indices.add(pair_index)
+                else:
+                    errors.append(
+                        f"stage_signatures.{stage_kind}[{index}].pair_index must be an integer"
+                    )
+                if not isinstance(row.get("stage_label"), str):
+                    errors.append(
+                        f"stage_signatures.{stage_kind}[{index}].stage_label must be a string"
+                    )
+                if timing_usable and row.get("signature") is None:
+                    errors.append(
+                        f"stage_signatures.{stage_kind}[{index}].signature missing for successful case"
+                    )
+            if timing_usable and pair_indices != expected_pair_indices:
+                errors.append(
+                    f"stage_signatures.{stage_kind} must cover pair indices {sorted(expected_pair_indices)}, got {sorted(pair_indices)}"
+                )
 
     baseline_diff = payload.get("baseline_diff")
     if not isinstance(baseline_diff, dict):
@@ -713,9 +951,47 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         if not isinstance(stages, dict):
             errors.append("baseline_diff.stages must be an object")
         else:
-            for key in ("attn", "moe"):
-                if key not in stages:
-                    errors.append(f"baseline_diff.stages.{key} missing")
+            for stage_kind in ("attn", "moe"):
+                rows = stages.get(stage_kind)
+                if not isinstance(rows, list):
+                    errors.append(f"baseline_diff.stages.{stage_kind} must be an array")
+                    continue
+                pair_indices: set[int] = set()
+                for index, row in enumerate(rows):
+                    if not isinstance(row, dict):
+                        errors.append(
+                            f"baseline_diff.stages.{stage_kind}[{index}] must be an object"
+                        )
+                        continue
+                    for key in ("pair_index", "stage_label", "diff"):
+                        if key not in row:
+                            errors.append(
+                                f"baseline_diff.stages.{stage_kind}[{index}].{key} missing"
+                            )
+                    pair_index = row.get("pair_index")
+                    if isinstance(pair_index, int):
+                        pair_indices.add(pair_index)
+                    else:
+                        errors.append(
+                            f"baseline_diff.stages.{stage_kind}[{index}].pair_index must be an integer"
+                        )
+                    if not isinstance(row.get("stage_label"), str):
+                        errors.append(
+                            f"baseline_diff.stages.{stage_kind}[{index}].stage_label must be a string"
+                        )
+                    if (
+                        payload.get("mode") == "overlap"
+                        and baseline_diff.get("baseline_case_id") is not None
+                        and timing_usable
+                        and row.get("diff") is None
+                    ):
+                        errors.append(
+                            f"baseline_diff.stages.{stage_kind}[{index}].diff missing for successful overlap case"
+                        )
+                if timing_usable and pair_indices != expected_pair_indices:
+                    errors.append(
+                        f"baseline_diff.stages.{stage_kind} must cover pair indices {sorted(expected_pair_indices)}, got {sorted(pair_indices)}"
+                    )
 
     profiler = payload.get("profiler")
     if not isinstance(profiler, dict):
@@ -744,15 +1020,28 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
     }
     if requires_equal_token_metadata:
         if not isinstance(tokens_per_expert, list) or not tokens_per_expert:
-            errors.append("tokens_per_expert must be a non-empty list for equal_tokens cases")
-        elif any(not isinstance(value, int) or value < 0 for value in tokens_per_expert):
+            errors.append(
+                "tokens_per_expert must be a non-empty list for equal_tokens cases"
+            )
+        elif any(
+            not isinstance(value, int) or value < 0 for value in tokens_per_expert
+        ):
             errors.append("tokens_per_expert must contain non-negative integers")
         if not isinstance(tokens_per_expert_min, int) or tokens_per_expert_min < 0:
-            errors.append("tokens_per_expert_min must be a non-negative integer for equal_tokens cases")
+            errors.append(
+                "tokens_per_expert_min must be a non-negative integer for equal_tokens cases"
+            )
         if not isinstance(tokens_per_expert_max, int) or tokens_per_expert_max < 0:
-            errors.append("tokens_per_expert_max must be a non-negative integer for equal_tokens cases")
-        if not isinstance(tokens_per_expert_spread, int) or tokens_per_expert_spread < 0:
-            errors.append("tokens_per_expert_spread must be a non-negative integer for equal_tokens cases")
+            errors.append(
+                "tokens_per_expert_max must be a non-negative integer for equal_tokens cases"
+            )
+        if (
+            not isinstance(tokens_per_expert_spread, int)
+            or tokens_per_expert_spread < 0
+        ):
+            errors.append(
+                "tokens_per_expert_spread must be a non-negative integer for equal_tokens cases"
+            )
         if (
             isinstance(tokens_per_expert, list)
             and tokens_per_expert
@@ -764,8 +1053,12 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
                 errors.append("tokens_per_expert_min must equal min(tokens_per_expert)")
             if tokens_per_expert_max != max(tokens_per_expert):
                 errors.append("tokens_per_expert_max must equal max(tokens_per_expert)")
-            if tokens_per_expert_spread != (tokens_per_expert_max - tokens_per_expert_min):
-                errors.append("tokens_per_expert_spread must equal tokens_per_expert_max - tokens_per_expert_min")
+            if tokens_per_expert_spread != (
+                tokens_per_expert_max - tokens_per_expert_min
+            ):
+                errors.append(
+                    "tokens_per_expert_spread must equal tokens_per_expert_max - tokens_per_expert_min"
+                )
     elif moe_routing_mode == "normal":
         for key, value in (
             ("tokens_per_expert", tokens_per_expert),
@@ -820,7 +1113,9 @@ def should_retry(status: str, attempt_count: int) -> bool:
     return attempt_count == 1 and status in RETRYABLE_STATUS_KEYS
 
 
-def should_skip_existing(existing_payload: dict[str, Any], rerun_existing: bool) -> bool:
+def should_skip_existing(
+    existing_payload: dict[str, Any], rerun_existing: bool
+) -> bool:
     if rerun_existing:
         return False
     if existing_payload.get("schema_version") != CASE_SCHEMA_VERSION:
@@ -841,8 +1136,11 @@ def _compact_case_row(payload: dict[str, Any]) -> dict[str, Any]:
         "moe_routing_mode": payload.get("moe_routing_mode"),
         "seq_len": payload.get("seq_len"),
         "batch_size": payload.get("batch_size"),
+        "num_layer_pairs": payload.get("num_layer_pairs"),
         "runtime_backend": payload.get("runtime_backend"),
-        "green_ctx_sms": dict(runtime.get("requested_sms_by_role") or {"attn": None, "moe": None}),
+        "green_ctx_sms": dict(
+            runtime.get("requested_sms_by_role") or {"attn": None, "moe": None}
+        ),
         "dtype": payload.get("dtype"),
         "nccl_tuple": payload.get("nccl", {}).get("tuple"),
         "attempt_count": payload.get("attempt_count", 1),
@@ -862,11 +1160,12 @@ def _comparison_green_ctx_sms(payload: dict[str, Any]) -> tuple[int | None, int 
 
 def _comparison_group_key(
     payload: dict[str, Any],
-) -> tuple[int, int, str, str, str, str, int | None, int | None]:
+) -> tuple[int, int, int, str, str, str, str, int | None, int | None]:
     green_ctx_attn_sms, green_ctx_moe_sms = _comparison_green_ctx_sms(payload)
     return (
         int(payload.get("seq_len") or 0),
         int(payload.get("batch_size") or 0),
+        int(payload.get("num_layer_pairs") or 1),
         str(payload.get("runtime_backend") or ""),
         str(payload.get("moe_routing_mode") or "normal"),
         str(payload.get("dtype") or ""),
@@ -881,6 +1180,7 @@ def _comparison_row_template(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "seq_len": int(payload.get("seq_len") or 0),
         "batch_size": int(payload.get("batch_size") or 0),
+        "num_layer_pairs": int(payload.get("num_layer_pairs") or 1),
         "runtime_backend": payload.get("runtime_backend"),
         "moe_routing_mode": payload.get("moe_routing_mode"),
         "green_ctx_sms": {
@@ -895,44 +1195,75 @@ def _comparison_row_template(payload: dict[str, Any]) -> dict[str, Any]:
         "serial_moe_ms": None,
         "serial_total_ms": None,
         "serial_timed_wall_ms": None,
+        "serial_tokens_per_s": None,
         "overlap_case_id": None,
         "overlap_status": "missing",
         "overlap_attn_ms": None,
         "overlap_moe_ms": None,
         "overlap_total_ms": None,
         "overlap_timed_wall_ms": None,
+        "overlap_tokens_per_s": None,
         "timed_speedup_vs_serial": None,
     }
 
 
-def _build_comparison_rows(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[int, int, str, str, str, int | None, int | None], dict[str, Any]] = {}
+def _timing_usable_status(status: str) -> bool:
+    return status in {"ok", "numerical_mismatch"}
+
+
+def _normalized_per_iter_timed_wall_ms(
+    timing_ms: dict[str, Any], timed_iters: int
+) -> float | None:
+    value = timing_ms.get("timed_wall")
+    if value is None or timed_iters <= 0:
+        return None
+    return float(value) / float(timed_iters)
+
+
+def _build_comparison_rows(
+    run_config: dict[str, Any], cases: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    grouped: dict[
+        tuple[int, int, int, str, str, str, str, int | None, int | None], dict[str, Any]
+    ] = {}
+    timed_iters = max(int(run_config.get("timed_iters") or 1), 1)
     for case in cases:
         key = _comparison_group_key(case)
         row = grouped.setdefault(key, _comparison_row_template(case))
         mode = case.get("mode")
-        prefix = "serial" if mode == "serial" else "overlap" if mode == "overlap" else None
+        prefix = (
+            "serial" if mode == "serial" else "overlap" if mode == "overlap" else None
+        )
         if prefix is None:
             continue
-        status = case.get("status") or "missing"
+        status = str(case.get("status") or "missing")
         timing_ms = case.get("timing_ms") or {}
+        throughput = case.get("throughput") or {}
         row[f"{prefix}_case_id"] = case.get("case_id")
         row[f"{prefix}_status"] = status
-        if status == "ok":
+        if _timing_usable_status(status):
             row[f"{prefix}_attn_ms"] = timing_ms.get("attn")
             row[f"{prefix}_moe_ms"] = timing_ms.get("moe")
             row[f"{prefix}_total_ms"] = timing_ms.get("total")
-            row[f"{prefix}_timed_wall_ms"] = timing_ms.get("timed_wall")
-        if prefix == "overlap" and status == "ok":
-            row["timed_speedup_vs_serial"] = (case.get("overlap") or {}).get("timed_speedup_vs_serial")
+            row[f"{prefix}_timed_wall_ms"] = _normalized_per_iter_timed_wall_ms(
+                timing_ms, timed_iters
+            )
+            row[f"{prefix}_tokens_per_s"] = throughput.get("tokens_per_s")
+        if prefix == "overlap" and _timing_usable_status(status):
+            row["timed_speedup_vs_serial"] = (case.get("overlap") or {}).get(
+                "timed_speedup_vs_serial"
+            )
 
     return [grouped[key] for key in sorted(grouped)]
 
 
-def _backend_pair_common_key(row: dict[str, Any]) -> tuple[int, int, str, str, str]:
+def _backend_pair_common_key(
+    row: dict[str, Any],
+) -> tuple[int, int, int, str, str, str]:
     return (
         int(row.get("seq_len") or 0),
         int(row.get("batch_size") or 0),
+        int(row.get("num_layer_pairs") or 1),
         str(row.get("moe_routing_mode") or "normal"),
         str(row.get("dtype") or ""),
         str(row.get("nccl_tuple") or ""),
@@ -943,6 +1274,7 @@ def _build_backend_pair_id(
     *,
     seq_len: int,
     batch_size: int,
+    num_layer_pairs: int,
     moe_routing_mode: str,
     dtype: str,
     nccl_tuple: str,
@@ -953,6 +1285,7 @@ def _build_backend_pair_id(
         (
             f"pair-seq-{seq_len}",
             f"batch-{batch_size}",
+            f"pairs-{num_layer_pairs}",
             f"routing-{normalize_moe_routing_mode(moe_routing_mode)}",
             f"dtype-{dtype}",
             f"nccl-{nccl_tuple.replace(',', '_')}",
@@ -970,7 +1303,9 @@ def _pair_status(backend_pair_row: dict[str, Any]) -> str:
     mps_only_overlap_status = backend_pair_row.get("mps_only_overlap_status")
     mps_green_ctx_serial_status = backend_pair_row.get("mps_green_ctx_serial_status")
     mps_green_ctx_overlap_status = backend_pair_row.get("mps_green_ctx_overlap_status")
-    mps_only_missing = mps_only_serial_status is None and mps_only_overlap_status is None
+    mps_only_missing = (
+        mps_only_serial_status is None and mps_only_overlap_status is None
+    )
     mps_green_ctx_missing = (
         mps_green_ctx_serial_status is None and mps_green_ctx_overlap_status is None
     )
@@ -978,8 +1313,14 @@ def _pair_status(backend_pair_row: dict[str, Any]) -> str:
         return "missing_mps_only"
     if mps_green_ctx_missing:
         return "missing_mps_green_ctx"
-    mps_only_ok = (mps_only_serial_status, mps_only_overlap_status) == ("ok", "ok")
-    mps_green_ctx_ok = (mps_green_ctx_serial_status, mps_green_ctx_overlap_status) == ("ok", "ok")
+    mps_only_ok = mps_only_serial_status in {
+        "ok",
+        "numerical_mismatch",
+    } and mps_only_overlap_status in {"ok", "numerical_mismatch"}
+    mps_green_ctx_ok = mps_green_ctx_serial_status in {
+        "ok",
+        "numerical_mismatch",
+    } and mps_green_ctx_overlap_status in {"ok", "numerical_mismatch"}
     if not mps_only_ok and not mps_green_ctx_ok:
         return "both_failed"
     if not mps_only_ok:
@@ -989,13 +1330,17 @@ def _pair_status(backend_pair_row: dict[str, Any]) -> str:
     return "ok"
 
 
-def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    runtime_backends = [str(value) for value in run_config.get("runtime_backends") or []]
+def _build_backend_pair_rows(
+    run_config: dict[str, Any], comparison_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    runtime_backends = [
+        str(value) for value in run_config.get("runtime_backends") or []
+    ]
     if "mps_only" not in runtime_backends or "mps_green_ctx" not in runtime_backends:
         return []
 
-    mps_only_rows: dict[tuple[int, int, str, str], dict[str, Any]] = {}
-    mps_green_ctx_rows: dict[tuple[int, int, str, str], dict[str, Any]] = {}
+    mps_only_rows: dict[tuple[int, int, int, str, str, str], dict[str, Any]] = {}
+    mps_green_ctx_rows: dict[tuple[int, int, int, str, str, str], dict[str, Any]] = {}
     for row in comparison_rows:
         key = _backend_pair_common_key(row)
         backend = row.get("runtime_backend")
@@ -1004,16 +1349,19 @@ def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[d
         elif backend == "mps_green_ctx":
             mps_green_ctx_rows[key] = row
 
-    requested_green_ctx_sms = dict(run_config.get("green_ctx_sms") or {"attn": None, "moe": None})
+    requested_green_ctx_sms = dict(
+        run_config.get("green_ctx_sms") or {"attn": None, "moe": None}
+    )
     pair_rows: list[dict[str, Any]] = []
     for key in sorted(set(mps_only_rows) | set(mps_green_ctx_rows)):
-        seq_len, batch_size, moe_routing_mode, dtype, nccl_tuple = key
+        seq_len, batch_size, num_layer_pairs, moe_routing_mode, dtype, nccl_tuple = key
         mps_only_row = mps_only_rows.get(key)
         mps_green_ctx_row = mps_green_ctx_rows.get(key)
         row = {
             "pair_id": _build_backend_pair_id(
                 seq_len=seq_len,
                 batch_size=batch_size,
+                num_layer_pairs=num_layer_pairs,
                 moe_routing_mode=moe_routing_mode,
                 dtype=dtype,
                 nccl_tuple=nccl_tuple,
@@ -1022,59 +1370,100 @@ def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[d
             ),
             "seq_len": seq_len,
             "batch_size": batch_size,
+            "num_layer_pairs": num_layer_pairs,
             "moe_routing_mode": moe_routing_mode,
             "dtype": dtype,
             "nccl_tuple": nccl_tuple,
             "green_ctx_sms": requested_green_ctx_sms,
-            "mps_only_serial_case_id": None if mps_only_row is None else mps_only_row.get("serial_case_id"),
-            "mps_only_serial_status": None if mps_only_row is None else mps_only_row.get("serial_status"),
+            "mps_only_serial_case_id": None
+            if mps_only_row is None
+            else mps_only_row.get("serial_case_id"),
+            "mps_only_serial_status": None
+            if mps_only_row is None
+            else mps_only_row.get("serial_status"),
             "mps_only_serial_timed_wall_ms": (
-                None if mps_only_row is None else mps_only_row.get("serial_timed_wall_ms")
+                None
+                if mps_only_row is None
+                else mps_only_row.get("serial_timed_wall_ms")
             ),
             "mps_only_serial_timed_speedup_vs_serial": (
-                1.0 if mps_only_row is not None and mps_only_row.get("serial_status") == "ok" else None
+                1.0
+                if mps_only_row is not None
+                and _timing_usable_status(str(mps_only_row.get("serial_status")))
+                else None
             ),
-            "mps_only_overlap_case_id": None if mps_only_row is None else mps_only_row.get("overlap_case_id"),
-            "mps_only_overlap_status": None if mps_only_row is None else mps_only_row.get("overlap_status"),
+            "mps_only_overlap_case_id": None
+            if mps_only_row is None
+            else mps_only_row.get("overlap_case_id"),
+            "mps_only_overlap_status": None
+            if mps_only_row is None
+            else mps_only_row.get("overlap_status"),
             "mps_only_overlap_timed_wall_ms": (
-                None if mps_only_row is None else mps_only_row.get("overlap_timed_wall_ms")
+                None
+                if mps_only_row is None
+                else mps_only_row.get("overlap_timed_wall_ms")
             ),
             "mps_only_overlap_timed_speedup_vs_serial": (
-                None if mps_only_row is None else mps_only_row.get("timed_speedup_vs_serial")
+                None
+                if mps_only_row is None
+                else mps_only_row.get("timed_speedup_vs_serial")
             ),
             "mps_green_ctx_serial_case_id": (
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_case_id")
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("serial_case_id")
             ),
             "mps_green_ctx_serial_status": (
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_status")
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("serial_status")
             ),
             "mps_green_ctx_serial_timed_wall_ms": (
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_timed_wall_ms")
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("serial_timed_wall_ms")
             ),
             "mps_green_ctx_serial_timed_speedup_vs_serial": (
                 1.0
-                if mps_green_ctx_row is not None and mps_green_ctx_row.get("serial_status") == "ok"
+                if mps_green_ctx_row is not None
+                and _timing_usable_status(str(mps_green_ctx_row.get("serial_status")))
                 else None
             ),
             "mps_green_ctx_overlap_case_id": (
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_case_id")
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("overlap_case_id")
             ),
             "mps_green_ctx_overlap_status": (
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_status")
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("overlap_status")
             ),
             "mps_green_ctx_overlap_timed_wall_ms": (
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_timed_wall_ms")
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("overlap_timed_wall_ms")
             ),
             "mps_green_ctx_overlap_timed_speedup_vs_serial": (
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("timed_speedup_vs_serial")
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("timed_speedup_vs_serial")
             ),
             "serial_timed_speedup_mps_green_ctx_vs_mps_only": compute_speedup(
-                None if mps_only_row is None else mps_only_row.get("serial_timed_wall_ms"),
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("serial_timed_wall_ms"),
+                None
+                if mps_only_row is None
+                else mps_only_row.get("serial_timed_wall_ms"),
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("serial_timed_wall_ms"),
             ),
             "overlap_timed_speedup_mps_green_ctx_vs_mps_only": compute_speedup(
-                None if mps_only_row is None else mps_only_row.get("overlap_timed_wall_ms"),
-                None if mps_green_ctx_row is None else mps_green_ctx_row.get("overlap_timed_wall_ms"),
+                None
+                if mps_only_row is None
+                else mps_only_row.get("overlap_timed_wall_ms"),
+                None
+                if mps_green_ctx_row is None
+                else mps_green_ctx_row.get("overlap_timed_wall_ms"),
             ),
             "delta_overlap_total_ms": (
                 None
@@ -1082,7 +1471,8 @@ def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[d
                 or mps_green_ctx_row is None
                 or mps_only_row.get("overlap_total_ms") is None
                 or mps_green_ctx_row.get("overlap_total_ms") is None
-                else float(mps_only_row["overlap_total_ms"]) - float(mps_green_ctx_row["overlap_total_ms"])
+                else float(mps_only_row["overlap_total_ms"])
+                - float(mps_green_ctx_row["overlap_total_ms"])
             ),
             "delta_overlap_timed_wall_ms": (
                 None
@@ -1090,7 +1480,8 @@ def _build_backend_pair_rows(run_config: dict[str, Any], comparison_rows: list[d
                 or mps_green_ctx_row is None
                 or mps_only_row.get("overlap_timed_wall_ms") is None
                 or mps_green_ctx_row.get("overlap_timed_wall_ms") is None
-                else float(mps_only_row["overlap_timed_wall_ms"]) - float(mps_green_ctx_row["overlap_timed_wall_ms"])
+                else float(mps_only_row["overlap_timed_wall_ms"])
+                - float(mps_green_ctx_row["overlap_timed_wall_ms"])
             ),
             "delta_timed_speedup_vs_serial": (
                 None
@@ -1122,7 +1513,7 @@ def build_matrix_summary(
         by_status[status] += 1
         attempted_cases += max(int(case.get("attempt_count", 1)), 1)
 
-    comparison_rows = _build_comparison_rows(cases)
+    comparison_rows = _build_comparison_rows(run_config, cases)
     backend_pair_rows = _build_backend_pair_rows(run_config, comparison_rows)
     summary = {
         "schema_version": MATRIX_SCHEMA_VERSION,
@@ -1172,7 +1563,14 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         errors.append("counts must be an object")
         return errors
 
-    for key in ("total_points", "attempted_cases", "completed_cases", "comparison_points", "backend_pair_points", "by_status"):
+    for key in (
+        "total_points",
+        "attempted_cases",
+        "completed_cases",
+        "comparison_points",
+        "backend_pair_points",
+        "by_status",
+    ):
         if key not in counts:
             errors.append(f"counts.{key} missing")
 
@@ -1202,13 +1600,19 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         elif any(not isinstance(value, int) or value <= 0 for value in batch_sizes):
             errors.append("run_config.batch_sizes must contain positive integers")
         if "batch_size" in run_config and batch_sizes:
-            if len(batch_sizes) != 1 or int(run_config["batch_size"]) != int(batch_sizes[0]):
-                errors.append("run_config.batch_size must mirror the only entry in run_config.batch_sizes")
+            if len(batch_sizes) != 1 or int(run_config["batch_size"]) != int(
+                batch_sizes[0]
+            ):
+                errors.append(
+                    "run_config.batch_size must mirror the only entry in run_config.batch_sizes"
+                )
         runtime_backends = run_config.get("runtime_backends")
         if not isinstance(runtime_backends, list) or not runtime_backends:
             errors.append("run_config.runtime_backends missing or empty")
         elif any(str(value) not in RUNTIME_BACKENDS for value in runtime_backends):
-            errors.append(f"run_config.runtime_backends must contain only {RUNTIME_BACKENDS}")
+            errors.append(
+                f"run_config.runtime_backends must contain only {RUNTIME_BACKENDS}"
+            )
         green_ctx_sms = run_config.get("green_ctx_sms")
         if not isinstance(green_ctx_sms, dict):
             errors.append("run_config.green_ctx_sms missing or invalid")
@@ -1219,14 +1623,24 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         device_sm_signature = run_config.get("device_sm_signature")
         if not isinstance(device_sm_signature, dict):
             errors.append("run_config.device_sm_signature missing or invalid")
-        elif any(not isinstance(value, int) or value <= 0 for value in device_sm_signature.values()):
-            errors.append("run_config.device_sm_signature must map GPU ids to positive integer SM counts")
+        elif any(
+            not isinstance(value, int) or value <= 0
+            for value in device_sm_signature.values()
+        ):
+            errors.append(
+                "run_config.device_sm_signature must map GPU ids to positive integer SM counts"
+            )
         config_fingerprint = run_config.get("config_fingerprint")
         if not isinstance(config_fingerprint, str) or not config_fingerprint.strip():
             errors.append("run_config.config_fingerprint missing or invalid")
         moe_routing_mode = run_config.get("moe_routing_mode")
         if moe_routing_mode not in MOE_ROUTING_MODES:
-            errors.append(f"run_config.moe_routing_mode must be one of {MOE_ROUTING_MODES}")
+            errors.append(
+                f"run_config.moe_routing_mode must be one of {MOE_ROUTING_MODES}"
+            )
+        num_layer_pairs = run_config.get("num_layer_pairs")
+        if not isinstance(num_layer_pairs, int) or num_layer_pairs <= 0:
+            errors.append("run_config.num_layer_pairs missing or invalid")
 
     cases = summary.get("cases")
     if not isinstance(cases, list):
@@ -1242,6 +1656,8 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
                 errors.append(f"cases[{index}].runtime_backend missing")
             if "moe_routing_mode" not in row:
                 errors.append(f"cases[{index}].moe_routing_mode missing")
+            if "num_layer_pairs" not in row:
+                errors.append(f"cases[{index}].num_layer_pairs missing")
 
     comparison_rows = summary.get("comparison_rows")
     if not isinstance(comparison_rows, list):
@@ -1250,6 +1666,7 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         required_comparison_keys = (
             "seq_len",
             "batch_size",
+            "num_layer_pairs",
             "runtime_backend",
             "moe_routing_mode",
             "green_ctx_sms",
@@ -1259,12 +1676,14 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
             "serial_moe_ms",
             "serial_total_ms",
             "serial_timed_wall_ms",
+            "serial_tokens_per_s",
             "overlap_case_id",
             "overlap_status",
             "overlap_attn_ms",
             "overlap_moe_ms",
             "overlap_total_ms",
             "overlap_timed_wall_ms",
+            "overlap_tokens_per_s",
             "timed_speedup_vs_serial",
         )
         for index, row in enumerate(comparison_rows):
@@ -1286,6 +1705,7 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         required_pair_keys = (
             "seq_len",
             "batch_size",
+            "num_layer_pairs",
             "moe_routing_mode",
             "mps_only_serial_case_id",
             "mps_only_serial_status",
@@ -1367,17 +1787,20 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append(f"- comparison_points: `{counts.get('comparison_points')}`")
     lines.append(f"- backend_pair_points: `{counts.get('backend_pair_points')}`")
     lines.append("")
-    lines.append("| case_id | status | mode | seq_len | batch_size | runtime_backend | dtype | nccl_tuple | attempt_count |")
-    lines.append("|---|---|---|---:|---:|---|---|---|---:|")
+    lines.append(
+        "| case_id | status | mode | seq_len | batch_size | num_layer_pairs | runtime_backend | dtype | nccl_tuple | attempt_count |"
+    )
+    lines.append("|---|---|---|---:|---:|---:|---|---|---|---:|")
     for row in summary.get("cases", []):
         lines.append(
-            "| {case_id} | {status} | {mode}/{moe_routing_mode} | {seq_len} | {batch_size} | {runtime_backend} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
+            "| {case_id} | {status} | {mode}/{moe_routing_mode} | {seq_len} | {batch_size} | {num_layer_pairs} | {runtime_backend} | {dtype} | {nccl_tuple} | {attempt_count} |".format(
                 case_id=row.get("case_id"),
                 status=row.get("status"),
                 mode=row.get("mode"),
                 moe_routing_mode=row.get("moe_routing_mode"),
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
+                num_layer_pairs=row.get("num_layer_pairs"),
                 runtime_backend=row.get("runtime_backend"),
                 dtype=row.get("dtype"),
                 nccl_tuple=row.get("nccl_tuple"),
@@ -1388,26 +1811,29 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     lines.append("## Comparison Rows")
     lines.append("")
     lines.append(
-        "| seq_len | batch_size | runtime_backend | moe_routing_mode | serial_status | serial_attn_ms | serial_moe_ms | serial_total_ms | overlap_status | overlap_attn_ms | overlap_moe_ms | overlap_total_ms | timed_speedup_vs_serial |"
+        "| seq_len | batch_size | num_layer_pairs | runtime_backend | moe_routing_mode | serial_status | serial_attn_ms | serial_moe_ms | serial_timed_wall_ms | serial_tokens_per_s | overlap_status | overlap_attn_ms | overlap_moe_ms | overlap_timed_wall_ms | overlap_tokens_per_s | timed_speedup_vs_serial |"
     )
     lines.append(
-        "|---:|---:|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|"
+        "|---:|---:|---:|---|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|"
     )
     for row in summary.get("comparison_rows", []):
         lines.append(
-            "| {seq_len} | {batch_size} | {runtime_backend} | {moe_routing_mode} | {serial_status} | {serial_attn_ms} | {serial_moe_ms} | {serial_total_ms} | {overlap_status} | {overlap_attn_ms} | {overlap_moe_ms} | {overlap_total_ms} | {timed_speedup_vs_serial} |".format(
+            "| {seq_len} | {batch_size} | {num_layer_pairs} | {runtime_backend} | {moe_routing_mode} | {serial_status} | {serial_attn_ms} | {serial_moe_ms} | {serial_timed_wall_ms} | {serial_tokens_per_s} | {overlap_status} | {overlap_attn_ms} | {overlap_moe_ms} | {overlap_timed_wall_ms} | {overlap_tokens_per_s} | {timed_speedup_vs_serial} |".format(
                 seq_len=row.get("seq_len"),
                 batch_size=row.get("batch_size"),
+                num_layer_pairs=row.get("num_layer_pairs"),
                 runtime_backend=row.get("runtime_backend"),
                 moe_routing_mode=row.get("moe_routing_mode"),
                 serial_status=row.get("serial_status"),
                 serial_attn_ms=row.get("serial_attn_ms"),
                 serial_moe_ms=row.get("serial_moe_ms"),
-                serial_total_ms=row.get("serial_total_ms"),
+                serial_timed_wall_ms=row.get("serial_timed_wall_ms"),
+                serial_tokens_per_s=row.get("serial_tokens_per_s"),
                 overlap_status=row.get("overlap_status"),
                 overlap_attn_ms=row.get("overlap_attn_ms"),
                 overlap_moe_ms=row.get("overlap_moe_ms"),
-                overlap_total_ms=row.get("overlap_total_ms"),
+                overlap_timed_wall_ms=row.get("overlap_timed_wall_ms"),
+                overlap_tokens_per_s=row.get("overlap_tokens_per_s"),
                 timed_speedup_vs_serial=row.get("timed_speedup_vs_serial"),
             )
         )
@@ -1442,7 +1868,9 @@ def render_matrix_summary_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_matrix_summary_markdown(output_dir: str | Path, summary: dict[str, Any]) -> Path:
+def write_matrix_summary_markdown(
+    output_dir: str | Path, summary: dict[str, Any]
+) -> Path:
     path = Path(output_dir) / "matrix_summary.md"
     _write_text_atomic(path, render_matrix_summary_markdown(summary))
     return path
