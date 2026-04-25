@@ -64,7 +64,9 @@ def _resolve_profiler_schedule(
     profiler_wait_iters: int | None,
     profiler_active_timed_iters: int | None,
 ) -> tuple[int, int]:
-    wait_iters = int(warmup_iters if profiler_wait_iters is None else profiler_wait_iters)
+    wait_iters = int(
+        warmup_iters if profiler_wait_iters is None else profiler_wait_iters
+    )
     if wait_iters < 0:
         raise ValueError("profiler_wait_iters must be >= 0")
 
@@ -73,7 +75,9 @@ def _resolve_profiler_schedule(
     return wait_iters, active_timed_iters
 
 
-def _timed_window_from_bounds(start_s: float | None, end_s: float | None) -> dict[str, float | None]:
+def _timed_window_from_bounds(
+    start_s: float | None, end_s: float | None
+) -> dict[str, float | None]:
     if start_s is None or end_s is None:
         return {"start_s": None, "end_s": None, "duration_ms": None}
     return {
@@ -95,14 +99,24 @@ def _enum_name(value: Any) -> str | None:
 def describe_attention_runtime(layer: Any, requested_backend: str) -> dict[str, Any]:
     config = getattr(layer, "config", None)
     self_attention = getattr(layer, "self_attention", None)
-    core_attention = getattr(self_attention, "core_attention", None) if self_attention is not None else None
+    core_attention = (
+        getattr(self_attention, "core_attention", None)
+        if self_attention is not None
+        else None
+    )
     return {
         "requested_backend": str(requested_backend),
-        "config_attention_backend": _enum_name(getattr(config, "attention_backend", None)),
+        "config_attention_backend": _enum_name(
+            getattr(config, "attention_backend", None)
+        ),
         "transformer_impl": getattr(config, "transformer_impl", None),
         "layer_class": type(layer).__name__,
-        "self_attention_class": type(self_attention).__name__ if self_attention is not None else None,
-        "core_attention_class": type(core_attention).__name__ if core_attention is not None else None,
+        "self_attention_class": type(self_attention).__name__
+        if self_attention is not None
+        else None,
+        "core_attention_class": type(core_attention).__name__
+        if core_attention is not None
+        else None,
         "nvte_backend_flags": {
             "flash": os.getenv("NVTE_FLASH_ATTN"),
             "fused": os.getenv("NVTE_FUSED_ATTN"),
@@ -119,6 +133,8 @@ def _run_iteration_schedule(
     *,
     execution_schedule: str,
     stage_role: str,
+    stage_label: str | None = None,
+    serial_phase_order: tuple[str, ...] | None = None,
     total_iters: int,
     warmup_iters: int,
     barrier_wait: Callable[[str, int], None],
@@ -130,15 +146,38 @@ def _run_iteration_schedule(
         raise ValueError(f"Unsupported execution_schedule: {execution_schedule}")
     if stage_role not in {"attn", "moe"}:
         raise ValueError(f"Unsupported stage_role: {stage_role}")
+    active_stage_label = str(stage_label or stage_role)
+    default_phase_order = (
+        ("attn", "moe")
+        if execution_schedule == "serial_lockstep"
+        else (active_stage_label,)
+    )
+    phase_order = tuple(serial_phase_order or default_phase_order)
+    if execution_schedule == "serial_lockstep":
+        if not phase_order:
+            raise ValueError("serial_phase_order must not be empty for serial_lockstep")
+        if active_stage_label not in phase_order:
+            raise ValueError(
+                f"serial_phase_order must contain the active stage label {active_stage_label!r}"
+            )
 
     stage_timed_start_s: float | None = None
     stage_timed_end_s: float | None = None
     schedule_timed_start_s: float | None = None
     schedule_timed_end_s: float | None = None
 
-    def _run_active_phase(phase_role: str, phase_name: str, iter_idx: int, is_timed: bool) -> None:
+    def _serial_barrier_name(phase_index: int, phase_count: int) -> str:
+        if phase_index >= phase_count - 1:
+            return "serial_end"
+        if phase_count == 2 and phase_index == 0:
+            return "serial_between"
+        return f"serial_between_{phase_index}"
+
+    def _run_active_phase(
+        phase_label: str, phase_name: str, iter_idx: int, is_timed: bool
+    ) -> None:
         nonlocal stage_timed_start_s, stage_timed_end_s
-        if stage_role != phase_role:
+        if active_stage_label != phase_label:
             return
         phase_start_s = now()
         run_forward(phase_name, iter_idx, is_timed)
@@ -155,14 +194,17 @@ def _run_iteration_schedule(
 
         if execution_schedule == "overlap":
             barrier_wait("overlap_start", iter_idx)
-            _run_active_phase(stage_role, stage_role, iter_idx, is_timed)
+            _run_active_phase(
+                active_stage_label, active_stage_label, iter_idx, is_timed
+            )
             barrier_wait("overlap_end", iter_idx)
         else:
             barrier_wait("serial_start", iter_idx)
-            _run_active_phase("attn", "attn", iter_idx, is_timed)
-            barrier_wait("serial_between", iter_idx)
-            _run_active_phase("moe", "moe", iter_idx, is_timed)
-            barrier_wait("serial_end", iter_idx)
+            for phase_index, phase_label in enumerate(phase_order):
+                _run_active_phase(phase_label, phase_label, iter_idx, is_timed)
+                barrier_wait(
+                    _serial_barrier_name(phase_index, len(phase_order)), iter_idx
+                )
 
         if is_timed:
             schedule_timed_end_s = now()
@@ -170,8 +212,12 @@ def _run_iteration_schedule(
             profiler_step(iter_idx)
 
     return {
-        "stage_timed_window_s": _timed_window_from_bounds(stage_timed_start_s, stage_timed_end_s),
-        "schedule_timed_window_s": _timed_window_from_bounds(schedule_timed_start_s, schedule_timed_end_s),
+        "stage_timed_window_s": _timed_window_from_bounds(
+            stage_timed_start_s, stage_timed_end_s
+        ),
+        "schedule_timed_window_s": _timed_window_from_bounds(
+            schedule_timed_start_s, schedule_timed_end_s
+        ),
     }
 
 
@@ -190,6 +236,8 @@ class RuntimeConfig:
     batch_size: int
     seed: int
     expert_model_parallel_size: int
+    stage_label: str | None = None
+    pair_index: int = 0
     green_ctx_attn_sms: int | None = None
     green_ctx_moe_sms: int | None = None
     num_experts: int | None = None
@@ -214,7 +262,9 @@ def _build_equal_token_routing_state(
     local_expert_indices: list[int],
 ) -> EqualTokenRoutingState:
     if hidden_states.ndim < 2:
-        raise RuntimeError("equal_tokens requires hidden_states with an explicit hidden dimension")
+        raise RuntimeError(
+            "equal_tokens requires hidden_states with an explicit hidden dimension"
+        )
     if int(num_experts) <= 0:
         raise RuntimeError("equal_tokens requires num_experts > 0")
     if int(top_k) <= 0:
@@ -223,14 +273,24 @@ def _build_equal_token_routing_state(
         raise RuntimeError("equal_tokens requires top_k <= num_experts")
     num_tokens = int(hidden_states.numel() // hidden_states.shape[-1])
     device = hidden_states.device
-    token_indices = torch.arange(num_tokens, device=device, dtype=torch.long).unsqueeze(1)
-    expert_offsets = torch.arange(int(top_k), device=device, dtype=torch.long).unsqueeze(0)
+    token_indices = torch.arange(num_tokens, device=device, dtype=torch.long).unsqueeze(
+        1
+    )
+    expert_offsets = torch.arange(
+        int(top_k), device=device, dtype=torch.long
+    ).unsqueeze(0)
     assigned_expert_ids = (token_indices + expert_offsets) % int(num_experts)
-    routing_map = torch.zeros((num_tokens, int(num_experts)), device=device, dtype=torch.bool)
+    routing_map = torch.zeros(
+        (num_tokens, int(num_experts)), device=device, dtype=torch.bool
+    )
     routing_map.scatter_(1, assigned_expert_ids, True)
-    probs = torch.zeros((num_tokens, int(num_experts)), device=device, dtype=hidden_states.dtype)
+    probs = torch.zeros(
+        (num_tokens, int(num_experts)), device=device, dtype=hidden_states.dtype
+    )
     probs.scatter_(1, assigned_expert_ids, 1.0 / float(top_k))
-    global_counts = torch.bincount(assigned_expert_ids.reshape(-1), minlength=int(num_experts)).to(dtype=torch.int64)
+    global_counts = torch.bincount(
+        assigned_expert_ids.reshape(-1), minlength=int(num_experts)
+    ).to(dtype=torch.int64)
     local_counts = torch.zeros_like(global_counts)
     if local_expert_indices:
         local_idx = torch.tensor(local_expert_indices, device=device, dtype=torch.long)
@@ -531,7 +591,9 @@ class MegatronSingleLayerRuntime:
         self.layer = self._resolve_decoder_layer(self.trainer.megatron_model)
         self.layer.eval()
         self._validate_moe_routing_mode_support()
-        self.attention_runtime = describe_attention_runtime(self.layer, self.config.attention_backend)
+        self.attention_runtime = describe_attention_runtime(
+            self.layer, self.config.attention_backend
+        )
         hidden_size = int(self.layer.config.hidden_size)
         self.hidden_states = self._build_hidden_states(hidden_size)
         self.attention_mask = self._build_attention_mask()
@@ -598,7 +660,9 @@ class MegatronSingleLayerRuntime:
             self.execution_stream = torch.cuda.current_stream(device=self.device)
             return
         if self.config.runtime_backend != "mps_green_ctx":
-            raise ValueError(f"Unsupported runtime_backend: {self.config.runtime_backend}")
+            raise ValueError(
+                f"Unsupported runtime_backend: {self.config.runtime_backend}"
+            )
 
         requested_sms = self._requested_green_ctx_sms()
         if requested_sms is None:
@@ -607,7 +671,9 @@ class MegatronSingleLayerRuntime:
             )
 
         try:
-            stream_owner = create_green_context_stream(device_id=int(self.device.index or 0), requested_sms=requested_sms)
+            stream_owner = create_green_context_stream(
+                device_id=int(self.device.index or 0), requested_sms=requested_sms
+            )
         except GreenContextError as exc:
             raise RuntimeError(f"{exc.code}: {exc.message}") from exc
         stream_owner.wait_for_current_stream()
@@ -627,7 +693,9 @@ class MegatronSingleLayerRuntime:
             "expert_model_parallel_size": int(self.config.expert_model_parallel_size),
             "attention_backend": str(self.config.attention_backend),
             "megatron_moe_grouped_gemm": True if self.config.moe_grouped_gemm else None,
-            "megatron_moe_token_dispatcher_type": str(self.config.moe_token_dispatcher_type),
+            "megatron_moe_token_dispatcher_type": str(
+                self.config.moe_token_dispatcher_type
+            ),
             "megatron_overlap_moe_expert_parallel_comm": (
                 True if self.config.overlap_moe_expert_parallel_comm else None
             ),
@@ -658,26 +726,39 @@ class MegatronSingleLayerRuntime:
         if self.config.moe_routing_mode == "normal" or self.config.stage_role != "moe":
             return
         if self.config.moe_routing_mode != "equal_tokens":
-            raise RuntimeError(f"Unsupported moe_routing_mode={self.config.moe_routing_mode}")
+            raise RuntimeError(
+                f"Unsupported moe_routing_mode={self.config.moe_routing_mode}"
+            )
         if self.config.num_experts is None or int(self.config.num_experts) <= 0:
             raise RuntimeError("equal_tokens requires --num-experts > 0")
-        if int(self.config.num_experts) % int(self.config.expert_model_parallel_size) != 0:
+        if (
+            int(self.config.num_experts) % int(self.config.expert_model_parallel_size)
+            != 0
+        ):
             raise RuntimeError(
                 "equal_tokens requires num_experts to be divisible by expert_model_parallel_size"
             )
         mlp = getattr(self.layer, "mlp", None)
         router = getattr(mlp, "router", None) if mlp is not None else None
-        token_dispatcher = getattr(mlp, "token_dispatcher", None) if mlp is not None else None
+        token_dispatcher = (
+            getattr(mlp, "token_dispatcher", None) if mlp is not None else None
+        )
         if mlp is None or router is None or token_dispatcher is None:
-            raise RuntimeError("equal_tokens requires layer.mlp.router and layer.mlp.token_dispatcher")
-        router_topk = getattr(getattr(self.layer, "config", None), "moe_router_topk", None)
+            raise RuntimeError(
+                "equal_tokens requires layer.mlp.router and layer.mlp.token_dispatcher"
+            )
+        router_topk = getattr(
+            getattr(self.layer, "config", None), "moe_router_topk", None
+        )
         if int(router_topk or 0) <= 0:
             raise RuntimeError("equal_tokens requires an effective moe_router_topk > 0")
         if int(router_topk or 0) > int(self.config.num_experts):
             raise RuntimeError("equal_tokens requires moe_router_topk <= num_experts")
         local_expert_indices = getattr(token_dispatcher, "local_expert_indices", None)
         if not isinstance(local_expert_indices, list) or not local_expert_indices:
-            raise RuntimeError("equal_tokens requires token_dispatcher.local_expert_indices")
+            raise RuntimeError(
+                "equal_tokens requires token_dispatcher.local_expert_indices"
+            )
 
     def _resolve_decoder_layer(self, megatron_model):
         model = megatron_model
@@ -708,7 +789,9 @@ class MegatronSingleLayerRuntime:
     def _build_attention_mask(self) -> torch.Tensor:
         seq_len = int(self.config.seq_len)
         batch = int(self.config.batch_size)
-        mask = ~torch.tril(torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool))
+        mask = ~torch.tril(
+            torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool)
+        )
         return mask.view(1, 1, seq_len, seq_len).expand(batch, 1, seq_len, seq_len)
 
     def run_stage(
@@ -717,6 +800,7 @@ class MegatronSingleLayerRuntime:
         warmup_iters: int,
         timed_iters: int,
         execution_schedule: str = "overlap",
+        serial_phase_order: tuple[str, ...] | None = None,
         iteration_barrier: Any | None = None,
         abort_event: Any | None = None,
         barrier_timeout_s: float | None = None,
@@ -725,7 +809,11 @@ class MegatronSingleLayerRuntime:
         profiler_wait_iters: int | None = None,
         profiler_active_timed_iters: int | None = None,
     ) -> dict[str, Any]:
-        if self.layer is None or self.hidden_states is None or self.attention_mask is None:
+        if (
+            self.layer is None
+            or self.hidden_states is None
+            or self.attention_mask is None
+        ):
             self.initialize()
 
         assert self.layer is not None
@@ -804,7 +892,9 @@ class MegatronSingleLayerRuntime:
                         f"Schedule aborted after {phase_name} at iter {iter_idx}"
                     )
 
-            def _run_forward_phase(_phase_name: str, iter_idx: int, is_timed: bool) -> None:
+            def _run_forward_phase(
+                _phase_name: str, iter_idx: int, is_timed: bool
+            ) -> None:
                 nonlocal first_nonfinite, output_tensor, timed_start_s, timed_end_s
                 nonlocal stable_tokens_per_expert, local_tokens_per_expert
                 if dist.is_available() and dist.is_initialized():
@@ -818,7 +908,9 @@ class MegatronSingleLayerRuntime:
                 start_event.record(active_stream)
                 enqueue_start = time.perf_counter()
                 record_ctx = (
-                    torch.profiler.record_function(f"{self.config.stage_role}.iter_{iter_idx:04d}")
+                    torch.profiler.record_function(
+                        f"{self.config.stage_role}.iter_{iter_idx:04d}"
+                    )
                     if profiler is not None
                     else nullcontext()
                 )
@@ -853,7 +945,11 @@ class MegatronSingleLayerRuntime:
                     enqueue_windows.append((enqueue_start, enqueue_end))
                     timed_end_s = step_end
 
-                if first_nonfinite is None and output_tensor is not None and torch.is_floating_point(output_tensor):
+                if (
+                    first_nonfinite is None
+                    and output_tensor is not None
+                    and torch.is_floating_point(output_tensor)
+                ):
                     if not torch.isfinite(output_tensor).all():
                         first_nonfinite = {
                             "module": f"{self.config.stage_role}_layer",
@@ -865,11 +961,15 @@ class MegatronSingleLayerRuntime:
             schedule_windows = _run_iteration_schedule(
                 execution_schedule=execution_schedule,
                 stage_role=self.config.stage_role,
+                stage_label=self.config.stage_label,
+                serial_phase_order=serial_phase_order,
                 total_iters=total_iters,
                 warmup_iters=int(warmup_iters),
                 barrier_wait=_wait_for_schedule_phase,
                 run_forward=_run_forward_phase,
-                profiler_step=(lambda _iter_idx: profiler.step()) if profiler is not None else None,
+                profiler_step=(lambda _iter_idx: profiler.step())
+                if profiler is not None
+                else None,
             )
         finally:
             if profiler is not None:
@@ -886,6 +986,8 @@ class MegatronSingleLayerRuntime:
         return {
             "status": "ok",
             "stage_role": self.config.stage_role,
+            "stage_label": str(self.config.stage_label or self.config.stage_role),
+            "pair_index": int(self.config.pair_index),
             "runtime_backend": self.config.runtime_backend,
             "attention_backend": self.config.attention_backend,
             "attention_impl": self.attention_runtime,

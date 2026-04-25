@@ -142,8 +142,8 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _worker_result_path(worker_result_dir: Path, role: str, rank: int) -> Path:
-    return worker_result_dir / f"{role}_rank{rank}.json"
+def _worker_result_path(worker_result_dir: Path, stage_label: str, rank: int) -> Path:
+    return worker_result_dir / f"{stage_label}_rank{rank}.json"
 
 
 def _load_worker_results(worker_result_dir: Path) -> list[dict[str, Any]]:
@@ -185,7 +185,9 @@ class MultiGpuMPSContext:
         active_thread_pct: int | None = None,
     ):
         self.gpu_ids = gpu_ids
-        self.pipe_dir = pipe_dir or f"/tmp/mm-step7-mps-pipe-{os.getuid()}-{os.getpid()}"
+        self.pipe_dir = (
+            pipe_dir or f"/tmp/mm-step7-mps-pipe-{os.getuid()}-{os.getpid()}"
+        )
         self.log_dir = log_dir or f"/tmp/mm-step7-mps-log-{os.getuid()}-{os.getpid()}"
         self.active_thread_pct = active_thread_pct
         self._saved_env: dict[str, str | None] = {}
@@ -203,7 +205,9 @@ class MultiGpuMPSContext:
             "CUDA_MPS_LOG_DIRECTORY": self.log_dir,
         }
         if self.active_thread_pct is not None:
-            env_updates["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(self.active_thread_pct)
+            env_updates["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                self.active_thread_pct
+            )
 
         for key, value in env_updates.items():
             self._saved_env[key] = os.environ.get(key)
@@ -285,8 +289,17 @@ class CaseDescriptor:
     baseline_key: str
 
 
+def _validate_num_layer_pairs(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--num-layer-pairs must be > 0")
+    return parsed
+
+
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Megatron single-layer attention/MoE overlap matrix")
+    parser = argparse.ArgumentParser(
+        description="Megatron single-layer attention/MoE overlap matrix"
+    )
     parser.add_argument("--model-name", type=str, required=True)
     parser.add_argument("--model-type", type=str, required=True)
     parser.add_argument("--attn-gpu-ids", type=str, required=True)
@@ -310,7 +323,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nccl-max-nchannels", type=int, default=None)
     parser.add_argument("--nccl-max-ctas", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
-    parser.add_argument("--moe-routing-mode", choices=["normal", "equal_tokens"], default="normal")
+    parser.add_argument("--num-layer-pairs", type=_validate_num_layer_pairs, default=1)
+    parser.add_argument(
+        "--moe-routing-mode", choices=["normal", "equal_tokens"], default="normal"
+    )
     parser.add_argument(
         "--moe-token-dispatcher-type",
         choices=["allgather", "alltoall", "flex"],
@@ -336,7 +352,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--capture-nsys", choices=["on", "off"], default="off")
     parser.add_argument("--nsys-bin", type=str, default="nsys")
-    parser.add_argument("--capture-torch-profiler", choices=["on", "off"], default="off")
+    parser.add_argument(
+        "--capture-torch-profiler", choices=["on", "off"], default="off"
+    )
     parser.add_argument("--torch-compile", choices=["on", "off"], default="off")
     parser.add_argument(
         "--torch-profiler-selection",
@@ -351,12 +369,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--torch-profiler-active-iters", type=int, default=5)
     parser.add_argument("--torch-profiler-recovery", action="store_true")
-    parser.add_argument("--torch-profiler-trace-dir", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--torch-profiler-trace-dir", type=str, default=None, help=argparse.SUPPRESS
+    )
     parser.add_argument("--single-mode", choices=["serial", "overlap"], default=None)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--rerun-existing", action="store_true")
-    parser.add_argument("--strict-schema", dest="strict_schema", action="store_true", default=True)
-    parser.add_argument("--no-strict-schema", dest="strict_schema", action="store_false")
+    parser.add_argument(
+        "--strict-schema", dest="strict_schema", action="store_true", default=True
+    )
+    parser.add_argument(
+        "--no-strict-schema", dest="strict_schema", action="store_false"
+    )
     parser.add_argument("--mps-active-thread-pct", type=int, default=None)
     parser.add_argument(
         "--attn-mps-active-thread-pct",
@@ -386,7 +410,9 @@ def _resolve_runtime_backends(args: argparse.Namespace) -> list[str]:
 
 def _resolved_green_ctx_sms(args: argparse.Namespace) -> dict[str, int | None]:
     return {
-        "attn": None if args.green_ctx_attn_sms is None else int(args.green_ctx_attn_sms),
+        "attn": None
+        if args.green_ctx_attn_sms is None
+        else int(args.green_ctx_attn_sms),
         "moe": None if args.green_ctx_moe_sms is None else int(args.green_ctx_moe_sms),
     }
 
@@ -394,7 +420,11 @@ def _resolved_green_ctx_sms(args: argparse.Namespace) -> dict[str, int | None]:
 def _effective_torch_profiler_wait_iters(args: argparse.Namespace) -> int | None:
     if args.capture_torch_profiler != "on":
         return None
-    return int(args.warmup_iters if args.torch_profiler_wait_iters is None else args.torch_profiler_wait_iters)
+    return int(
+        args.warmup_iters
+        if args.torch_profiler_wait_iters is None
+        else args.torch_profiler_wait_iters
+    )
 
 
 def _profiler_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -414,7 +444,10 @@ def _profiler_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _device_sm_signature(device_total_sms: dict[int, int]) -> dict[str, int]:
-    return {str(device_id): int(device_total_sms[device_id]) for device_id in sorted(device_total_sms)}
+    return {
+        str(device_id): int(device_total_sms[device_id])
+        for device_id in sorted(device_total_sms)
+    }
 
 
 def _run_config_identity_fields(
@@ -432,6 +465,7 @@ def _run_config_identity_fields(
     torch_profiler_active_iters: int | None,
     moe_routing_mode: str,
     torch_compile: str,
+    num_layer_pairs: int,
 ) -> dict[str, Any]:
     return {
         "seq_lens": [int(value) for value in seq_lens],
@@ -450,6 +484,7 @@ def _run_config_identity_fields(
         "torch_profiler_active_iters": torch_profiler_active_iters,
         "moe_routing_mode": normalize_moe_routing_mode(moe_routing_mode),
         "torch_compile": normalize_torch_compile_requested(torch_compile),
+        "num_layer_pairs": int(num_layer_pairs),
     }
 
 
@@ -482,6 +517,7 @@ def _build_run_config(
         torch_profiler_active_iters=profiler_config["active_iters"],
         moe_routing_mode=args.moe_routing_mode,
         torch_compile=args.torch_compile,
+        num_layer_pairs=int(getattr(args, "num_layer_pairs", 1) or 1),
     )
     run_config = {
         "model_name": args.model_name,
@@ -489,11 +525,14 @@ def _build_run_config(
         "topology": topology,
         **identity_fields,
         "config_fingerprint": build_config_fingerprint(identity_fields),
-        "modes": [args.single_mode] if args.single_mode is not None else ["serial", "overlap"],
+        "modes": [args.single_mode]
+        if args.single_mode is not None
+        else ["serial", "overlap"],
         "warmup_iters": args.warmup_iters,
         "timed_iters": args.timed_iters,
         "worker_timeout_s": args.worker_timeout_s,
         "num_experts": args.num_experts,
+        "num_layer_pairs": int(getattr(args, "num_layer_pairs", 1) or 1),
         "moe_routing_mode": normalize_moe_routing_mode(args.moe_routing_mode),
         "mps_active_thread_pct": args.mps_active_thread_pct,
         "attn_mps_active_thread_pct": args.attn_mps_active_thread_pct,
@@ -514,7 +553,9 @@ def _build_run_config(
     return run_config
 
 
-def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, Any]) -> None:
+def _ensure_output_dir_identity_matches(
+    output_dir: Path, run_config: dict[str, Any]
+) -> None:
     summary_path = output_dir / "matrix_summary.json"
     cases_dir = output_dir / "cases"
     if not summary_path.exists():
@@ -542,6 +583,7 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "torch_profiler_active_iters",
             "moe_routing_mode",
             "torch_compile",
+            "num_layer_pairs",
             "config_fingerprint",
         )
     }
@@ -561,6 +603,7 @@ def _ensure_output_dir_identity_matches(output_dir: Path, run_config: dict[str, 
             "torch_profiler_active_iters",
             "moe_routing_mode",
             "torch_compile",
+            "num_layer_pairs",
             "config_fingerprint",
         )
     }
@@ -580,9 +623,13 @@ def _validate_topology(
 ) -> list[str]:
     errors: list[str] = []
     if len(attn_gpu_ids) != attn_dp_size:
-        errors.append(f"len(attn_gpu_ids) ({len(attn_gpu_ids)}) must equal attn_dp_size ({attn_dp_size})")
+        errors.append(
+            f"len(attn_gpu_ids) ({len(attn_gpu_ids)}) must equal attn_dp_size ({attn_dp_size})"
+        )
     if len(moe_gpu_ids) != moe_ep_size:
-        errors.append(f"len(moe_gpu_ids) ({len(moe_gpu_ids)}) must equal moe_ep_size ({moe_ep_size})")
+        errors.append(
+            f"len(moe_gpu_ids) ({len(moe_gpu_ids)}) must equal moe_ep_size ({moe_ep_size})"
+        )
     if not set(attn_gpu_ids).issubset(set(moe_gpu_ids)):
         errors.append("attn_gpu_ids must be a subset of moe_gpu_ids")
     for gpu_id in sorted(set(attn_gpu_ids + moe_gpu_ids)):
@@ -655,7 +702,9 @@ def _preflight_errors(
         for role in ("attn", "moe"):
             requested = green_ctx_sms.get(role)
             if requested is None:
-                errors.append(f"--green-ctx-{role}-sms is required when mps_green_ctx is selected")
+                errors.append(
+                    f"--green-ctx-{role}-sms is required when mps_green_ctx is selected"
+                )
             elif requested <= 0:
                 errors.append(f"--green-ctx-{role}-sms must be > 0, got {requested}")
 
@@ -664,7 +713,9 @@ def _preflight_errors(
                 try:
                     device_total_sms[gpu_id] = int(get_device_total_sms(gpu_id))
                 except Exception as exc:
-                    errors.append(f"Green Context total-SM query failed for gpu-id {gpu_id}: {exc}")
+                    errors.append(
+                        f"Green Context total-SM query failed for gpu-id {gpu_id}: {exc}"
+                    )
 
         unique_total_sms = sorted(set(device_total_sms.values()))
         if len(unique_total_sms) > 1:
@@ -694,6 +745,7 @@ def _baseline_key(
     moe_routing_mode: str,
     dtype: str,
     nccl_tuple: tuple[int, int, int] | None,
+    num_layer_pairs: int,
 ) -> str:
     green_ctx_fragment = (
         f"gc={int(green_ctx_attn_sms or 0)},{int(green_ctx_moe_sms or 0)}"
@@ -704,6 +756,7 @@ def _baseline_key(
         f"seq={seq_len}|batch={batch_size}|backend={runtime_backend}|{green_ctx_fragment}|"
         f"routing={normalize_moe_routing_mode(moe_routing_mode)}|"
         f"dtype={normalize_dtype_name(dtype)}|"
+        f"pairs={int(num_layer_pairs)}|"
         f"nccl={canonical_nccl_tuple(nccl_tuple)}"
     )
 
@@ -723,6 +776,7 @@ def _build_case_descriptors(
     attn_gpu_ids: list[int],
     moe_gpu_ids: list[int],
     moe_routing_mode: str,
+    num_layer_pairs: int,
 ) -> list[CaseDescriptor]:
     cases: list[CaseDescriptor] = []
     for seq_len in seq_lens:
@@ -740,6 +794,7 @@ def _build_case_descriptors(
                                 moe_routing_mode,
                                 dtype,
                                 nccl_tuple,
+                                num_layer_pairs,
                             )
                             case_id = build_case_id(
                                 mode=mode,
@@ -756,6 +811,7 @@ def _build_case_descriptors(
                                 moe_gpu_ids=moe_gpu_ids,
                                 nccl_tuple=nccl_tuple,
                                 moe_routing_mode=moe_routing_mode,
+                                num_layer_pairs=num_layer_pairs,
                             )
                             cases.append(
                                 CaseDescriptor(
@@ -792,6 +848,8 @@ def _nccl_meta(nccl_tuple: tuple[int, int, int] | None) -> dict[str, Any]:
 def _empty_stage_result(
     *,
     role: str,
+    stage_label: str,
+    pair_index: int,
     status: str,
     error: dict[str, Any] | None,
     runtime: dict[str, Any] | None = None,
@@ -799,10 +857,13 @@ def _empty_stage_result(
 ) -> dict[str, Any]:
     return {
         "status": status,
+        "role": role,
+        "stage_label": stage_label,
+        "pair_index": int(pair_index),
         "error": error
         or {
             "code": status,
-            "message": f"No results for role={role}",
+            "message": f"No results for stage_label={stage_label}",
             "traceback": None,
         },
         "timing_ms": None,
@@ -865,10 +926,14 @@ def _aggregate_role_torch_compile(
     return {"requested": requested, "status": status}, len(successful_statuses) > 1
 
 
-def _select_root_cause_worker_result(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _select_root_cause_worker_result(
+    results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
     priorities = [
         lambda item: item.get("failure_origin") is True and item.get("status") == "oom",
-        lambda item: item.get("failure_origin") is True and item.get("status") == "runtime_error",
+        lambda item: (
+            item.get("failure_origin") is True and item.get("status") == "runtime_error"
+        ),
         lambda item: item.get("status") == "oom",
         lambda item: item.get("status") == "runtime_error",
         lambda item: item.get("status") == "timeout",
@@ -892,7 +957,9 @@ def _normalize_launch_failure(
         status = str(root_cause.get("status") or "runtime_error")
         error = root_cause.get("error") or {
             "code": status,
-            "message": f"Worker {root_cause.get('role')} rank {root_cause.get('rank')} failed",
+            "message": (
+                f"Worker {root_cause.get('stage_label') or root_cause.get('role')} rank {root_cause.get('rank')} failed"
+            ),
             "traceback": None,
         }
         return {"status": status, "error": error}
@@ -911,6 +978,8 @@ def _normalize_launch_failure(
 def _worker_main(
     *,
     role: str,
+    stage_label: str,
+    pair_index: int,
     rank: int,
     world_size: int,
     gpu_id: int,
@@ -937,6 +1006,7 @@ def _worker_main(
     mps_env: dict[str, str],
     attn_mps_active_thread_pct: int | None,
     execution_schedule: str,
+    serial_phase_order: tuple[str, ...] | None,
     iteration_barrier: Any | None,
     abort_event: Any | None,
     barrier_timeout_s: float,
@@ -975,7 +1045,9 @@ def _worker_main(
             if attn_mps_active_thread_pct is None:
                 os.environ.pop("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", None)
             else:
-                os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(attn_mps_active_thread_pct)
+                os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                    attn_mps_active_thread_pct
+                )
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         os.environ["LOCAL_RANK"] = "0"
         os.environ["RANK"] = str(rank)
@@ -1006,6 +1078,8 @@ def _worker_main(
                 batch_size=batch_size,
                 seed=seed,
                 expert_model_parallel_size=moe_ep_size if role == "moe" else 1,
+                stage_label=stage_label,
+                pair_index=pair_index,
                 green_ctx_attn_sms=green_ctx_attn_sms,
                 green_ctx_moe_sms=green_ctx_moe_sms,
                 num_experts=num_experts,
@@ -1017,11 +1091,14 @@ def _worker_main(
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
             execution_schedule=execution_schedule,
+            serial_phase_order=serial_phase_order,
             iteration_barrier=iteration_barrier,
             abort_event=abort_event,
             barrier_timeout_s=barrier_timeout_s,
-            profiler_trace_dir=str(Path(profiler_trace_root)) if profiler_trace_root is not None else None,
-            profiler_worker_name=f"{role}_rank{rank}_gpu{gpu_id}",
+            profiler_trace_dir=str(Path(profiler_trace_root))
+            if profiler_trace_root is not None
+            else None,
+            profiler_worker_name=f"{stage_label}_rank{rank}_gpu{gpu_id}",
             profiler_wait_iters=profiler_wait_iters,
             profiler_active_timed_iters=profiler_active_timed_iters,
         )
@@ -1063,9 +1140,11 @@ def _worker_main(
                 pass
         cleanup_distributed_state()
         write_json_atomic(
-            _worker_result_path(Path(worker_result_dir), role, rank),
+            _worker_result_path(Path(worker_result_dir), stage_label, rank),
             {
                 "role": role,
+                "stage_label": stage_label,
+                "pair_index": int(pair_index),
                 "rank": rank,
                 "status": status,
                 "failure_origin": failure_origin,
@@ -1104,6 +1183,8 @@ def _launch_workers(
                     target=_worker_main,
                     kwargs={
                         "role": spec["role"],
+                        "stage_label": spec["stage_label"],
+                        "pair_index": spec["pair_index"],
                         "rank": rank,
                         "world_size": spec["world_size"],
                         "gpu_id": gpu_id,
@@ -1123,21 +1204,28 @@ def _launch_workers(
                         "moe_ep_size": common_config["moe_ep_size"],
                         "num_experts": common_config["num_experts"],
                         "moe_grouped_gemm": common_config["moe_grouped_gemm"],
-                        "moe_token_dispatcher_type": common_config["moe_token_dispatcher_type"],
+                        "moe_token_dispatcher_type": common_config[
+                            "moe_token_dispatcher_type"
+                        ],
                         "overlap_moe_expert_parallel_comm": common_config[
                             "overlap_moe_expert_parallel_comm"
                         ],
                         "attention_backend": common_config["attention_backend"],
                         "nccl_tuple": common_config["nccl_tuple"],
                         "mps_env": mps_env,
-                        "attn_mps_active_thread_pct": common_config["attn_mps_active_thread_pct"],
+                        "attn_mps_active_thread_pct": common_config[
+                            "attn_mps_active_thread_pct"
+                        ],
                         "execution_schedule": common_config["execution_schedule"],
+                        "serial_phase_order": common_config.get("serial_phase_order"),
                         "iteration_barrier": iteration_barrier,
                         "abort_event": abort_event,
                         "barrier_timeout_s": timeout_s,
                         "profiler_trace_root": common_config.get("profiler_trace_root"),
                         "profiler_wait_iters": common_config.get("profiler_wait_iters"),
-                        "profiler_active_timed_iters": common_config.get("profiler_active_timed_iters"),
+                        "profiler_active_timed_iters": common_config.get(
+                            "profiler_active_timed_iters"
+                        ),
                         "worker_result_dir": str(worker_result_dir),
                         "moe_routing_mode": common_config["moe_routing_mode"],
                         "torch_compile_enabled": common_config.get("torch_compile_enabled", False),
@@ -1156,7 +1244,9 @@ def _launch_workers(
             time.sleep(0.1)
 
         results = _load_worker_results(worker_result_dir)
-        timed_out = len(results) < expected and any(process.is_alive() for process in processes)
+        timed_out = len(results) < expected and any(
+            process.is_alive() for process in processes
+        )
         if timed_out:
             abort_event.set()
             if iteration_barrier is not None:
@@ -1201,7 +1291,7 @@ def _launch_workers(
 
 
 def _aggregate_stage_results(
-    role: str,
+    stage_spec: dict[str, Any],
     results: list[dict[str, Any]],
     *,
     expected_world_size: int | None = None,
@@ -1209,102 +1299,138 @@ def _aggregate_stage_results(
     fallback_error: dict[str, Any] | None = None,
     torch_compile_requested: str = "off",
 ) -> dict[str, Any]:
-    role_results = sorted((item for item in results if item.get("role") == role), key=lambda item: item["rank"])
-    role_runtime = {
-        "requested_sms_by_rank": [((item.get("runtime") or {}).get("requested_sms")) for item in role_results],
-        "granted_sms_by_rank": [((item.get("runtime") or {}).get("granted_sms")) for item in role_results],
-        "device_total_sms_by_rank": [((item.get("runtime") or {}).get("device_total_sms")) for item in role_results],
+    stage_label = str(stage_spec["stage_label"])
+    stage_kind = str(stage_spec["role"])
+    pair_index = int(stage_spec["pair_index"])
+    stage_results = sorted(
+        (
+            item
+            for item in results
+            if item.get("stage_label") == stage_label
+            or (
+                item.get("stage_label") is None
+                and item.get("role") == stage_kind
+                and pair_index == 0
+            )
+        ),
+        key=lambda item: item["rank"],
+    )
+    stage_runtime = {
+        "requested_sms_by_rank": [
+            ((item.get("runtime") or {}).get("requested_sms")) for item in stage_results
+        ],
+        "granted_sms_by_rank": [
+            ((item.get("runtime") or {}).get("granted_sms")) for item in stage_results
+        ],
+        "device_total_sms_by_rank": [
+            ((item.get("runtime") or {}).get("device_total_sms"))
+            for item in stage_results
+        ],
     }
-    if not role_results:
+    if not stage_results:
         role_torch_compile, _ = _aggregate_role_torch_compile(
-            role_results,
+            stage_results,
             torch_compile_requested=torch_compile_requested,
             aggregated_error_code=(fallback_error or {}).get("code"),
         )
         return _empty_stage_result(
-            role=role,
+            role=stage_kind,
+            stage_label=stage_label,
+            pair_index=pair_index,
             status=fallback_status or "runtime_error",
             error=fallback_error,
             torch_compile=role_torch_compile,
         )
 
-    if expected_world_size is not None and len(role_results) < int(expected_world_size):
-        failing = _select_root_cause_worker_result(role_results)
+    if expected_world_size is not None and len(stage_results) < int(
+        expected_world_size
+    ):
+        failing = _select_root_cause_worker_result(stage_results)
         if failing is not None:
             status = str(failing.get("status") or "runtime_error")
             error = failing.get("error") or {
                 "code": status,
-                "message": f"{role} rank {failing.get('rank')} failed",
+                "message": f"{stage_label} rank {failing.get('rank')} failed",
                 "traceback": None,
             }
             role_torch_compile, _ = _aggregate_role_torch_compile(
-                role_results,
+                stage_results,
                 torch_compile_requested=torch_compile_requested,
                 aggregated_error_code=error.get("code"),
             )
             return _empty_stage_result(
-                role=role,
+                role=stage_kind,
+                stage_label=stage_label,
+                pair_index=pair_index,
                 status=status,
                 error=error,
-                runtime=role_runtime,
+                runtime=stage_runtime,
                 torch_compile=role_torch_compile,
             )
         role_torch_compile, _ = _aggregate_role_torch_compile(
-            role_results,
+            stage_results,
             torch_compile_requested=torch_compile_requested,
             aggregated_error_code=(fallback_error or {}).get("code"),
         )
         return _empty_stage_result(
-            role=role,
+            role=stage_kind,
+            stage_label=stage_label,
+            pair_index=pair_index,
             status=fallback_status or "runtime_error",
             error=fallback_error,
-            runtime=role_runtime,
+            runtime=stage_runtime,
             torch_compile=role_torch_compile,
         )
 
-    failing = _select_root_cause_worker_result(role_results)
+    failing = _select_root_cause_worker_result(stage_results)
     if failing is not None:
         status = str(failing.get("status") or "runtime_error")
         error = failing.get("error") or {
             "code": status,
-            "message": f"{role} rank {failing.get('rank')} failed",
+            "message": f"{stage_label} rank {failing.get('rank')} failed",
             "traceback": None,
         }
         role_torch_compile, _ = _aggregate_role_torch_compile(
-            role_results,
+            stage_results,
             torch_compile_requested=torch_compile_requested,
             aggregated_error_code=error.get("code"),
         )
         return _empty_stage_result(
-            role=role,
+            role=stage_kind,
+            stage_label=stage_label,
+            pair_index=pair_index,
             status=status,
             error=error,
-            runtime=role_runtime,
+            runtime=stage_runtime,
             torch_compile=role_torch_compile,
         )
 
     role_torch_compile, mixed_successful_compile_statuses = _aggregate_role_torch_compile(
-        role_results,
+        stage_results,
         torch_compile_requested=torch_compile_requested,
     )
     if mixed_successful_compile_statuses:
         return _empty_stage_result(
-            role=role,
+            role=stage_kind,
+            stage_label=stage_label,
+            pair_index=pair_index,
             status="runtime_error",
             error={
                 "code": "torch_compile_status_mismatch",
-                "message": f"{role} workers reported mixed torch compile statuses",
+                "message": f"{stage_label} workers reported mixed torch compile statuses",
                 "traceback": None,
             },
-            runtime=role_runtime,
+            runtime=stage_runtime,
             torch_compile=role_torch_compile,
         )
 
-    timed_window = _collapse_timed_window_s([item.get("timed_window_s") for item in role_results])
-    rank0 = role_results[0]
+    timed_window = _collapse_timed_window_s(
+        [item.get("timed_window_s") for item in stage_results]
+    )
+    rank0 = stage_results[0]
     first_nonfinite = None
     all_finite = True
-    for result in role_results:
+    for result in stage_results:
         finite = result.get("finite", {})
         if not finite.get("all_finite", False):
             all_finite = False
@@ -1313,6 +1439,9 @@ def _aggregate_stage_results(
 
     return {
         "status": "ok",
+        "role": stage_kind,
+        "stage_label": stage_label,
+        "pair_index": pair_index,
         "error": {"code": None, "message": None, "traceback": None},
         "attention_backend": rank0.get("attention_backend"),
         "attention_impl": rank0.get("attention_impl"),
@@ -1320,7 +1449,9 @@ def _aggregate_stage_results(
         "moe_routing_mode": rank0.get("moe_routing_mode", "normal"),
         "moe_grouped_gemm": rank0.get("moe_grouped_gemm"),
         "moe_token_dispatcher_type": rank0.get("moe_token_dispatcher_type"),
-        "overlap_moe_expert_parallel_comm": rank0.get("overlap_moe_expert_parallel_comm"),
+        "overlap_moe_expert_parallel_comm": rank0.get(
+            "overlap_moe_expert_parallel_comm"
+        ),
         "timing_ms": {
             "cuda": (rank0.get("timing_ms") or {}).get("cuda"),
             "step_total": (rank0.get("timing_ms") or {}).get("step_total"),
@@ -1330,35 +1461,131 @@ def _aggregate_stage_results(
         "enqueue_windows": rank0.get("enqueue_windows", []),
         "output_signature": rank0.get("output_signature"),
         "finite": {"all_finite": all_finite, "first_nonfinite": first_nonfinite},
-        "runtime": role_runtime,
+        "runtime": stage_runtime,
         "tokens_per_expert": rank0.get("tokens_per_expert"),
         "local_tokens_per_expert_by_rank": [
-            item.get("local_tokens_per_expert") for item in role_results if item.get("local_tokens_per_expert") is not None
+            item.get("local_tokens_per_expert")
+            for item in stage_results
+            if item.get("local_tokens_per_expert") is not None
         ],
     }
 
 
-def _stage_specs(attn_gpu_ids: list[int], moe_gpu_ids: list[int]) -> tuple[dict[str, Any], dict[str, Any]]:
-    attn_port = _find_free_port()
-    moe_port = _find_free_port()
-    while moe_port == attn_port:
-        moe_port = _find_free_port()
-    attn_spec = {
-        "role": "attn",
-        "gpu_ids": attn_gpu_ids,
-        "world_size": len(attn_gpu_ids),
-        "master_port": attn_port,
-    }
-    moe_spec = {
-        "role": "moe",
-        "gpu_ids": moe_gpu_ids,
-        "world_size": len(moe_gpu_ids),
-        "master_port": moe_port,
-    }
-    return attn_spec, moe_spec
+def _stage_label(stage_kind: str, pair_index: int) -> str:
+    return f"{stage_kind}_{pair_index}"
 
 
-def _collapse_timed_window_s(windows: list[dict[str, Any] | None]) -> dict[str, float | None]:
+def _serial_phase_order(num_layer_pairs: int) -> tuple[str, ...]:
+    phase_order: list[str] = []
+    for pair_index in range(int(num_layer_pairs)):
+        phase_order.extend(
+            (_stage_label("attn", pair_index), _stage_label("moe", pair_index))
+        )
+    return tuple(phase_order)
+
+
+def _stage_specs(
+    attn_gpu_ids: list[int], moe_gpu_ids: list[int], num_layer_pairs: int
+) -> list[dict[str, Any]]:
+    used_ports: set[int] = set()
+    specs: list[dict[str, Any]] = []
+    for pair_index in range(int(num_layer_pairs)):
+        for role, gpu_ids in (("attn", attn_gpu_ids), ("moe", moe_gpu_ids)):
+            master_port = _find_free_port()
+            while master_port in used_ports:
+                master_port = _find_free_port()
+            used_ports.add(master_port)
+            specs.append(
+                {
+                    "role": role,
+                    "stage_label": _stage_label(role, pair_index),
+                    "pair_index": pair_index,
+                    "gpu_ids": gpu_ids,
+                    "world_size": len(gpu_ids),
+                    "master_port": master_port,
+                }
+            )
+    return specs
+
+
+def _mean_timing_ms(values: list[float | None]) -> float | None:
+    numeric = [float(value) for value in values if value is not None]
+    if not numeric:
+        return None
+    return float(sum(numeric) / len(numeric))
+
+
+def _flatten_runtime_values(
+    stage_results: list[dict[str, Any]], key: str
+) -> list[int | None]:
+    flattened: list[int | None] = []
+    for stage in stage_results:
+        flattened.extend((stage.get("runtime") or {}).get(key) or [])
+    return flattened
+
+
+def _aggregate_equal_tokens_counts(
+    moe_stages: list[dict[str, Any]],
+) -> list[int] | None:
+    reference: list[int] | None = None
+    for stage in moe_stages:
+        if stage.get("status") != "ok":
+            continue
+        local_vectors = stage.get("local_tokens_per_expert_by_rank") or []
+        if not local_vectors:
+            raise RuntimeError(
+                "equal_tokens expected per-rank local_tokens_per_expert vectors"
+            )
+        lengths = {len(vector) for vector in local_vectors}
+        if len(lengths) != 1:
+            raise RuntimeError(
+                "equal_tokens local_tokens_per_expert vectors must have identical lengths"
+            )
+        tokens_per_expert = [0 for _ in range(lengths.pop())]
+        for vector in local_vectors:
+            for index, value in enumerate(vector):
+                tokens_per_expert[index] += int(value)
+        if reference is None:
+            reference = tokens_per_expert
+        elif reference != tokens_per_expert:
+            raise RuntimeError(
+                "equal_tokens produced inconsistent tokens_per_expert across layer pairs"
+            )
+    return reference
+
+
+def _layer_timing_rows(stage_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for stage in sorted(stage_results, key=lambda item: int(item.get("pair_index", 0))):
+        timing_ms = stage.get("timing_ms") or {}
+        rows.append(
+            {
+                "pair_index": int(stage.get("pair_index", 0)),
+                "stage_label": stage.get("stage_label"),
+                "cuda": timing_ms.get("cuda"),
+                "step_total": timing_ms.get("step_total"),
+                "timed_wall": timing_ms.get("timed_wall"),
+            }
+        )
+    return rows
+
+
+def _stage_signature_rows(stage_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for stage in sorted(stage_results, key=lambda item: int(item.get("pair_index", 0))):
+        rows.append(
+            {
+                "pair_index": int(stage.get("pair_index", 0)),
+                "stage_label": stage.get("stage_label"),
+                "signature": stage.get("output_signature"),
+            }
+        )
+    return rows
+
+
+def _collapse_timed_window_s(
+    windows: list[dict[str, Any] | None],
+) -> dict[str, float | None]:
     starts: list[float] = []
     ends: list[float] = []
     for window in windows:
@@ -1392,10 +1619,16 @@ def _run_case_attempt(
 ) -> dict[str, Any]:
     start_s = time.perf_counter()
     execution_schedule = "serial_lockstep" if mode == "serial" else "overlap"
-    attn_spec, moe_spec = _stage_specs(attn_gpu_ids, moe_gpu_ids)
+    num_layer_pairs = int(common_config.get("num_layer_pairs") or 1)
+    stage_specs = _stage_specs(attn_gpu_ids, moe_gpu_ids, num_layer_pairs)
     launch_result = _launch_workers(
-        stage_specs=[attn_spec, moe_spec],
-        common_config={**common_config, "execution_schedule": execution_schedule},
+        stage_specs=stage_specs,
+        common_config={
+            **common_config,
+            "execution_schedule": execution_schedule,
+            "serial_phase_order": _serial_phase_order(num_layer_pairs),
+            "num_layer_pairs": num_layer_pairs,
+        },
         timeout_s=timeout_s,
         mps_env=mps_env,
     )
@@ -1406,70 +1639,92 @@ def _run_case_attempt(
         fallback_status = None
         fallback_error = None
 
-    requested_torch_compile = normalize_torch_compile_requested(str(common_config.get("torch_compile", "off")))
-    attn_stage = _aggregate_stage_results(
-        "attn",
-        results,
-        expected_world_size=attn_spec["world_size"],
-        fallback_status=fallback_status,
-        fallback_error=fallback_error,
-        torch_compile_requested=requested_torch_compile,
+    requested_torch_compile = normalize_torch_compile_requested(
+        str(common_config.get("torch_compile", "off"))
     )
-    moe_stage = _aggregate_stage_results(
-        "moe",
-        results,
-        expected_world_size=moe_spec["world_size"],
-        fallback_status=fallback_status,
-        fallback_error=fallback_error,
-        torch_compile_requested=requested_torch_compile,
-    )
-    tokens_per_expert: list[int] | None = None
-    if common_config["moe_routing_mode"] == "equal_tokens" and moe_stage["status"] == "ok":
-        local_vectors = moe_stage.get("local_tokens_per_expert_by_rank") or []
-        if not local_vectors:
-            raise RuntimeError("equal_tokens expected per-rank local_tokens_per_expert vectors")
-        lengths = {len(vector) for vector in local_vectors}
-        if len(lengths) != 1:
-            raise RuntimeError("equal_tokens local_tokens_per_expert vectors must have identical lengths")
-        tokens_per_expert = [0 for _ in range(lengths.pop())]
-        for vector in local_vectors:
-            for index, value in enumerate(vector):
-                tokens_per_expert[index] += int(value)
+    stage_results = [
+        _aggregate_stage_results(
+            spec,
+            results,
+            expected_world_size=spec["world_size"],
+            fallback_status=fallback_status,
+            fallback_error=fallback_error,
+            torch_compile_requested=requested_torch_compile,
+        )
+        for spec in stage_specs
+    ]
+    attn_stages = [stage for stage in stage_results if stage.get("role") == "attn"]
+    moe_stages = [stage for stage in stage_results if stage.get("role") == "moe"]
 
-    case_timed_wall_ms = (launch_result.get("schedule_timed_window_s") or {}).get("duration_ms")
+    tokens_per_expert: list[int] | None = None
+    if common_config["moe_routing_mode"] == "equal_tokens":
+        tokens_per_expert = _aggregate_equal_tokens_counts(moe_stages)
+
+    case_timed_wall_ms = (launch_result.get("schedule_timed_window_s") or {}).get(
+        "duration_ms"
+    )
     host_overlap_ms = 0.0
     if mode == "overlap":
-        host_overlap_ms = compute_host_enqueue_overlap_ms(
-            attn_stage.get("enqueue_windows", []),
-            moe_stage.get("enqueue_windows", []),
-        )
+        pair_overlaps = [
+            compute_host_enqueue_overlap_ms(
+                attn_stage.get("enqueue_windows", []),
+                moe_stage.get("enqueue_windows", []),
+            )
+            for attn_stage, moe_stage in zip(attn_stages, moe_stages)
+        ]
+        if pair_overlaps:
+            host_overlap_ms = float(sum(pair_overlaps) / len(pair_overlaps))
 
     wall_ms = (time.perf_counter() - start_s) * 1000.0
-    stage_statuses = [attn_stage["status"], moe_stage["status"]]
-    if any(status == "oom" for status in stage_statuses):
-        status = "oom"
-        error = attn_stage["error"] if attn_stage["status"] == "oom" else moe_stage["error"]
-    elif any(status == "timeout" for status in stage_statuses):
-        status = "timeout"
-        error = attn_stage["error"] if attn_stage["status"] == "timeout" else moe_stage["error"]
-    elif any(status != "ok" for status in stage_statuses):
-        status = "runtime_error"
-        stage_errors = [attn_stage.get("error") or {}, moe_stage.get("error") or {}]
-        compile_error = next((item for item in stage_errors if item.get("code") == "torch_compile_failed"), None)
-        if compile_error is not None:
-            error = compile_error
-        else:
-            error = attn_stage["error"] if attn_stage["status"] != "ok" else moe_stage["error"]
-    else:
-        status = "ok"
-        error = {"code": None, "message": None, "traceback": None}
-
-    first_nonfinite = (
-        attn_stage["finite"]["first_nonfinite"]
-        if attn_stage["finite"]["first_nonfinite"] is not None
-        else moe_stage["finite"]["first_nonfinite"]
+    failing_stage = next(
+        (stage for stage in stage_results if stage.get("status") == "oom"), None
     )
-    all_finite = bool(attn_stage["finite"]["all_finite"] and moe_stage["finite"]["all_finite"])
+    if failing_stage is not None:
+        status = "oom"
+        error = failing_stage["error"]
+    else:
+        failing_stage = next(
+            (stage for stage in stage_results if stage.get("status") == "timeout"), None
+        )
+        if failing_stage is not None:
+            status = "timeout"
+            error = failing_stage["error"]
+        else:
+            compile_failed_stage = next(
+                (
+                    stage
+                    for stage in stage_results
+                    if (stage.get("error") or {}).get("code")
+                    == "torch_compile_failed"
+                ),
+                None,
+            )
+            if compile_failed_stage is not None:
+                status = "runtime_error"
+                error = compile_failed_stage["error"]
+            else:
+                failing_stage = next(
+                    (stage for stage in stage_results if stage.get("status") != "ok"),
+                    None,
+                )
+                if failing_stage is not None:
+                    status = "runtime_error"
+                    error = failing_stage["error"]
+                else:
+                    status = "ok"
+                    error = {"code": None, "message": None, "traceback": None}
+
+    first_nonfinite = next(
+        (
+            stage.get("finite", {}).get("first_nonfinite")
+            for stage in stage_results
+            if (stage.get("finite", {}) or {}).get("first_nonfinite") is not None
+        ),
+        None,
+    )
+    all_finite = all(
+        bool((stage.get("finite") or {}).get("all_finite")) for stage in stage_results
+    )
     if (
         status == "ok"
         and not all_finite
@@ -1482,6 +1737,25 @@ def _run_case_attempt(
             "traceback": None,
         }
 
+    attn_timing_rows = _layer_timing_rows(attn_stages)
+    moe_timing_rows = _layer_timing_rows(moe_stages)
+    timed_iters = int(common_config["timed_iters"])
+    tokens_per_iter = int(common_config["seq_len"]) * int(common_config["batch_size"])
+    timed_tokens = tokens_per_iter * timed_iters
+    tokens_per_s = None
+    if case_timed_wall_ms is not None and float(case_timed_wall_ms) > 0:
+        tokens_per_s = float(timed_tokens / (float(case_timed_wall_ms) / 1000.0))
+
+    first_attn_stage = attn_stages[0] if attn_stages else {}
+    first_moe_stage = moe_stages[0] if moe_stages else {}
+    attn_torch_compile, _ = _aggregate_role_torch_compile(
+        attn_stages,
+        torch_compile_requested=requested_torch_compile,
+    )
+    moe_torch_compile, _ = _aggregate_role_torch_compile(
+        moe_stages,
+        torch_compile_requested=requested_torch_compile,
+    )
     return {
         "status": status,
         "error": error,
@@ -1491,88 +1765,158 @@ def _run_case_attempt(
             green_ctx_attn_sms=common_config["green_ctx_attn_sms"],
             green_ctx_moe_sms=common_config["green_ctx_moe_sms"],
             granted_sms_by_role={
-                "attn": (attn_stage.get("runtime") or {}).get("granted_sms_by_rank"),
-                "moe": (moe_stage.get("runtime") or {}).get("granted_sms_by_rank"),
+                "attn": _flatten_runtime_values(attn_stages, "granted_sms_by_rank"),
+                "moe": _flatten_runtime_values(moe_stages, "granted_sms_by_rank"),
             },
             device_total_sms_by_role={
-                "attn": (attn_stage.get("runtime") or {}).get("device_total_sms_by_rank"),
-                "moe": (moe_stage.get("runtime") or {}).get("device_total_sms_by_rank"),
+                "attn": _flatten_runtime_values(
+                    attn_stages, "device_total_sms_by_rank"
+                ),
+                "moe": _flatten_runtime_values(moe_stages, "device_total_sms_by_rank"),
             },
         ),
         "attention_backend": {
             "requested": common_config["attention_backend"],
-            "attn": attn_stage.get("attention_backend"),
-            "moe": moe_stage.get("attention_backend"),
+            "attn": first_attn_stage.get("attention_backend"),
+            "moe": first_moe_stage.get("attention_backend"),
         },
         "attention_impl": {
-            "attn": attn_stage.get("attention_impl"),
-            "moe": moe_stage.get("attention_impl"),
+            "attn": first_attn_stage.get("attention_impl"),
+            "moe": first_moe_stage.get("attention_impl"),
         },
         "moe_runtime": {
             "grouped_gemm": {
                 "requested": common_config["moe_grouped_gemm"],
-                "attn": attn_stage.get("moe_grouped_gemm"),
-                "moe": moe_stage.get("moe_grouped_gemm"),
+                "attn": first_attn_stage.get("moe_grouped_gemm"),
+                "moe": first_moe_stage.get("moe_grouped_gemm"),
             },
             "token_dispatcher_type": {
                 "requested": common_config["moe_token_dispatcher_type"],
-                "attn": attn_stage.get("moe_token_dispatcher_type"),
-                "moe": moe_stage.get("moe_token_dispatcher_type"),
+                "attn": first_attn_stage.get("moe_token_dispatcher_type"),
+                "moe": first_moe_stage.get("moe_token_dispatcher_type"),
             },
             "overlap_expert_parallel_comm": {
                 "requested": common_config["overlap_moe_expert_parallel_comm"],
-                "attn": attn_stage.get("overlap_moe_expert_parallel_comm"),
-                "moe": moe_stage.get("overlap_moe_expert_parallel_comm"),
+                "attn": first_attn_stage.get("overlap_moe_expert_parallel_comm"),
+                "moe": first_moe_stage.get("overlap_moe_expert_parallel_comm"),
             },
         },
         "moe_routing_mode": common_config["moe_routing_mode"],
         "torch_compile": {
             "requested": requested_torch_compile,
             "by_role": {
-                "attn": {"status": str((attn_stage.get("torch_compile") or {}).get("status", "eager"))},
-                "moe": {"status": str((moe_stage.get("torch_compile") or {}).get("status", "eager"))},
+                "attn": {"status": attn_torch_compile["status"]},
+                "moe": {"status": moe_torch_compile["status"]},
             },
         },
+        "num_layer_pairs": num_layer_pairs,
         "timing_ms": {
             "total": wall_ms,
             "timed_wall": case_timed_wall_ms,
-            "attn": attn_stage["timing_ms"]["cuda"] if attn_stage["timing_ms"] else None,
-            "moe": moe_stage["timing_ms"]["cuda"] if moe_stage["timing_ms"] else None,
+            "attn": _mean_timing_ms([row.get("cuda") for row in attn_timing_rows]),
+            "moe": _mean_timing_ms([row.get("cuda") for row in moe_timing_rows]),
+        },
+        "layer_timings_ms": {
+            "attn": attn_timing_rows,
+            "moe": moe_timing_rows,
+        },
+        "throughput": {
+            "tokens_per_iter": tokens_per_iter,
+            "timed_tokens": timed_tokens,
+            "tokens_per_s": tokens_per_s,
         },
         "overlap_ms": host_overlap_ms,
         "finite": {"all_finite": all_finite, "first_nonfinite": first_nonfinite},
         "stage_signatures": {
-            "attn": attn_stage["output_signature"],
-            "moe": moe_stage["output_signature"],
+            "attn": _stage_signature_rows(attn_stages),
+            "moe": _stage_signature_rows(moe_stages),
         },
         "tokens_per_expert": tokens_per_expert,
     }
 
 
-def _apply_baseline_diff(overlap_payload: dict[str, Any], serial_payload: dict[str, Any] | None) -> dict[str, Any]:
+def _apply_baseline_diff(
+    overlap_payload: dict[str, Any], serial_payload: dict[str, Any] | None
+) -> dict[str, Any]:
+    num_layer_pairs = int(overlap_payload.get("num_layer_pairs") or 1)
+    empty_rows = {
+        "attn": [
+            {
+                "pair_index": pair_index,
+                "stage_label": _stage_label("attn", pair_index),
+                "diff": None,
+            }
+            for pair_index in range(num_layer_pairs)
+        ],
+        "moe": [
+            {
+                "pair_index": pair_index,
+                "stage_label": _stage_label("moe", pair_index),
+                "diff": None,
+            }
+            for pair_index in range(num_layer_pairs)
+        ],
+    }
     if serial_payload is None:
+        overlap_payload["baseline_diff"] = {
+            "baseline_case_id": None,
+            "all_within_tolerance": None,
+            "stages": empty_rows,
+        }
         return overlap_payload
+
     dtype = overlap_payload["dtype"]
-    attn_diff = evaluate_stage_diff(
-        stage_name="attn",
-        dtype=dtype,
-        test_signature=overlap_payload["stage_signatures"].get("attn"),
-        ref_signature=serial_payload["stage_signatures"].get("attn"),
-    )
-    moe_diff = evaluate_stage_diff(
-        stage_name="moe",
-        dtype=dtype,
-        test_signature=overlap_payload["stage_signatures"].get("moe"),
-        ref_signature=serial_payload["stage_signatures"].get("moe"),
-    )
-    all_within = bool(attn_diff["within_tolerance"] and moe_diff["within_tolerance"])
+    serial_signatures = serial_payload.get("stage_signatures") or {}
+    overlap_signatures = overlap_payload.get("stage_signatures") or {}
+    stage_diffs: dict[str, list[dict[str, Any]]] = {"attn": [], "moe": []}
+    all_within = True
+    missing_pair = False
+    for stage_kind in ("attn", "moe"):
+        serial_by_pair = {
+            int(item.get("pair_index", -1)): item
+            for item in (serial_signatures.get(stage_kind) or [])
+            if isinstance(item, dict)
+        }
+        overlap_by_pair = {
+            int(item.get("pair_index", -1)): item
+            for item in (overlap_signatures.get(stage_kind) or [])
+            if isinstance(item, dict)
+        }
+        for pair_index in range(num_layer_pairs):
+            serial_item = serial_by_pair.get(pair_index)
+            overlap_item = overlap_by_pair.get(pair_index)
+            if serial_item is None or overlap_item is None:
+                missing_pair = True
+                stage_diffs[stage_kind].append(
+                    {
+                        "pair_index": pair_index,
+                        "stage_label": _stage_label(stage_kind, pair_index),
+                        "diff": None,
+                    }
+                )
+                all_within = False
+                continue
+            diff = evaluate_stage_diff(
+                stage_name=_stage_label(stage_kind, pair_index),
+                dtype=dtype,
+                test_signature=overlap_item.get("signature"),
+                ref_signature=serial_item.get("signature"),
+            )
+            diff["pair_index"] = pair_index
+            diff["stage_label"] = _stage_label(stage_kind, pair_index)
+            stage_diffs[stage_kind].append(
+                {
+                    "pair_index": pair_index,
+                    "stage_label": _stage_label(stage_kind, pair_index),
+                    "diff": diff,
+                }
+            )
+            all_within = all_within and bool(diff["within_tolerance"])
+
     overlap_payload["baseline_diff"] = {
         "baseline_case_id": serial_payload["case_id"],
-        "all_within_tolerance": all_within,
-        "stages": {
-            "attn": attn_diff,
-            "moe": moe_diff,
-        },
+        "all_within_tolerance": all_within and not missing_pair,
+        "stages": stage_diffs,
     }
     overlap_payload["overlap"]["speedup_vs_serial"] = compute_speedup(
         serial_payload["timing_ms"]["total"],
@@ -1582,15 +1926,16 @@ def _apply_baseline_diff(overlap_payload: dict[str, Any], serial_payload: dict[s
         serial_payload["timing_ms"].get("timed_wall"),
         overlap_payload["timing_ms"].get("timed_wall"),
     )
-    if overlap_payload["status"] == "ok" and not all_within:
+    if overlap_payload["status"] == "ok" and (missing_pair or not all_within):
         overlap_payload["status"] = "numerical_mismatch"
+        message = "Baseline tolerance exceeded across one or more layer pairs"
+        if missing_pair:
+            message = (
+                "Missing pair-indexed stage signatures for one or more layer pairs"
+            )
         overlap_payload["error"] = {
             "code": "numerical_mismatch",
-            "message": (
-                "Baseline tolerance exceeded: "
-                f"attn(max_abs={attn_diff['max_abs_diff']}, max_rel={attn_diff['max_rel_diff']}), "
-                f"moe(max_abs={moe_diff['max_abs_diff']}, max_rel={moe_diff['max_rel_diff']})"
-            ),
+            "message": message,
             "traceback": None,
         }
     return overlap_payload
@@ -1631,13 +1976,18 @@ def _invalid_env_matrix(
                 "by_role": {"attn": {"status": "eager"}, "moe": {"status": "eager"}},
             },
         )
-        write_case_json(output_dir=output_dir, payload=payload, strict_schema=strict_schema)
+        write_case_json(
+            output_dir=output_dir, payload=payload, strict_schema=strict_schema
+        )
         payloads.append(payload)
     return payloads
 
 
 def _load_case_payloads(output_dir: str | Path) -> list[dict[str, Any]]:
-    return [load_case_payload(path) for path in sorted((Path(output_dir) / "cases").glob("*.json"))]
+    return [
+        load_case_payload(path)
+        for path in sorted((Path(output_dir) / "cases").glob("*.json"))
+    ]
 
 
 def _load_matrix_summary(output_dir: str | Path) -> dict[str, Any]:
@@ -1658,12 +2008,22 @@ def _pair_metric(pair: dict[str, Any]) -> float | None:
 
 
 def _infer_selection_run_config(cases: list[dict[str, Any]]) -> dict[str, Any]:
-    runtime_backends = sorted({str(case.get("runtime_backend") or "") for case in cases if case.get("runtime_backend")})
-    green_ctx_case = next((case for case in cases if case.get("runtime_backend") == "mps_green_ctx"), None)
+    runtime_backends = sorted(
+        {
+            str(case.get("runtime_backend") or "")
+            for case in cases
+            if case.get("runtime_backend")
+        }
+    )
+    green_ctx_case = next(
+        (case for case in cases if case.get("runtime_backend") == "mps_green_ctx"), None
+    )
     runtime = (green_ctx_case or {}).get("runtime") or {}
     return {
         "runtime_backends": runtime_backends,
-        "green_ctx_sms": dict(runtime.get("requested_sms_by_role") or {"attn": None, "moe": None}),
+        "green_ctx_sms": dict(
+            runtime.get("requested_sms_by_role") or {"attn": None, "moe": None}
+        ),
     }
 
 
@@ -1677,19 +2037,51 @@ def _select_profiler_backend_pairs(cases: list[dict[str, Any]]) -> list[dict[str
     if not pair_rows:
         return []
 
-    successful_pairs = [pair for pair in pair_rows if pair.get("pair_status") == "ok" and _pair_metric(pair) is not None]
+    successful_pairs = [
+        pair
+        for pair in pair_rows
+        if pair.get("pair_status") == "ok" and _pair_metric(pair) is not None
+    ]
     selected: list[dict[str, Any]] = []
 
     if successful_pairs:
-        positive_pairs = [pair for pair in successful_pairs if float(_pair_metric(pair) or 0.0) > 0.0]
+        positive_pairs = [
+            pair for pair in successful_pairs if float(_pair_metric(pair) or 0.0) > 0.0
+        ]
         if positive_pairs:
-            selected.append(max(positive_pairs, key=lambda pair: (float(_pair_metric(pair) or 0.0), pair["pair_id"])))
+            selected.append(
+                max(
+                    positive_pairs,
+                    key=lambda pair: (
+                        float(_pair_metric(pair) or 0.0),
+                        pair["pair_id"],
+                    ),
+                )
+            )
 
-        selected.append(min(successful_pairs, key=lambda pair: (abs(float(_pair_metric(pair) or 0.0)), pair["pair_id"])))
+        selected.append(
+            min(
+                successful_pairs,
+                key=lambda pair: (
+                    abs(float(_pair_metric(pair) or 0.0)),
+                    pair["pair_id"],
+                ),
+            )
+        )
 
-        negative_pairs = [pair for pair in successful_pairs if float(_pair_metric(pair) or 0.0) < 0.0]
+        negative_pairs = [
+            pair for pair in successful_pairs if float(_pair_metric(pair) or 0.0) < 0.0
+        ]
         if negative_pairs:
-            selected.append(min(negative_pairs, key=lambda pair: (float(_pair_metric(pair) or 0.0), pair["pair_id"])))
+            selected.append(
+                min(
+                    negative_pairs,
+                    key=lambda pair: (
+                        float(_pair_metric(pair) or 0.0),
+                        pair["pair_id"],
+                    ),
+                )
+            )
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for pair in selected:
@@ -1701,25 +2093,43 @@ def _select_profiler_backend_pairs(cases: list[dict[str, Any]]) -> list[dict[str
     return deduped
 
 
-def _requested_attention_backend(case_payload: dict[str, Any], run_config: dict[str, Any]) -> str:
+def _requested_attention_backend(
+    case_payload: dict[str, Any], run_config: dict[str, Any]
+) -> str:
     requested = (case_payload.get("attention_backend") or {}).get("requested")
     fallback = run_config.get("attention_backend")
     return str(fallback if requested is None else requested)
 
 
-def _requested_moe_runtime(case_payload: dict[str, Any], run_config: dict[str, Any]) -> tuple[bool, str, bool]:
+def _requested_moe_runtime(
+    case_payload: dict[str, Any], run_config: dict[str, Any]
+) -> tuple[bool, str, bool]:
     moe_runtime = case_payload.get("moe_runtime") or {}
     grouped_gemm = (moe_runtime.get("grouped_gemm") or {}).get("requested")
     token_dispatcher = (moe_runtime.get("token_dispatcher_type") or {}).get("requested")
-    overlap_comm = (moe_runtime.get("overlap_expert_parallel_comm") or {}).get("requested")
+    overlap_comm = (moe_runtime.get("overlap_expert_parallel_comm") or {}).get(
+        "requested"
+    )
     return (
-        bool(run_config.get("moe_grouped_gemm") if grouped_gemm is None else grouped_gemm),
-        str(run_config.get("moe_token_dispatcher_type") if token_dispatcher is None else token_dispatcher),
-        bool(run_config.get("overlap_moe_expert_parallel_comm") if overlap_comm is None else overlap_comm),
+        bool(
+            run_config.get("moe_grouped_gemm") if grouped_gemm is None else grouped_gemm
+        ),
+        str(
+            run_config.get("moe_token_dispatcher_type")
+            if token_dispatcher is None
+            else token_dispatcher
+        ),
+        bool(
+            run_config.get("overlap_moe_expert_parallel_comm")
+            if overlap_comm is None
+            else overlap_comm
+        ),
     )
 
 
-def _requested_moe_routing_mode(case_payload: dict[str, Any], run_config: dict[str, Any]) -> str:
+def _requested_moe_routing_mode(
+    case_payload: dict[str, Any], run_config: dict[str, Any]
+) -> str:
     requested = case_payload.get("moe_routing_mode")
     fallback = run_config.get("moe_routing_mode", "normal")
     return normalize_moe_routing_mode(str(fallback if requested is None else requested))
@@ -1730,7 +2140,9 @@ def _requested_green_ctx_sms(case_payload: dict[str, Any]) -> dict[str, int | No
     return dict(runtime.get("requested_sms_by_role") or {"attn": None, "moe": None})
 
 
-def _case_topology(case_payload: dict[str, Any], run_config: dict[str, Any]) -> dict[str, Any]:
+def _case_topology(
+    case_payload: dict[str, Any], run_config: dict[str, Any]
+) -> dict[str, Any]:
     topology = dict(run_config.get("topology") or {})
     topology.update(case_payload.get("topology") or {})
     return {
@@ -1738,6 +2150,9 @@ def _case_topology(case_payload: dict[str, Any], run_config: dict[str, Any]) -> 
         "moe_ep_size": int(topology["moe_ep_size"]),
         "attn_gpu_ids": [int(value) for value in topology["attn_gpu_ids"]],
         "moe_gpu_ids": [int(value) for value in topology["moe_gpu_ids"]],
+        "num_layer_pairs": int(
+            case_payload.get("num_layer_pairs") or topology.get("num_layer_pairs") or 1
+        ),
     }
 
 
@@ -1755,7 +2170,9 @@ def _build_case_rerun_command(
     profiler_active_iters: int | None = None,
 ) -> list[str]:
     topology = _case_topology(case_payload, run_config)
-    grouped_gemm, token_dispatcher, overlap_comm = _requested_moe_runtime(case_payload, run_config)
+    grouped_gemm, token_dispatcher, overlap_comm = _requested_moe_runtime(
+        case_payload, run_config
+    )
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -1773,6 +2190,12 @@ def _build_case_rerun_command(
         str(topology["moe_ep_size"]),
         "--seq-lens",
         str(case_payload["seq_len"]),
+        "--num-layer-pairs",
+        str(
+            case_payload.get("num_layer_pairs")
+            or run_config.get("num_layer_pairs")
+            or topology["num_layer_pairs"]
+        ),
         "--dtypes",
         str(case_payload["dtype"]),
         "--runtime-backends",
@@ -1808,10 +2231,19 @@ def _build_case_rerun_command(
     if run_config.get("num_experts") is not None:
         cmd.extend(["--num-experts", str(run_config["num_experts"])])
     if run_config.get("mps_active_thread_pct") is not None:
-        cmd.extend(["--mps-active-thread-pct", str(run_config["mps_active_thread_pct"])])
+        cmd.extend(
+            ["--mps-active-thread-pct", str(run_config["mps_active_thread_pct"])]
+        )
     if run_config.get("attn_mps_active_thread_pct") is not None:
-        cmd.extend(["--attn-mps-active-thread-pct", str(run_config["attn_mps_active_thread_pct"])])
-    _append_nccl_tuple_args(cmd, str((case_payload.get("nccl") or {}).get("tuple") or "off"))
+        cmd.extend(
+            [
+                "--attn-mps-active-thread-pct",
+                str(run_config["attn_mps_active_thread_pct"]),
+            ]
+        )
+    _append_nccl_tuple_args(
+        cmd, str((case_payload.get("nccl") or {}).get("tuple") or "off")
+    )
     if grouped_gemm:
         cmd.append("--moe-grouped-gemm")
     if overlap_comm:
@@ -1831,7 +2263,9 @@ def _build_case_rerun_command(
     return cmd
 
 
-def _load_rerun_case_payload(case_id: str, rerun_output_dir: Path) -> dict[str, Any] | None:
+def _load_rerun_case_payload(
+    case_id: str, rerun_output_dir: Path
+) -> dict[str, Any] | None:
     case_path = rerun_output_dir / "cases" / f"{case_id}.json"
     if case_path.exists():
         return load_case_payload(case_path)
@@ -1860,8 +2294,12 @@ def _normalize_torch_profiler_status(
     return "torch_profiler_capture_failed"
 
 
-def _select_torch_profiler_cases(cases: list[dict[str, Any]], selection: str) -> list[dict[str, Any]]:
-    cases_by_id = {str(case.get("case_id")): case for case in cases if case.get("case_id")}
+def _select_torch_profiler_cases(
+    cases: list[dict[str, Any]], selection: str
+) -> list[dict[str, Any]]:
+    cases_by_id = {
+        str(case.get("case_id")): case for case in cases if case.get("case_id")
+    }
     if selection == "all-successful":
         return sorted(
             (case for case in cases_by_id.values() if case.get("status") == "ok"),
@@ -1875,7 +2313,10 @@ def _select_torch_profiler_cases(cases: list[dict[str, Any]], selection: str) ->
     reruns: list[dict[str, Any]] = []
     seen_case_ids: set[str] = set()
     for pair in selected_pairs:
-        for case_id_key in ("mps_only_overlap_case_id", "mps_green_ctx_overlap_case_id"):
+        for case_id_key in (
+            "mps_only_overlap_case_id",
+            "mps_green_ctx_overlap_case_id",
+        ):
             case_id = pair.get(case_id_key)
             if case_id is None:
                 continue
@@ -1946,10 +2387,17 @@ def _run_nsys_capture(
             }
         )
         if completed.returncode != 0:
-            write_json_atomic(nsys_dir / "trace_index.json", {"status": "nsys_capture_failed", "entries": entries})
+            write_json_atomic(
+                nsys_dir / "trace_index.json",
+                {"status": "nsys_capture_failed", "entries": entries},
+            )
             return "nsys_capture_failed"
-    write_json_atomic(nsys_dir / "trace_index.json", {"status": "ok", "entries": entries})
+    write_json_atomic(
+        nsys_dir / "trace_index.json", {"status": "ok", "entries": entries}
+    )
     return "ok"
+
+
 def _run_torch_profiler_capture(
     *,
     args: argparse.Namespace,
@@ -1959,7 +2407,9 @@ def _run_torch_profiler_capture(
     if args.capture_torch_profiler != "on":
         return "off"
 
-    selected = _select_torch_profiler_cases(cases, selection=args.torch_profiler_selection)
+    selected = _select_torch_profiler_cases(
+        cases, selection=args.torch_profiler_selection
+    )
     if not selected:
         return "off"
 
@@ -2011,7 +2461,11 @@ def _run_torch_profiler_capture(
             }
         )
 
-    overall_status = "ok" if all(entry["profiler_status"] == "ok" for entry in entries) else "partial_failure"
+    overall_status = (
+        "ok"
+        if all(entry["profiler_status"] == "ok" for entry in entries)
+        else "partial_failure"
+    )
     write_json_atomic(
         profiler_root / "trace_index.json",
         {
@@ -2050,7 +2504,9 @@ def main() -> int:
         nccl_max_nchannels=args.nccl_max_nchannels,
         nccl_max_ctas=args.nccl_max_ctas,
     )
-    modes = [args.single_mode] if args.single_mode is not None else ["serial", "overlap"]
+    modes = (
+        [args.single_mode] if args.single_mode is not None else ["serial", "overlap"]
+    )
     output_dir = Path(args.output_dir)
     (output_dir / "cases").mkdir(parents=True, exist_ok=True)
 
@@ -2059,6 +2515,7 @@ def main() -> int:
         "moe_ep_size": int(args.moe_ep_size),
         "attn_gpu_ids": attn_gpu_ids,
         "moe_gpu_ids": moe_gpu_ids,
+        "num_layer_pairs": int(args.num_layer_pairs),
         "seed": int(args.seed),
     }
 
@@ -2074,9 +2531,13 @@ def main() -> int:
     )
     if args.moe_routing_mode == "equal_tokens":
         if args.num_experts is None or int(args.num_experts) <= 0:
-            preflight_errors.append("--moe-routing-mode equal_tokens requires --num-experts > 0")
+            preflight_errors.append(
+                "--moe-routing-mode equal_tokens requires --num-experts > 0"
+            )
         elif int(args.num_experts) % int(args.moe_ep_size) != 0:
-            preflight_errors.append("--num-experts must be divisible by --moe-ep-size for equal_tokens")
+            preflight_errors.append(
+                "--num-experts must be divisible by --moe-ep-size for equal_tokens"
+            )
     device_sm_signature = _device_sm_signature(device_total_sms)
     cases = _build_case_descriptors(
         modes=modes,
@@ -2092,6 +2553,7 @@ def main() -> int:
         attn_gpu_ids=attn_gpu_ids,
         moe_gpu_ids=moe_gpu_ids,
         moe_routing_mode=args.moe_routing_mode,
+        num_layer_pairs=args.num_layer_pairs,
     )
     total_points = len(cases)
     profiler_config = _profiler_config_from_args(args)
@@ -2118,7 +2580,9 @@ def main() -> int:
 
     if args.torch_profiler_recovery:
         if args.capture_torch_profiler != "on":
-            preflight_errors.append("--torch-profiler-recovery requires --capture-torch-profiler on")
+            preflight_errors.append(
+                "--torch-profiler-recovery requires --capture-torch-profiler on"
+            )
         if args.torch_profiler_selection != "all-successful":
             preflight_errors.append(
                 "--torch-profiler-recovery requires --torch-profiler-selection all-successful"
@@ -2133,7 +2597,10 @@ def main() -> int:
             return 1
         persisted_case_payloads = _load_case_payloads(output_dir)
         if not persisted_case_payloads:
-            print(f"{output_dir}/cases does not contain any case payloads", file=sys.stderr)
+            print(
+                f"{output_dir}/cases does not contain any case payloads",
+                file=sys.stderr,
+            )
             return 1
         existing_run_config = dict(existing_summary.get("run_config") or {})
         torch_profiler_status = _run_torch_profiler_capture(
@@ -2144,14 +2611,24 @@ def main() -> int:
         existing_run_config["capture_torch_profiler"] = args.capture_torch_profiler
         existing_run_config["torch_profiler_selection"] = profiler_config["selection"]
         existing_run_config["torch_profiler_wait_iters"] = profiler_config["wait_iters"]
-        existing_run_config["torch_profiler_active_iters"] = profiler_config["active_iters"]
+        existing_run_config["torch_profiler_active_iters"] = profiler_config[
+            "active_iters"
+        ]
         existing_run_config["torch_profiler_status"] = torch_profiler_status
         summary = build_matrix_summary(
             run_config=existing_run_config,
             cases=persisted_case_payloads,
-            total_points=int((existing_summary.get("counts") or {}).get("total_points", len(persisted_case_payloads))),
+            total_points=int(
+                (existing_summary.get("counts") or {}).get(
+                    "total_points", len(persisted_case_payloads)
+                )
+            ),
         )
-        write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
+        write_matrix_summary(
+            output_dir=args.output_dir,
+            summary=summary,
+            strict_schema=args.strict_schema,
+        )
         write_matrix_summary_markdown(args.output_dir, summary)
         return 0 if torch_profiler_status == "ok" else 1
 
@@ -2170,7 +2647,11 @@ def main() -> int:
             cases=all_case_payloads,
             total_points=total_points,
         )
-        write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
+        write_matrix_summary(
+            output_dir=args.output_dir,
+            summary=summary,
+            strict_schema=args.strict_schema,
+        )
         write_matrix_summary_markdown(args.output_dir, summary)
         return 1
 
@@ -2207,6 +2688,7 @@ def main() -> int:
                     "timed_iters": args.timed_iters,
                     "moe_ep_size": args.moe_ep_size,
                     "num_experts": args.num_experts,
+                    "num_layer_pairs": int(args.num_layer_pairs),
                     "moe_routing_mode": args.moe_routing_mode,
                     "attn_mps_active_thread_pct": args.attn_mps_active_thread_pct,
                     "moe_grouped_gemm": args.moe_grouped_gemm,
@@ -2244,8 +2726,11 @@ def main() -> int:
                         topology=topology,
                         nccl_env=nccl_meta,
                         moe_routing_mode=descriptor.moe_routing_mode,
+                        num_layer_pairs=attempt_result["num_layer_pairs"],
                         runtime=attempt_result["runtime"],
                         timing_ms=attempt_result["timing_ms"],
+                        layer_timings_ms=attempt_result["layer_timings_ms"],
+                        throughput=attempt_result["throughput"],
                         overlap_ms=attempt_result["overlap_ms"],
                         finite=attempt_result["finite"],
                         stage_signatures=attempt_result["stage_signatures"],
@@ -2285,33 +2770,9 @@ def main() -> int:
                 if descriptor.mode == "serial":
                     serial_baselines[descriptor.baseline_key] = payload
                 else:
-                    payload = _apply_baseline_diff(payload, serial_baselines.get(descriptor.baseline_key))
-                    tol = tolerance_for_dtype(payload["dtype"])
-                    if payload["baseline_diff"]["all_within_tolerance"] is None and payload["status"] == "ok":
-                        payload["baseline_diff"]["stages"] = {
-                            "attn": {
-                                "stage": "attn",
-                                "max_abs_diff": None,
-                                "max_rel_diff": None,
-                                "eps": tol["eps"],
-                                "tolerance": {
-                                    "max_abs_diff": tol["max_abs_diff"],
-                                    "max_rel_diff": tol["max_rel_diff"],
-                                },
-                                "within_tolerance": False,
-                            },
-                            "moe": {
-                                "stage": "moe",
-                                "max_abs_diff": None,
-                                "max_rel_diff": None,
-                                "eps": tol["eps"],
-                                "tolerance": {
-                                    "max_abs_diff": tol["max_abs_diff"],
-                                    "max_rel_diff": tol["max_rel_diff"],
-                                },
-                                "within_tolerance": False,
-                            },
-                        }
+                    payload = _apply_baseline_diff(
+                        payload, serial_baselines.get(descriptor.baseline_key)
+                    )
 
                 if args.strict_schema:
                     schema_errors = validate_case_payload(payload)
@@ -2323,11 +2784,19 @@ def main() -> int:
                             "traceback": None,
                         }
 
-                write_case_json(output_dir=args.output_dir, payload=payload, strict_schema=args.strict_schema)
+                write_case_json(
+                    output_dir=args.output_dir,
+                    payload=payload,
+                    strict_schema=args.strict_schema,
+                )
                 all_case_payloads.append(payload)
     except Exception as exc:
         error_payloads = _invalid_env_matrix(
-            cases=[case for case in cases if case.case_id not in {p["case_id"] for p in all_case_payloads}],
+            cases=[
+                case
+                for case in cases
+                if case.case_id not in {p["case_id"] for p in all_case_payloads}
+            ],
             output_dir=args.output_dir,
             strict_schema=args.strict_schema,
             error_message=f"MPS startup or matrix run failed: {exc}",
@@ -2341,7 +2810,11 @@ def main() -> int:
             cases=all_case_payloads,
             total_points=total_points,
         )
-        write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
+        write_matrix_summary(
+            output_dir=args.output_dir,
+            summary=summary,
+            strict_schema=args.strict_schema,
+        )
         write_matrix_summary_markdown(args.output_dir, summary)
         return 1
 
@@ -2369,8 +2842,12 @@ def main() -> int:
         nsys_status=nsys_status,
         torch_profiler_status=torch_profiler_status,
     )
-    summary = build_matrix_summary(run_config=run_config, cases=persisted_case_payloads, total_points=total_points)
-    write_matrix_summary(output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema)
+    summary = build_matrix_summary(
+        run_config=run_config, cases=persisted_case_payloads, total_points=total_points
+    )
+    write_matrix_summary(
+        output_dir=args.output_dir, summary=summary, strict_schema=args.strict_schema
+    )
     write_matrix_summary_markdown(args.output_dir, summary)
 
     return 0

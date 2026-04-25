@@ -52,9 +52,12 @@ from examples.attn_moe_overlap.step7_megatron_ep_overlap import (
     _collapse_timed_window_s,
     _ensure_output_dir_identity_matches,
     _normalize_launch_failure,
+    _parse_args,
     _run_case_attempt,
     _run_torch_profiler_capture,
     _select_torch_profiler_cases,
+    _serial_phase_order,
+    _stage_specs,
 )
 
 pytestmark = [pytest.mark.cpu_only]
@@ -66,6 +69,7 @@ def _sample_topology() -> dict:
         "moe_ep_size": 4,
         "attn_gpu_ids": [0, 1],
         "moe_gpu_ids": [0, 1, 2, 3],
+        "num_layer_pairs": 1,
         "seed": 1234,
     }
 
@@ -100,7 +104,10 @@ def _sample_case_payload(
     runtime_backend: str = "mps_only",
     green_ctx_attn_sms: int | None = None,
     green_ctx_moe_sms: int | None = None,
+    num_layer_pairs: int = 1,
 ) -> dict:
+    tokens_per_iter = seq_len * batch_size
+    timed_tokens = tokens_per_iter
     return build_case_payload(
         case_id=case_id,
         status=status,
@@ -110,27 +117,89 @@ def _sample_case_payload(
         runtime_backend=runtime_backend,
         dtype="bf16",
         seed=1234,
-        topology=_sample_topology(),
+        topology={**_sample_topology(), "num_layer_pairs": num_layer_pairs},
         nccl_env=_sample_nccl(),
         moe_routing_mode="normal",
+        num_layer_pairs=num_layer_pairs,
         runtime=build_runtime_metadata(
             runtime_backend=runtime_backend,
             green_ctx_attn_sms=green_ctx_attn_sms,
             green_ctx_moe_sms=green_ctx_moe_sms,
-            granted_sms_by_role={"attn": [green_ctx_attn_sms], "moe": [green_ctx_moe_sms]},
+            granted_sms_by_role={
+                "attn": [green_ctx_attn_sms],
+                "moe": [green_ctx_moe_sms],
+            },
             device_total_sms_by_role={"attn": [132], "moe": [132]},
         ),
         timing_ms={"total": 10.0, "timed_wall": 8.0, "attn": 4.0, "moe": 6.0},
+        layer_timings_ms={
+            "attn": [
+                {
+                    "pair_index": pair_index,
+                    "stage_label": f"attn_{pair_index}",
+                    "cuda": 4.0,
+                    "step_total": 4.5,
+                    "timed_wall": 8.0,
+                }
+                for pair_index in range(num_layer_pairs)
+            ],
+            "moe": [
+                {
+                    "pair_index": pair_index,
+                    "stage_label": f"moe_{pair_index}",
+                    "cuda": 6.0,
+                    "step_total": 6.5,
+                    "timed_wall": 8.0,
+                }
+                for pair_index in range(num_layer_pairs)
+            ],
+        },
+        throughput={
+            "tokens_per_iter": tokens_per_iter,
+            "timed_tokens": timed_tokens,
+            "tokens_per_s": timed_tokens / (8.0 / 1000.0),
+        },
         overlap_ms=1.5,
         finite={"all_finite": True, "first_nonfinite": None},
         stage_signatures={
-            "attn": {"sum": 1.0, "mean": 0.1, "std": 0.2, "max_abs": 1.5},
-            "moe": {"sum": 2.0, "mean": 0.2, "std": 0.3, "max_abs": 2.5},
+            "attn": [
+                {
+                    "pair_index": pair_index,
+                    "stage_label": f"attn_{pair_index}",
+                    "signature": {"sum": 1.0, "mean": 0.1, "std": 0.2, "max_abs": 1.5},
+                }
+                for pair_index in range(num_layer_pairs)
+            ],
+            "moe": [
+                {
+                    "pair_index": pair_index,
+                    "stage_label": f"moe_{pair_index}",
+                    "signature": {"sum": 2.0, "mean": 0.2, "std": 0.3, "max_abs": 2.5},
+                }
+                for pair_index in range(num_layer_pairs)
+            ],
         },
         baseline_diff={
             "baseline_case_id": None,
             "all_within_tolerance": None,
-            "stages": {"attn": None, "moe": None},
+            "stages": {
+                "attn": [
+                    {
+                        "pair_index": pair_index,
+                        "stage_label": f"attn_{pair_index}",
+                        "diff": None,
+                    }
+                    for pair_index in range(num_layer_pairs)
+                ],
+                "moe": [
+                    {
+                        "pair_index": pair_index,
+                        "stage_label": f"moe_{pair_index}",
+                        "diff": None,
+                    }
+                    for pair_index in range(num_layer_pairs)
+                ],
+            },
         },
         error={"code": None, "message": None, "traceback": None},
         attempt_count=1,
@@ -153,8 +222,12 @@ def test_collapse_timed_window_spans_earliest_start_to_latest_end():
 
 
 def test_select_torch_profiler_cases_returns_backend_reruns_for_selected_pairs():
-    mps_only_serial = _sample_case_payload("mps-only-serial", "serial", seq_len=1024, batch_size=1)
-    mps_only_overlap = _sample_case_payload("mps-only-overlap", "overlap", seq_len=1024, batch_size=1)
+    mps_only_serial = _sample_case_payload(
+        "mps-only-serial", "serial", seq_len=1024, batch_size=1
+    )
+    mps_only_overlap = _sample_case_payload(
+        "mps-only-overlap", "overlap", seq_len=1024, batch_size=1
+    )
     mps_only_overlap["timing_ms"]["timed_wall"] = 10.0
     mps_green_ctx_serial = _sample_case_payload(
         "green-serial",
@@ -177,7 +250,12 @@ def test_select_torch_profiler_cases_returns_backend_reruns_for_selected_pairs()
     mps_green_ctx_overlap["timing_ms"]["timed_wall"] = 7.0
 
     selected = _select_torch_profiler_cases(
-        [mps_only_serial, mps_only_overlap, mps_green_ctx_serial, mps_green_ctx_overlap],
+        [
+            mps_only_serial,
+            mps_only_overlap,
+            mps_green_ctx_serial,
+            mps_green_ctx_overlap,
+        ],
         selection="representative",
     )
 
@@ -188,10 +266,16 @@ def test_select_torch_profiler_cases_returns_backend_reruns_for_selected_pairs()
 
 def test_select_torch_profiler_cases_supports_all_successful_selection():
     serial = _sample_case_payload("case-serial", "serial", seq_len=1024, batch_size=2)
-    overlap = _sample_case_payload("case-overlap", "overlap", seq_len=1024, batch_size=2)
-    failed = _sample_case_payload("case-failed", "overlap", status="runtime_error", seq_len=1024, batch_size=2)
+    overlap = _sample_case_payload(
+        "case-overlap", "overlap", seq_len=1024, batch_size=2
+    )
+    failed = _sample_case_payload(
+        "case-failed", "overlap", status="runtime_error", seq_len=1024, batch_size=2
+    )
 
-    selected = _select_torch_profiler_cases([failed, overlap, serial], selection="all-successful")
+    selected = _select_torch_profiler_cases(
+        [failed, overlap, serial], selection="all-successful"
+    )
 
     assert [row["case_id"] for row in selected] == ["case-overlap", "case-serial"]
 
@@ -203,7 +287,10 @@ def test_parse_batch_sizes_requires_positive_integers():
 
 
 def test_parse_runtime_backends_dedupes_and_validates_values():
-    assert parse_runtime_backends("mps_only,mps_green_ctx,mps_only") == ["mps_only", "mps_green_ctx"]
+    assert parse_runtime_backends("mps_only,mps_green_ctx,mps_only") == [
+        "mps_only",
+        "mps_green_ctx",
+    ]
     with pytest.raises(ValueError):
         parse_runtime_backends("mps_only,unknown")
 
@@ -247,6 +334,127 @@ def test_resolve_profiler_schedule_supports_independent_wait_iters():
     assert active_iters == 7
 
 
+def test_parse_args_supports_num_layer_pairs_and_defaults_to_one(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "step7_megatron_ep_overlap.py",
+            "--model-name",
+            "Qwen/Qwen3-30B-A3B",
+            "--model-type",
+            "qwen3_moe",
+            "--attn-gpu-ids",
+            "0",
+            "--moe-gpu-ids",
+            "0",
+            "--attn-dp-size",
+            "1",
+            "--moe-ep-size",
+            "1",
+            "--output-dir",
+            "/tmp/out",
+        ],
+    )
+    assert _parse_args().num_layer_pairs == 1
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "step7_megatron_ep_overlap.py",
+            "--model-name",
+            "Qwen/Qwen3-30B-A3B",
+            "--model-type",
+            "qwen3_moe",
+            "--attn-gpu-ids",
+            "0",
+            "--moe-gpu-ids",
+            "0",
+            "--attn-dp-size",
+            "1",
+            "--moe-ep-size",
+            "1",
+            "--num-layer-pairs",
+            "2",
+            "--output-dir",
+            "/tmp/out",
+        ],
+    )
+    assert _parse_args().num_layer_pairs == 2
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "step7_megatron_ep_overlap.py",
+            "--model-name",
+            "Qwen/Qwen3-30B-A3B",
+            "--model-type",
+            "qwen3_moe",
+            "--attn-gpu-ids",
+            "0",
+            "--moe-gpu-ids",
+            "0",
+            "--attn-dp-size",
+            "1",
+            "--moe-ep-size",
+            "1",
+            "--num-layer-pairs",
+            "0",
+            "--output-dir",
+            "/tmp/out",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        _parse_args()
+
+
+def test_stage_specs_and_serial_phase_order_expand_for_two_pairs():
+    specs = _stage_specs([0, 1], [0, 1, 2, 3], 2)
+    assert [spec["stage_label"] for spec in specs] == [
+        "attn_0",
+        "moe_0",
+        "attn_1",
+        "moe_1",
+    ]
+    assert [spec["pair_index"] for spec in specs] == [0, 0, 1, 1]
+    assert len({spec["master_port"] for spec in specs}) == 4
+    assert _serial_phase_order(2) == ("attn_0", "moe_0", "attn_1", "moe_1")
+
+
+def test_run_iteration_schedule_serial_lockstep_supports_multi_pair_phase_order():
+    barrier_calls: list[tuple[str, int]] = []
+    forward_calls: list[tuple[str, int, bool]] = []
+    windows = _run_iteration_schedule(
+        execution_schedule="serial_lockstep",
+        stage_role="moe",
+        stage_label="moe_1",
+        serial_phase_order=("attn_0", "moe_0", "attn_1", "moe_1"),
+        total_iters=2,
+        warmup_iters=1,
+        barrier_wait=lambda phase, iter_idx: barrier_calls.append((phase, iter_idx)),
+        run_forward=lambda phase, iter_idx, is_timed: forward_calls.append(
+            (phase, iter_idx, is_timed)
+        ),
+    )
+    assert barrier_calls == [
+        ("serial_start", 0),
+        ("serial_between_0", 0),
+        ("serial_between_1", 0),
+        ("serial_between_2", 0),
+        ("serial_end", 0),
+        ("serial_start", 1),
+        ("serial_between_0", 1),
+        ("serial_between_1", 1),
+        ("serial_between_2", 1),
+        ("serial_end", 1),
+    ]
+    assert forward_calls == [("moe_1", 0, False), ("moe_1", 1, True)]
+    assert windows["stage_timed_window_s"]["duration_ms"] is not None
+    assert windows["schedule_timed_window_s"]["duration_ms"] is not None
+
+
 def test_run_iteration_schedule_serial_lockstep_steps_once_and_skips_inactive_phase():
     barrier_calls: list[tuple[str, int]] = []
     forward_calls: list[tuple[str, int, bool]] = []
@@ -259,7 +467,9 @@ def test_run_iteration_schedule_serial_lockstep_steps_once_and_skips_inactive_ph
         total_iters=3,
         warmup_iters=1,
         barrier_wait=lambda phase, iter_idx: barrier_calls.append((phase, iter_idx)),
-        run_forward=lambda phase, iter_idx, is_timed: forward_calls.append((phase, iter_idx, is_timed)),
+        run_forward=lambda phase, iter_idx, is_timed: forward_calls.append(
+            (phase, iter_idx, is_timed)
+        ),
         profiler_step=lambda iter_idx: profiler_steps.append(iter_idx),
         now=lambda: float(next(clock)),
     )
@@ -293,7 +503,11 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
         calls.append({"stage_specs": stage_specs, "common_config": common_config})
         return {
             "status": "ok",
-            "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
+            "schedule_timed_window_s": {
+                "start_s": 10.0,
+                "end_s": 11.0,
+                "duration_ms": 1000.0,
+            },
             "results": [
                 {
                     "role": "attn",
@@ -308,17 +522,34 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                         "layer_class": "TransformerLayer",
                         "self_attention_class": "SelfAttention",
                         "core_attention_class": "TEDotProductAttention",
-                        "nvte_backend_flags": {"flash": "1", "fused": "1", "unfused": "1"},
+                        "nvte_backend_flags": {
+                            "flash": "1",
+                            "fused": "1",
+                            "unfused": "1",
+                        },
                     },
                     "moe_grouped_gemm": True,
                     "moe_token_dispatcher_type": "alltoall",
                     "overlap_moe_expert_parallel_comm": True,
                     "timing_ms": {"cuda": 1.25, "step_total": 1.5, "timed_wall": 400.0},
-                    "timed_window_s": {"start_s": 10.1, "end_s": 10.5, "duration_ms": 400.0},
-                    "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 10.1,
+                        "end_s": 10.5,
+                        "duration_ms": 400.0,
+                    },
+                    "schedule_timed_window_s": {
+                        "start_s": 10.0,
+                        "end_s": 11.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [(1.0, 1.1)],
                     "finite": {"all_finite": True, "first_nonfinite": None},
-                    "output_signature": {"sum": 1.0, "mean": 0.1, "std": 0.2, "max_abs": 1.5},
+                    "output_signature": {
+                        "sum": 1.0,
+                        "mean": 0.1,
+                        "std": 0.2,
+                        "max_abs": 1.5,
+                    },
                     "moe_routing_mode": "normal",
                     "tokens_per_expert": None,
                     "local_tokens_per_expert": None,
@@ -336,17 +567,34 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
                         "layer_class": "TransformerLayer",
                         "self_attention_class": "SelfAttention",
                         "core_attention_class": "TEDotProductAttention",
-                        "nvte_backend_flags": {"flash": "1", "fused": "1", "unfused": "1"},
+                        "nvte_backend_flags": {
+                            "flash": "1",
+                            "fused": "1",
+                            "unfused": "1",
+                        },
                     },
                     "moe_grouped_gemm": True,
                     "moe_token_dispatcher_type": "alltoall",
                     "overlap_moe_expert_parallel_comm": True,
                     "timing_ms": {"cuda": 2.5, "step_total": 3.0, "timed_wall": 700.0},
-                    "timed_window_s": {"start_s": 10.2, "end_s": 10.9, "duration_ms": 700.0},
-                    "schedule_timed_window_s": {"start_s": 10.0, "end_s": 11.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 10.2,
+                        "end_s": 10.9,
+                        "duration_ms": 700.0,
+                    },
+                    "schedule_timed_window_s": {
+                        "start_s": 10.0,
+                        "end_s": 11.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [(1.2, 1.4)],
                     "finite": {"all_finite": True, "first_nonfinite": None},
-                    "output_signature": {"sum": 2.0, "mean": 0.2, "std": 0.3, "max_abs": 2.5},
+                    "output_signature": {
+                        "sum": 2.0,
+                        "mean": 0.2,
+                        "std": 0.3,
+                        "max_abs": 2.5,
+                    },
                     "moe_routing_mode": "normal",
                     "tokens_per_expert": None,
                     "local_tokens_per_expert": None,
@@ -395,12 +643,23 @@ def test_run_case_attempt_serial_uses_joint_launch_and_launch_timed_window(monke
     assert calls[0]["common_config"]["execution_schedule"] == "serial_lockstep"
     assert {spec["role"] for spec in calls[0]["stage_specs"]} == {"attn", "moe"}
     assert result["status"] == "ok"
-    assert result["attention_backend"] == {"requested": "auto", "attn": "auto", "moe": "auto"}
-    assert result["attention_impl"]["attn"]["core_attention_class"] == "TEDotProductAttention"
+    assert result["attention_backend"] == {
+        "requested": "auto",
+        "attn": "auto",
+        "moe": "auto",
+    }
+    assert (
+        result["attention_impl"]["attn"]["core_attention_class"]
+        == "TEDotProductAttention"
+    )
     assert result["attention_impl"]["attn"]["transformer_impl"] == "transformer_engine"
     assert result["moe_runtime"] == {
         "grouped_gemm": {"requested": True, "attn": True, "moe": True},
-        "token_dispatcher_type": {"requested": "alltoall", "attn": "alltoall", "moe": "alltoall"},
+        "token_dispatcher_type": {
+            "requested": "alltoall",
+            "attn": "alltoall",
+            "moe": "alltoall",
+        },
         "overlap_expert_parallel_comm": {"requested": True, "attn": True, "moe": True},
     }
     assert result["timing_ms"]["timed_wall"] == pytest.approx(1000.0)
@@ -419,14 +678,22 @@ def test_normalize_launch_failure_prefers_root_cause_worker_error():
                 "rank": 0,
                 "status": "oom",
                 "failure_origin": True,
-                "error": {"code": "oom", "message": "CUDA out of memory", "traceback": None},
+                "error": {
+                    "code": "oom",
+                    "message": "CUDA out of memory",
+                    "traceback": None,
+                },
             },
             {
                 "role": "moe",
                 "rank": 0,
                 "status": "runtime_error",
                 "failure_origin": False,
-                "error": {"code": "runtime_error", "message": "Schedule aborted", "traceback": None},
+                "error": {
+                    "code": "runtime_error",
+                    "message": "Schedule aborted",
+                    "traceback": None,
+                },
             },
         ],
         expected=4,
@@ -443,49 +710,77 @@ def test_run_case_attempt_reduces_equal_tokens_counts(monkeypatch):
         del stage_specs, common_config, timeout_s, mps_env
         return {
             "status": "ok",
-            "schedule_timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+            "schedule_timed_window_s": {
+                "start_s": 1.0,
+                "end_s": 2.0,
+                "duration_ms": 1000.0,
+            },
             "results": [
                 {
                     "role": "attn",
                     "rank": 0,
                     "status": "ok",
                     "timing_ms": {"cuda": 1.0, "step_total": 1.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 1.0},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": None,
                     "local_tokens_per_expert": None,
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
                 {
                     "role": "moe",
                     "rank": 0,
                     "status": "ok",
                     "timing_ms": {"cuda": 2.0, "step_total": 2.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 2.0},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": [2, 2, 1, 1],
                     "local_tokens_per_expert": [2, 2, 0, 0],
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
                 {
                     "role": "moe",
                     "rank": 1,
                     "status": "ok",
                     "timing_ms": {"cuda": 2.0, "step_total": 2.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 2.0},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": [2, 2, 1, 1],
                     "local_tokens_per_expert": [0, 0, 1, 1],
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
             ],
         }
@@ -533,49 +828,77 @@ def test_run_case_attempt_rejects_mismatched_equal_tokens_vectors(monkeypatch):
         del stage_specs, common_config, timeout_s, mps_env
         return {
             "status": "ok",
-            "schedule_timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+            "schedule_timed_window_s": {
+                "start_s": 1.0,
+                "end_s": 2.0,
+                "duration_ms": 1000.0,
+            },
             "results": [
                 {
                     "role": "attn",
                     "rank": 0,
                     "status": "ok",
                     "timing_ms": {"cuda": 1.0, "step_total": 1.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 1.0},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": None,
                     "local_tokens_per_expert": None,
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
                 {
                     "role": "moe",
                     "rank": 0,
                     "status": "ok",
                     "timing_ms": {"cuda": 2.0, "step_total": 2.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 2.0},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": [2, 2, 1, 1],
                     "local_tokens_per_expert": [2, 2, 0, 0],
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
                 {
                     "role": "moe",
                     "rank": 1,
                     "status": "ok",
                     "timing_ms": {"cuda": 2.0, "step_total": 2.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 2.0},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": [2, 2, 1, 1],
                     "local_tokens_per_expert": [0, 0, 1],
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
             ],
         }
@@ -622,55 +945,93 @@ def test_run_case_attempt_equal_tokens_tolerates_non_finite_outputs(monkeypatch)
         del stage_specs, common_config, timeout_s, mps_env
         return {
             "status": "ok",
-            "schedule_timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+            "schedule_timed_window_s": {
+                "start_s": 1.0,
+                "end_s": 2.0,
+                "duration_ms": 1000.0,
+            },
             "results": [
                 {
                     "role": "attn",
                     "rank": 0,
                     "status": "ok",
                     "timing_ms": {"cuda": 1.0, "step_total": 1.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {"all_finite": True, "first_nonfinite": None},
                     "output_signature": {"sum": 1.0},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": None,
                     "local_tokens_per_expert": None,
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
                 {
                     "role": "moe",
                     "rank": 0,
                     "status": "ok",
                     "timing_ms": {"cuda": 2.0, "step_total": 2.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {
                         "all_finite": False,
-                        "first_nonfinite": {"module": "moe_layer", "phase": "forward", "tensor": "output", "iter": 0},
+                        "first_nonfinite": {
+                            "module": "moe_layer",
+                            "phase": "forward",
+                            "tensor": "output",
+                            "iter": 0,
+                        },
                     },
                     "output_signature": {"sum": float("nan")},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": [2, 2, 1, 1],
                     "local_tokens_per_expert": [2, 2, 0, 0],
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
                 {
                     "role": "moe",
                     "rank": 1,
                     "status": "ok",
                     "timing_ms": {"cuda": 2.0, "step_total": 2.0},
-                    "timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+                    "timed_window_s": {
+                        "start_s": 1.0,
+                        "end_s": 2.0,
+                        "duration_ms": 1000.0,
+                    },
                     "enqueue_windows": [],
                     "finite": {
                         "all_finite": False,
-                        "first_nonfinite": {"module": "moe_layer", "phase": "forward", "tensor": "output", "iter": 0},
+                        "first_nonfinite": {
+                            "module": "moe_layer",
+                            "phase": "forward",
+                            "tensor": "output",
+                            "iter": 0,
+                        },
                     },
                     "output_signature": {"sum": float("nan")},
                     "moe_routing_mode": "equal_tokens",
                     "tokens_per_expert": [2, 2, 1, 1],
                     "local_tokens_per_expert": [0, 0, 1, 1],
-                    "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": 132},
+                    "runtime": {
+                        "requested_sms": None,
+                        "granted_sms": None,
+                        "device_total_sms": 132,
+                    },
                 },
             ],
         }
@@ -730,7 +1091,9 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         (trace_dir / "worker0.pt.trace.json").write_text("{}")
         return _Completed()
 
-    monkeypatch.setattr("examples.attn_moe_overlap.step7_megatron_ep_overlap.subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        "examples.attn_moe_overlap.step7_megatron_ep_overlap.subprocess.run", _fake_run
+    )
 
     args = SimpleNamespace(
         capture_torch_profiler="on",
@@ -755,7 +1118,12 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     run_config = {
         "model_name": "Qwen/Qwen3-30B-A3B",
         "model_type": "qwen3_moe",
-        "topology": {"attn_dp_size": 4, "moe_ep_size": 4, "attn_gpu_ids": [0, 1, 2, 3], "moe_gpu_ids": [0, 1, 2, 3]},
+        "topology": {
+            "attn_dp_size": 4,
+            "moe_ep_size": 4,
+            "attn_gpu_ids": [0, 1, 2, 3],
+            "moe_gpu_ids": [0, 1, 2, 3],
+        },
         "warmup_iters": 1,
         "timed_iters": 3,
         "worker_timeout_s": 180.0,
@@ -769,8 +1137,12 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         "overlap_moe_expert_parallel_comm": True,
         "torch_compile": "off",
     }
-    serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=2048, batch_size=4)
-    overlap = _sample_case_payload("case-overlap", "overlap", status="ok", seq_len=2048, batch_size=4)
+    serial = _sample_case_payload(
+        "case-serial", "serial", status="ok", seq_len=2048, batch_size=4
+    )
+    overlap = _sample_case_payload(
+        "case-overlap", "overlap", status="ok", seq_len=2048, batch_size=4
+    )
     serial["moe_routing_mode"] = "equal_tokens"
     overlap["moe_routing_mode"] = "equal_tokens"
     green_serial = _sample_case_payload(
@@ -805,7 +1177,9 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
     assert status == "ok"
     assert len(calls) == 4
     assert calls[0][0] == sys.executable
-    assert calls[0][1] == str((REPO_ROOT / "examples/attn_moe_overlap/step7_megatron_ep_overlap.py").resolve())
+    assert calls[0][1] == str(
+        (REPO_ROOT / "examples/attn_moe_overlap/step7_megatron_ep_overlap.py").resolve()
+    )
     assert "-m" not in calls[0]
     assert calls[0][calls[0].index("--attention-backend") + 1] == "fused"
     assert calls[0][calls[0].index("--moe-token-dispatcher-type") + 1] == "alltoall"
@@ -821,14 +1195,23 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         "mps_only",
         "mps_only",
     ]
-    green_cmd = next(cmd for cmd in calls if cmd[cmd.index("--runtime-backends") + 1] == "mps_green_ctx")
+    green_cmd = next(
+        cmd
+        for cmd in calls
+        if cmd[cmd.index("--runtime-backends") + 1] == "mps_green_ctx"
+    )
     assert green_cmd[green_cmd.index("--green-ctx-attn-sms") + 1] == "64"
     assert green_cmd[green_cmd.index("--green-ctx-moe-sms") + 1] == "64"
 
-    trace_index = json.loads((tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text())
+    trace_index = json.loads(
+        (tmp_path / "out" / "torch_profiler" / "trace_index.json").read_text()
+    )
     assert trace_index["status"] == "ok"
     assert trace_index["selection"] == "all-successful"
-    assert all(entry["trace_files"] == [f"{entry['trace_dir']}/worker0.pt.trace.json"] for entry in trace_index["entries"])
+    assert all(
+        entry["trace_files"] == [f"{entry['trace_dir']}/worker0.pt.trace.json"]
+        for entry in trace_index["entries"]
+    )
     assert all(entry["profiler_status"] == "ok" for entry in trace_index["entries"])
 
 
@@ -853,10 +1236,17 @@ def test_case_id_is_deterministic_and_sensitive_to_batch_size_and_nccl_tuple():
     case_id_c = build_case_id(**kwargs, nccl_tuple=(8, 16, 32))
     case_id_d = build_case_id(**{**kwargs, "batch_size": 4}, nccl_tuple=(4, 16, 32))
     case_id_e = build_case_id(
-        **{**kwargs, "runtime_backend": "mps_green_ctx", "green_ctx_attn_sms": 64, "green_ctx_moe_sms": 64},
+        **{
+            **kwargs,
+            "runtime_backend": "mps_green_ctx",
+            "green_ctx_attn_sms": 64,
+            "green_ctx_moe_sms": 64,
+        },
         nccl_tuple=(4, 16, 32),
     )
-    case_id_f = build_case_id(**{**kwargs, "moe_routing_mode": "equal_tokens"}, nccl_tuple=(4, 16, 32))
+    case_id_f = build_case_id(
+        **{**kwargs, "moe_routing_mode": "equal_tokens"}, nccl_tuple=(4, 16, 32)
+    )
     assert case_id_a == case_id_b
     assert case_id_a != case_id_c
     assert case_id_a != case_id_d
@@ -908,7 +1298,10 @@ def test_validate_case_payload_rejects_missing_equal_tokens_metadata():
         timing_ms={"total": 1.0, "timed_wall": 0.9, "attn": 0.4, "moe": 0.5},
         overlap_ms=0.0,
         finite={"all_finite": True, "first_nonfinite": None},
-        stage_signatures={"attn": None, "moe": None},
+        stage_signatures={
+            "attn": [{"pair_index": 0, "stage_label": "attn_0", "signature": None}],
+            "moe": [{"pair_index": 0, "stage_label": "moe_0", "signature": None}],
+        },
         error={"code": None, "message": None, "traceback": None},
     )
 
@@ -932,7 +1325,10 @@ def test_validate_case_payload_allows_missing_equal_tokens_metadata_for_failed_c
         timing_ms={"total": None, "timed_wall": None, "attn": None, "moe": None},
         overlap_ms=0.0,
         finite={"all_finite": False, "first_nonfinite": None},
-        stage_signatures={"attn": None, "moe": None},
+        stage_signatures={
+            "attn": [{"pair_index": 0, "stage_label": "attn_0", "signature": None}],
+            "moe": [{"pair_index": 0, "stage_label": "moe_0", "signature": None}],
+        },
         error={"code": "invalid_environment", "message": "boom", "traceback": None},
     )
 
@@ -952,7 +1348,9 @@ def test_build_equal_token_routing_state_balances_tokens():
     assert state.local_tokens_per_expert == [0, 0, 4, 3]
     assert max(state.tokens_per_expert) - min(state.tokens_per_expert) == 1
     assert state.routing_map.dtype == torch.bool
-    assert torch.allclose(state.probs.sum(dim=1), torch.ones(7, dtype=hidden_states.dtype))
+    assert torch.allclose(
+        state.probs.sum(dim=1), torch.ones(7, dtype=hidden_states.dtype)
+    )
     assert torch.all(state.routing_map.sum(dim=1) == 2)
 
 
@@ -1004,13 +1402,21 @@ def test_runtime_config_threads_attention_and_moe_overrides_into_engine_config()
         num_experts=None,
     )
 
-    from examples.attn_moe_overlap.megatron_layer_runtime import MegatronSingleLayerRuntime
+    from examples.attn_moe_overlap.megatron_layer_runtime import (
+        MegatronSingleLayerRuntime,
+    )
 
     trainer_config = MegatronSingleLayerRuntime(runtime_config)._build_trainer_config()
     assert trainer_config["engine_config"]["attention_backend"] == "auto"
     assert trainer_config["engine_config"]["megatron_moe_grouped_gemm"] is True
-    assert trainer_config["engine_config"]["megatron_moe_token_dispatcher_type"] == "alltoall"
-    assert trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"] is True
+    assert (
+        trainer_config["engine_config"]["megatron_moe_token_dispatcher_type"]
+        == "alltoall"
+    )
+    assert (
+        trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"]
+        is True
+    )
 
 
 def test_runtime_config_omits_false_boolean_moe_overrides():
@@ -1031,12 +1437,20 @@ def test_runtime_config_omits_false_boolean_moe_overrides():
         num_experts=None,
     )
 
-    from examples.attn_moe_overlap.megatron_layer_runtime import MegatronSingleLayerRuntime
+    from examples.attn_moe_overlap.megatron_layer_runtime import (
+        MegatronSingleLayerRuntime,
+    )
 
     trainer_config = MegatronSingleLayerRuntime(runtime_config)._build_trainer_config()
     assert trainer_config["engine_config"]["megatron_moe_grouped_gemm"] is None
-    assert trainer_config["engine_config"]["megatron_moe_token_dispatcher_type"] == "alltoall"
-    assert trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"] is None
+    assert (
+        trainer_config["engine_config"]["megatron_moe_token_dispatcher_type"]
+        == "alltoall"
+    )
+    assert (
+        trainer_config["engine_config"]["megatron_overlap_moe_expert_parallel_comm"]
+        is None
+    )
 
 
 def test_runtime_config_equal_tokens_preserves_model_topk():
@@ -1058,7 +1472,9 @@ def test_runtime_config_equal_tokens_preserves_model_topk():
         moe_routing_mode="equal_tokens",
     )
 
-    from examples.attn_moe_overlap.megatron_layer_runtime import MegatronSingleLayerRuntime
+    from examples.attn_moe_overlap.megatron_layer_runtime import (
+        MegatronSingleLayerRuntime,
+    )
 
     trainer_config = MegatronSingleLayerRuntime(runtime_config)._build_trainer_config()
     assert "megatron_moe_router_topk" not in trainer_config["engine_config"]
@@ -1155,9 +1571,74 @@ def test_describe_attention_runtime_reports_layer_and_nvte_flags(monkeypatch):
     assert info["nvte_backend_flags"] == {"flash": "1", "fused": "1", "unfused": "1"}
 
 
+def test_validate_case_payload_rejects_missing_pair_indexed_stage_signatures_for_successful_case():
+    payload = _sample_case_payload("case-two-pairs", "overlap", num_layer_pairs=2)
+    payload["stage_signatures"]["attn"] = payload["stage_signatures"]["attn"][:1]
+    errors = validate_case_payload(payload)
+    assert any(
+        "stage_signatures.attn must cover pair indices" in error for error in errors
+    )
+
+
+def test_matrix_summary_normalizes_timed_wall_and_keeps_tokens_per_s_for_two_pairs():
+    serial = _sample_case_payload(
+        "serial-two-pairs", "serial", seq_len=4096, batch_size=4, num_layer_pairs=2
+    )
+    serial["timing_ms"]["timed_wall"] = 120.0
+    serial["throughput"]["timed_tokens"] = serial["throughput"]["tokens_per_iter"] * 3
+    serial["throughput"]["tokens_per_s"] = serial["throughput"]["timed_tokens"] / (
+        120.0 / 1000.0
+    )
+    overlap = _sample_case_payload(
+        "overlap-two-pairs", "overlap", seq_len=4096, batch_size=4, num_layer_pairs=2
+    )
+    overlap["timing_ms"]["timed_wall"] = 90.0
+    overlap["throughput"]["timed_tokens"] = overlap["throughput"]["tokens_per_iter"] * 3
+    overlap["throughput"]["tokens_per_s"] = overlap["throughput"]["timed_tokens"] / (
+        90.0 / 1000.0
+    )
+    overlap["overlap"]["timed_speedup_vs_serial"] = 120.0 / 90.0
+    identity_fields = {
+        "seq_lens": [4096],
+        "batch_sizes": [4],
+        "dtypes": ["bf16"],
+        "nccl_tuples": ["4,16,32"],
+        "runtime_backends": ["mps_only"],
+        "green_ctx_sms": {"attn": None, "moe": None},
+        "device_sm_signature": {"0": 132, "1": 132},
+        "moe_routing_mode": "normal",
+        "num_layer_pairs": 2,
+    }
+    summary = build_matrix_summary(
+        run_config={
+            "model_name": "Qwen/Qwen3-30B-A3B",
+            "model_type": "qwen3_moe",
+            **identity_fields,
+            "config_fingerprint": build_config_fingerprint(identity_fields),
+            "timed_iters": 3,
+        },
+        cases=[serial, overlap],
+        total_points=2,
+    )
+    row = summary["comparison_rows"][0]
+    assert row["num_layer_pairs"] == 2
+    assert row["serial_timed_wall_ms"] == pytest.approx(40.0)
+    assert row["overlap_timed_wall_ms"] == pytest.approx(30.0)
+    assert row["serial_tokens_per_s"] == pytest.approx(
+        serial["throughput"]["tokens_per_s"]
+    )
+    assert row["overlap_tokens_per_s"] == pytest.approx(
+        overlap["throughput"]["tokens_per_s"]
+    )
+
+
 def test_matrix_summary_contract_and_status_count_invariant():
-    serial = _sample_case_payload("case-serial", "serial", status="ok", seq_len=1024, batch_size=2)
-    overlap = _sample_case_payload("case-overlap", "overlap", status="oom", seq_len=1024, batch_size=2)
+    serial = _sample_case_payload(
+        "case-serial", "serial", status="ok", seq_len=1024, batch_size=2
+    )
+    overlap = _sample_case_payload(
+        "case-overlap", "overlap", status="oom", seq_len=1024, batch_size=2
+    )
     overlap["attempt_count"] = 2
     identity_fields = {
         "seq_lens": [1024],
@@ -1169,6 +1650,7 @@ def test_matrix_summary_contract_and_status_count_invariant():
         "device_sm_signature": {"0": 132, "1": 132},
         "moe_routing_mode": "normal",
         "torch_compile": "off",
+        "num_layer_pairs": 1,
     }
     summary = build_matrix_summary(
         run_config={
@@ -1202,8 +1684,12 @@ def test_matrix_summary_contract_and_status_count_invariant():
 
 
 def test_matrix_summary_persists_backend_pairs_for_same_code_comparisons():
-    mps_only_serial = _sample_case_payload("mps-only-serial", "serial", seq_len=1024, batch_size=2)
-    mps_only_overlap = _sample_case_payload("mps-only-overlap", "overlap", seq_len=1024, batch_size=2)
+    mps_only_serial = _sample_case_payload(
+        "mps-only-serial", "serial", seq_len=1024, batch_size=2
+    )
+    mps_only_overlap = _sample_case_payload(
+        "mps-only-overlap", "overlap", seq_len=1024, batch_size=2
+    )
     mps_only_overlap["timing_ms"]["timed_wall"] = 9.0
     mps_only_overlap["timing_ms"]["total"] = 11.0
     mps_only_overlap["overlap"]["timed_speedup_vs_serial"] = 1.11
@@ -1238,7 +1724,9 @@ def test_matrix_summary_persists_backend_pairs_for_same_code_comparisons():
         "runtime_backends": ["mps_only", "mps_green_ctx"],
         "green_ctx_sms": {"attn": 64, "moe": 64},
         "device_sm_signature": {"0": 132, "1": 132},
+        "moe_routing_mode": "normal",
         "torch_compile": "off",
+        "num_layer_pairs": 1,
     }
     summary = build_matrix_summary(
         run_config={
@@ -1256,15 +1744,29 @@ def test_matrix_summary_persists_backend_pairs_for_same_code_comparisons():
     assert backend_pairs[0]["pair_status"] == "ok"
     assert backend_pairs[0]["mps_only_overlap_case_id"] == "mps-only-overlap"
     assert backend_pairs[0]["mps_green_ctx_overlap_case_id"] == "green-overlap"
-    assert backend_pairs[0]["mps_only_serial_timed_speedup_vs_serial"] == pytest.approx(1.0)
-    assert backend_pairs[0]["overlap_timed_speedup_mps_green_ctx_vs_mps_only"] == pytest.approx(9.0 / 7.0)
+    assert backend_pairs[0]["mps_only_serial_timed_speedup_vs_serial"] == pytest.approx(
+        1.0
+    )
+    assert backend_pairs[0][
+        "overlap_timed_speedup_mps_green_ctx_vs_mps_only"
+    ] == pytest.approx(9.0 / 7.0)
     assert backend_pairs[0]["delta_overlap_timed_wall_ms"] == pytest.approx(2.0)
-    assert backend_pairs[0]["delta_timed_speedup_vs_serial"] == pytest.approx(0.32, abs=1e-6)
+    assert backend_pairs[0]["delta_timed_speedup_vs_serial"] == pytest.approx(
+        0.32, abs=1e-6
+    )
 
 
 def test_matrix_summary_marks_backend_pair_as_both_failed_when_both_backends_fail():
-    mps_only_serial = _sample_case_payload("mps-only-serial", "serial", seq_len=1024, batch_size=2)
-    mps_only_overlap = _sample_case_payload("mps-only-overlap", "overlap", status="runtime_error", seq_len=1024, batch_size=2)
+    mps_only_serial = _sample_case_payload(
+        "mps-only-serial", "serial", seq_len=1024, batch_size=2
+    )
+    mps_only_overlap = _sample_case_payload(
+        "mps-only-overlap",
+        "overlap",
+        status="runtime_error",
+        seq_len=1024,
+        batch_size=2,
+    )
     green_serial = _sample_case_payload(
         "green-serial",
         "serial",
@@ -1293,7 +1795,9 @@ def test_matrix_summary_marks_backend_pair_as_both_failed_when_both_backends_fai
         "runtime_backends": ["mps_only", "mps_green_ctx"],
         "green_ctx_sms": {"attn": 64, "moe": 64},
         "device_sm_signature": {"0": 132, "1": 132},
+        "moe_routing_mode": "normal",
         "torch_compile": "off",
+        "num_layer_pairs": 1,
     }
     summary = build_matrix_summary(
         run_config={
@@ -1440,7 +1944,12 @@ def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path
     run_config = {
         "model_name": "Qwen/Qwen3-30B-A3B",
         "model_type": "qwen3_moe",
-        "topology": {"attn_dp_size": 4, "moe_ep_size": 4, "attn_gpu_ids": [0, 1, 2, 3], "moe_gpu_ids": [0, 1, 2, 3]},
+        "topology": {
+            "attn_dp_size": 4,
+            "moe_ep_size": 4,
+            "attn_gpu_ids": [0, 1, 2, 3],
+            "moe_gpu_ids": [0, 1, 2, 3],
+        },
         "warmup_iters": 1,
         "timed_iters": 3,
         "worker_timeout_s": 180.0,
@@ -1456,7 +1965,11 @@ def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path
     status = _run_torch_profiler_capture(
         args=args,
         run_config=run_config,
-        cases=[_sample_case_payload("case-bad", "overlap", status="runtime_error", batch_size=4)],
+        cases=[
+            _sample_case_payload(
+                "case-bad", "overlap", status="runtime_error", batch_size=4
+            )
+        ],
     )
     assert status == "off"
     assert not (tmp_path / "out" / "torch_profiler" / "trace_index.json").exists()
@@ -1850,7 +2363,7 @@ def test_aggregate_stage_results_marks_compiled_when_all_workers_compile():
     ]
 
     stage = _aggregate_stage_results(
-        "attn",
+        {"role": "attn", "stage_label": "attn_0", "pair_index": 0},
         results,
         expected_world_size=2,
         torch_compile_requested="on",
@@ -1874,7 +2387,7 @@ def test_aggregate_stage_results_propagates_compile_failures():
     ]
 
     stage = _aggregate_stage_results(
-        "attn",
+        {"role": "attn", "stage_label": "attn_0", "pair_index": 0},
         results,
         expected_world_size=2,
         torch_compile_requested="on",
@@ -1892,7 +2405,7 @@ def test_aggregate_stage_results_rejects_mixed_successful_compile_statuses():
     ]
 
     stage = _aggregate_stage_results(
-        "attn",
+        {"role": "attn", "stage_label": "attn_0", "pair_index": 0},
         results,
         expected_world_size=2,
         torch_compile_requested="on",
