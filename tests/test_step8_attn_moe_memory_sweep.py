@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from examples.attn_moe_overlap.step8_attn_moe_memory_sweep import (  # noqa: E402
     BenchmarkConfig,
+    ResolvedModelConfig,
     bytes_to_units,
     canonical_matrix,
     expected_row_keys,
@@ -22,6 +23,8 @@ from examples.attn_moe_overlap.step8_attn_moe_memory_sweep import (  # noqa: E40
     parse_modes,
     parse_modules,
     render_results_markdown,
+    resolve_model_config,
+    run_sweep,
     write_csv,
     write_json,
 )
@@ -30,6 +33,21 @@ pytestmark = [pytest.mark.cpu_only]
 
 
 def _config() -> BenchmarkConfig:
+    model = ResolvedModelConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_revision="ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+        model_commit_hash="ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+        model_type="qwen3_moe",
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        num_experts=128,
+        num_experts_per_tok=8,
+        moe_intermediate_size=768,
+        attention_backend="sdpa",
+        config_available=True,
+    )
     return BenchmarkConfig(
         modules=("attention", "moe"),
         modes=("forward", "forward_backward"),
@@ -39,12 +57,8 @@ def _config() -> BenchmarkConfig:
         device="cuda",
         warmup_iters=1,
         timed_iters=1,
-        hidden_size=1024,
-        num_heads=16,
-        intermediate_size=4096,
-        num_experts=8,
-        top_k=2,
         seed=1234,
+        model=model,
     )
 
 
@@ -66,11 +80,22 @@ def _metadata() -> dict:
             "warmup_iters": config.warmup_iters,
             "timed_iters": config.timed_iters,
             "dtype": config.dtype_name,
-            "hidden_size": config.hidden_size,
-            "num_heads": config.num_heads,
-            "intermediate_size": config.intermediate_size,
-            "num_experts": config.num_experts,
-            "top_k": config.top_k,
+        },
+        "model": {
+            "model_name": config.model.model_name,
+            "model_revision": config.model.model_revision,
+            "model_commit_hash": config.model.model_commit_hash,
+            "model_type": config.model.model_type,
+            "hidden_size": config.model.hidden_size,
+            "num_attention_heads": config.model.num_attention_heads,
+            "num_key_value_heads": config.model.num_key_value_heads,
+            "head_dim": config.model.head_dim,
+            "num_experts": config.model.num_experts,
+            "num_experts_per_tok": config.model.num_experts_per_tok,
+            "moe_intermediate_size": config.model.moe_intermediate_size,
+            "attention_backend": config.model.attention_backend,
+            "config_available": config.model.config_available,
+            "config_error": config.model.config_error,
         },
     }
 
@@ -114,6 +139,83 @@ def test_canonical_matrix_resolves_issue_grid_as_12_cells():
     assert ("moe", "forward_backward", 32768, 2) in expected_row_keys(config)
 
 
+def test_qwen_config_resolution_uses_expected_dimensions():
+    class FakeQwenConfig:
+        _commit_hash = "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+        model_type = "qwen3_moe"
+        hidden_size = 2048
+        num_attention_heads = 32
+        num_key_value_heads = 4
+        head_dim = 128
+        num_experts = 128
+        num_experts_per_tok = 8
+        moe_intermediate_size = 768
+        attention_backend = None
+
+    class FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(model_name: str, **kwargs):
+            assert model_name == "Qwen/Qwen3-30B-A3B"
+            assert kwargs == {}
+            return FakeQwenConfig()
+
+    resolved = resolve_model_config(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_revision=None,
+        auto_config_cls=FakeAutoConfig,
+    )
+
+    assert resolved.config_available is True
+    assert resolved.model_revision == "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+    assert resolved.model_type == "qwen3_moe"
+    assert resolved.hidden_size == 2048
+    assert resolved.num_attention_heads == 32
+    assert resolved.num_key_value_heads == 4
+    assert resolved.head_dim == 128
+    assert resolved.num_experts == 128
+    assert resolved.num_experts_per_tok == 8
+    assert resolved.moe_intermediate_size == 768
+    assert resolved.attention_backend == "sdpa"
+
+
+def test_config_unavailable_emits_skipped_rows_without_placeholder_dimensions():
+    config = BenchmarkConfig(
+        modules=("attention", "moe"),
+        modes=("forward", "forward_backward"),
+        seq_lens=(1024,),
+        batch_sizes=(1,),
+        dtype_name="bf16",
+        device="cuda",
+        warmup_iters=1,
+        timed_iters=1,
+        seed=1234,
+        model=ResolvedModelConfig(
+            model_name="Qwen/Qwen3-30B-A3B",
+            model_revision=None,
+            model_commit_hash=None,
+            model_type=None,
+            hidden_size=None,
+            num_attention_heads=None,
+            num_key_value_heads=None,
+            head_dim=None,
+            num_experts=None,
+            num_experts_per_tok=None,
+            moe_intermediate_size=None,
+            attention_backend=None,
+            config_available=False,
+            config_error="network unavailable",
+        ),
+    )
+    rows = run_sweep(config, {"num_gpus_used": 0})
+
+    assert len(rows) == 4
+    assert {row["status"] for row in rows} == {"skipped"}
+    assert {row["status_reason"] for row in rows} == {"config_unavailable"}
+    assert {row["hidden_size"] for row in rows} == {None}
+    assert {row["num_attention_heads"] for row in rows} == {None}
+    assert {row["num_experts"] for row in rows} == {None}
+
+
 def test_bytes_to_units_reports_raw_mib_and_gib():
     converted = bytes_to_units(1073741824)
     assert converted["bytes"] == 1073741824
@@ -134,6 +236,9 @@ def test_render_results_markdown_separates_modules_modes_and_notes_12_cells():
     )
 
     assert "6 sequence lengths x 2 batch sizes = 12 cells" in text
+    assert "supersedes the prior canonical artifact set that used placeholder synthetic dimensions" in text
+    assert "hidden_size=`2048`, num_attention_heads=`32`, num_key_value_heads=`4`, head_dim=`128`" in text
+    assert "num_experts=`128`, num_experts_per_tok=`8`, moe_intermediate_size=`768`" in text
     assert "## Attention forward" in text
     assert "## Attention forward+backward" in text
     assert "## Moe forward" in text

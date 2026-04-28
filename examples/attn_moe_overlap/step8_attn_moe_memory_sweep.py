@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 DEFAULT_SEQ_LENS = (1024, 2048, 4096, 8192, 16384, 32768)
 DEFAULT_BATCH_SIZES = (1, 2)
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-30B-A3B"
 VALID_MODULES = ("attention", "moe")
 VALID_MODES = ("forward", "forward_backward")
 DTYPE_ALIASES = {
@@ -82,11 +83,23 @@ ROW_FIELDNAMES = (
     "gpu_name",
     "device",
     "dtype",
+    "world_size",
+    "num_gpus_used",
+    "expert_parallel_size",
+    "tensor_parallel_size",
+    "model_name",
+    "model_revision",
+    "model_commit_hash",
+    "model_type",
     "hidden_size",
-    "num_heads",
-    "intermediate_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
     "num_experts",
-    "top_k",
+    "num_experts_per_tok",
+    "moe_intermediate_size",
+    "attention_backend",
+    "config_error",
     "cuda_version",
     "cuda_driver_version",
     "pytorch_version",
@@ -101,6 +114,24 @@ ROW_FIELDNAMES = (
 
 
 @dataclass(frozen=True)
+class ResolvedModelConfig:
+    model_name: str
+    model_revision: str | None
+    model_commit_hash: str | None
+    model_type: str | None
+    hidden_size: int | None
+    num_attention_heads: int | None
+    num_key_value_heads: int | None
+    head_dim: int | None
+    num_experts: int | None
+    num_experts_per_tok: int | None
+    moe_intermediate_size: int | None
+    attention_backend: str | None
+    config_available: bool
+    config_error: str | None = None
+
+
+@dataclass(frozen=True)
 class BenchmarkConfig:
     modules: tuple[str, ...]
     modes: tuple[str, ...]
@@ -110,12 +141,8 @@ class BenchmarkConfig:
     device: str
     warmup_iters: int
     timed_iters: int
-    hidden_size: int
-    num_heads: int
-    intermediate_size: int
-    num_experts: int
-    top_k: int
     seed: int
+    model: ResolvedModelConfig
 
 
 def now_utc_iso() -> str:
@@ -219,27 +246,181 @@ def expected_row_keys(config: BenchmarkConfig) -> list[tuple[str, str, int, int]
     ]
 
 
+def _get_int_attr(config_obj: Any, attr_name: str) -> int | None:
+    value = getattr(config_obj, attr_name, None)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _config_commit_hash(config_obj: Any) -> str | None:
+    commit_hash = getattr(config_obj, "_commit_hash", None)
+    if commit_hash:
+        return str(commit_hash)
+    try:
+        raw_dict = config_obj.to_dict()
+    except Exception:
+        return None
+    commit_hash = raw_dict.get("_commit_hash")
+    return str(commit_hash) if commit_hash else None
+
+
+def _attention_backend(config_obj: Any) -> str:
+    for attr_name in ("attention_backend", "_attn_implementation", "attn_implementation"):
+        value = getattr(config_obj, attr_name, None)
+        if value:
+            return str(value)
+    return "sdpa"
+
+
+def resolve_model_config(
+    *,
+    model_name: str,
+    model_revision: str | None,
+    auto_config_cls: Any | None = None,
+) -> ResolvedModelConfig:
+    """Resolve Qwen module dimensions from transformers config without model weights."""
+    try:
+        if auto_config_cls is None:
+            from transformers import AutoConfig
+
+            auto_config_cls = AutoConfig
+        kwargs: dict[str, Any] = {}
+        if model_revision:
+            kwargs["revision"] = model_revision
+        config_obj = auto_config_cls.from_pretrained(model_name, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - unavailable config becomes skipped rows.
+        return ResolvedModelConfig(
+            model_name=model_name,
+            model_revision=model_revision,
+            model_commit_hash=None,
+            model_type=None,
+            hidden_size=None,
+            num_attention_heads=None,
+            num_key_value_heads=None,
+            head_dim=None,
+            num_experts=None,
+            num_experts_per_tok=None,
+            moe_intermediate_size=None,
+            attention_backend=None,
+            config_available=False,
+            config_error=f"{exc.__class__.__name__}: {exc}",
+        )
+
+    hidden_size = _get_int_attr(config_obj, "hidden_size")
+    num_attention_heads = _get_int_attr(config_obj, "num_attention_heads")
+    num_key_value_heads = _get_int_attr(config_obj, "num_key_value_heads")
+    head_dim = _get_int_attr(config_obj, "head_dim")
+    num_experts = _get_int_attr(config_obj, "num_experts")
+    num_experts_per_tok = _get_int_attr(config_obj, "num_experts_per_tok")
+    moe_intermediate_size = _get_int_attr(config_obj, "moe_intermediate_size")
+    if head_dim is None and hidden_size is not None and num_attention_heads is not None:
+        if hidden_size % num_attention_heads != 0:
+            return ResolvedModelConfig(
+                model_name=model_name,
+                model_revision=model_revision,
+                model_commit_hash=_config_commit_hash(config_obj),
+                model_type=getattr(config_obj, "model_type", None),
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=None,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                moe_intermediate_size=moe_intermediate_size,
+                attention_backend=_attention_backend(config_obj),
+                config_available=False,
+                config_error="hidden_size is not divisible by num_attention_heads",
+            )
+        head_dim = hidden_size // num_attention_heads
+
+    missing = [
+        field_name
+        for field_name, value in (
+            ("hidden_size", hidden_size),
+            ("num_attention_heads", num_attention_heads),
+            ("num_key_value_heads", num_key_value_heads),
+            ("head_dim", head_dim),
+            ("num_experts", num_experts),
+            ("num_experts_per_tok", num_experts_per_tok),
+            ("moe_intermediate_size", moe_intermediate_size),
+        )
+        if value is None
+    ]
+    config_available = not missing
+    config_error = None if config_available else f"missing config fields: {', '.join(missing)}"
+    commit_hash = _config_commit_hash(config_obj)
+    return ResolvedModelConfig(
+        model_name=model_name,
+        model_revision=commit_hash or model_revision,
+        model_commit_hash=commit_hash,
+        model_type=getattr(config_obj, "model_type", None),
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        moe_intermediate_size=moe_intermediate_size,
+        attention_backend=_attention_backend(config_obj),
+        config_available=config_available,
+        config_error=config_error,
+    )
+
+
+def require_model_int(model: ResolvedModelConfig, field_name: str) -> int:
+    value = getattr(model, field_name)
+    if value is None:
+        raise RuntimeError(f"model config field unavailable: {field_name}")
+    return int(value)
+
+
 class IsolatedAttention(nn.Module):
-    def __init__(self, *, hidden_size: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        head_dim: int,
+    ) -> None:
         super().__init__()
-        if hidden_size % num_heads != 0:
-            raise ValueError("hidden_size must be divisible by num_heads")
+        if num_attention_heads % num_key_value_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         self.hidden_size = int(hidden_size)
-        self.num_heads = int(num_heads)
-        self.head_dim = self.hidden_size // self.num_heads
-        self.qkv = nn.Linear(self.hidden_size, self.hidden_size * 3, bias=False)
-        self.out = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.num_attention_heads = int(num_attention_heads)
+        self.num_key_value_heads = int(num_key_value_heads)
+        self.head_dim = int(head_dim)
+        self.q_width = self.num_attention_heads * self.head_dim
+        self.kv_width = self.num_key_value_heads * self.head_dim
+        self.q_proj = nn.Linear(self.hidden_size, self.q_width, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.kv_width, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.kv_width, bias=False)
+        self.out = nn.Linear(self.q_width, self.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        y = self._scaled_dot_product_attention(q, k, v)
+        y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.q_width)
         return self.out(y)
+
+    def _scaled_dot_product_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        if self.num_attention_heads == self.num_key_value_heads:
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        try:
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False, enable_gqa=True)
+        except TypeError:
+            repeat_factor = self.num_attention_heads // self.num_key_value_heads
+            return F.scaled_dot_product_attention(
+                q,
+                k.repeat_interleave(repeat_factor, dim=1),
+                v.repeat_interleave(repeat_factor, dim=1),
+                dropout_p=0.0,
+                is_causal=False,
+            )
 
 
 class ExpertMLP(nn.Module):
@@ -275,28 +456,36 @@ class BalancedTopKMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.reshape(-1, x.shape[-1])
         positions = torch.arange(flat.shape[0], device=flat.device)
+        route_offsets = torch.arange(self.top_k, device=flat.device)
+        routed_experts = ((positions[:, None] + route_offsets[None, :]) % self.num_experts).reshape(-1)
+        routed_tokens = positions.repeat_interleave(self.top_k)
         output = torch.zeros_like(flat)
-        for route_offset in range(self.top_k):
-            routed_experts = (positions + route_offset) % self.num_experts
-            for expert_idx, expert in enumerate(self.experts):
-                token_idx = torch.nonzero(routed_experts == expert_idx, as_tuple=False).flatten()
-                if token_idx.numel() == 0:
-                    continue
-                expert_input = flat.index_select(0, token_idx)
-                expert_output = expert(expert_input)
-                output.index_add_(0, token_idx, expert_output)
+        for expert_idx, expert in enumerate(self.experts):
+            route_idx = torch.nonzero(routed_experts == expert_idx, as_tuple=False).flatten()
+            if route_idx.numel() == 0:
+                continue
+            token_idx = routed_tokens.index_select(0, route_idx)
+            expert_input = flat.index_select(0, token_idx)
+            expert_output = expert(expert_input)
+            output.index_add_(0, token_idx, expert_output)
         return (output / float(self.top_k)).view_as(x)
 
 
 def build_module(config: BenchmarkConfig, module_name: str, dtype: torch.dtype, device: torch.device) -> nn.Module:
+    model = config.model
     if module_name == "attention":
-        module = IsolatedAttention(hidden_size=config.hidden_size, num_heads=config.num_heads)
+        module = IsolatedAttention(
+            hidden_size=require_model_int(model, "hidden_size"),
+            num_attention_heads=require_model_int(model, "num_attention_heads"),
+            num_key_value_heads=require_model_int(model, "num_key_value_heads"),
+            head_dim=require_model_int(model, "head_dim"),
+        )
     elif module_name == "moe":
         module = BalancedTopKMoE(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            num_experts=config.num_experts,
-            top_k=config.top_k,
+            hidden_size=require_model_int(model, "hidden_size"),
+            intermediate_size=require_model_int(model, "moe_intermediate_size"),
+            num_experts=require_model_int(model, "num_experts"),
+            top_k=require_model_int(model, "num_experts_per_tok"),
         )
     else:
         raise ValueError(f"Unsupported module: {module_name}")
@@ -315,11 +504,19 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def clear_grads(module: nn.Module, x: torch.Tensor) -> None:
+def clear_grads(module: nn.Module, x: torch.Tensor, *, set_to_none: bool) -> None:
     for parameter in module.parameters():
-        parameter.grad = None
+        if parameter.grad is None:
+            continue
+        if set_to_none:
+            parameter.grad = None
+        else:
+            parameter.grad.zero_()
     if x.grad is not None:
-        x.grad = None
+        if set_to_none:
+            x.grad = None
+        else:
+            x.grad.zero_()
 
 
 def run_step(module: nn.Module, x: torch.Tensor, mode: str) -> None:
@@ -328,11 +525,11 @@ def run_step(module: nn.Module, x: torch.Tensor, mode: str) -> None:
             module(x)
         return
 
-    clear_grads(module, x)
+    clear_grads(module, x, set_to_none=False)
     y = module(x)
     loss = y.float().square().mean()
     loss.backward()
-    clear_grads(module, x)
+    clear_grads(module, x, set_to_none=False)
 
 
 def cuda_memory_snapshot(device: torch.device) -> dict[str, int | None]:
@@ -395,6 +592,7 @@ def measure_case(
     module: nn.Module | None = None
     x: torch.Tensor | None = None
     try:
+        hidden_size = require_model_int(config.model, "hidden_size")
         if device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA device requested but torch.cuda.is_available() is false")
         if device.type == "cuda":
@@ -406,7 +604,7 @@ def measure_case(
         cleanup_cuda(device)
 
         module = build_module(config, module_name, dtype, device)
-        x = torch.randn(batch_size, seq_len, config.hidden_size, device=device, dtype=dtype)
+        x = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype)
         if mode == "forward_backward":
             x.requires_grad_(True)
 
@@ -460,12 +658,41 @@ def measure_case(
         add_memory_units(row, "max_memory_reserved", snapshot.get("max_reserved"))
     finally:
         if module is not None and x is not None:
-            clear_grads(module, x)
+            clear_grads(module, x, set_to_none=True)
         del module
         del x
         cleanup_cuda(device)
 
     row["completed_at_utc"] = now_utc_iso()
+    return row
+
+
+def skipped_case(
+    *,
+    config: BenchmarkConfig,
+    module_name: str,
+    mode: str,
+    seq_len: int,
+    batch_size: int,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    row = base_row(
+        config=config,
+        module_name=module_name,
+        mode=mode,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        metadata=metadata,
+        started_at=now_utc_iso(),
+    )
+    row.update(
+        {
+            "status": "skipped",
+            "status_reason": "config_unavailable",
+            "config_error": config.model.config_error,
+            "completed_at_utc": now_utc_iso(),
+        }
+    )
     return row
 
 
@@ -479,6 +706,7 @@ def base_row(
     metadata: dict[str, Any],
     started_at: str,
 ) -> dict[str, Any]:
+    model = config.model
     row: dict[str, Any] = {
         "module": module_name,
         "mode": mode,
@@ -496,11 +724,23 @@ def base_row(
         "gpu_name": metadata.get("gpu_name"),
         "device": config.device,
         "dtype": config.dtype_name,
-        "hidden_size": int(config.hidden_size),
-        "num_heads": int(config.num_heads),
-        "intermediate_size": int(config.intermediate_size),
-        "num_experts": int(config.num_experts),
-        "top_k": int(config.top_k),
+        "world_size": 1,
+        "num_gpus_used": metadata.get("num_gpus_used"),
+        "expert_parallel_size": 1,
+        "tensor_parallel_size": 1,
+        "model_name": model.model_name,
+        "model_revision": model.model_revision,
+        "model_commit_hash": model.model_commit_hash,
+        "model_type": model.model_type,
+        "hidden_size": model.hidden_size,
+        "num_attention_heads": model.num_attention_heads,
+        "num_key_value_heads": model.num_key_value_heads,
+        "head_dim": model.head_dim,
+        "num_experts": model.num_experts,
+        "num_experts_per_tok": model.num_experts_per_tok,
+        "moe_intermediate_size": model.moe_intermediate_size,
+        "attention_backend": model.attention_backend,
+        "config_error": model.config_error,
         "cuda_version": metadata.get("cuda_version"),
         "cuda_driver_version": metadata.get("cuda_driver_version"),
         "pytorch_version": metadata.get("pytorch_version"),
@@ -564,6 +804,7 @@ def build_metadata(config: BenchmarkConfig, argv: list[str]) -> dict[str, Any]:
         "gpu_name": gpu_name,
         "gpu_type": detect_gpu_type(gpu_name),
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "num_gpus_used": 1 if device.type == "cuda" and torch.cuda.is_available() else 0,
         "cuda_version": torch.version.cuda,
         "cuda_driver_version": query_nvidia_driver(),
         "pytorch_version": torch.__version__,
@@ -572,6 +813,22 @@ def build_metadata(config: BenchmarkConfig, argv: list[str]) -> dict[str, Any]:
         "started_at_utc": now_utc_iso(),
         "matrix_cell_count": len(canonical_matrix(config.seq_lens, config.batch_sizes)),
         "expected_row_count": len(expected_row_keys(config)),
+        "model": {
+            "model_name": config.model.model_name,
+            "model_revision": config.model.model_revision,
+            "model_commit_hash": config.model.model_commit_hash,
+            "model_type": config.model.model_type,
+            "hidden_size": config.model.hidden_size,
+            "num_attention_heads": config.model.num_attention_heads,
+            "num_key_value_heads": config.model.num_key_value_heads,
+            "head_dim": config.model.head_dim,
+            "num_experts": config.model.num_experts,
+            "num_experts_per_tok": config.model.num_experts_per_tok,
+            "moe_intermediate_size": config.model.moe_intermediate_size,
+            "attention_backend": config.model.attention_backend,
+            "config_available": config.model.config_available,
+            "config_error": config.model.config_error,
+        },
         "config": {
             "modules": list(config.modules),
             "modes": list(config.modes),
@@ -581,11 +838,6 @@ def build_metadata(config: BenchmarkConfig, argv: list[str]) -> dict[str, Any]:
             "device": config.device,
             "warmup_iters": config.warmup_iters,
             "timed_iters": config.timed_iters,
-            "hidden_size": config.hidden_size,
-            "num_heads": config.num_heads,
-            "intermediate_size": config.intermediate_size,
-            "num_experts": config.num_experts,
-            "top_k": config.top_k,
             "seed": config.seed,
         },
     }
@@ -595,16 +847,28 @@ def run_sweep(config: BenchmarkConfig, metadata: dict[str, Any]) -> list[dict[st
     rows: list[dict[str, Any]] = []
     for module_name, mode, seq_len, batch_size in expected_row_keys(config):
         print(f"[case] module={module_name} mode={mode} seq_len={seq_len} batch={batch_size}", flush=True)
-        rows.append(
-            measure_case(
-                config=config,
-                module_name=module_name,
-                mode=mode,
-                seq_len=seq_len,
-                batch_size=batch_size,
-                metadata=metadata,
+        if not config.model.config_available:
+            rows.append(
+                skipped_case(
+                    config=config,
+                    module_name=module_name,
+                    mode=mode,
+                    seq_len=seq_len,
+                    batch_size=batch_size,
+                    metadata=metadata,
+                )
             )
-        )
+        else:
+            rows.append(
+                measure_case(
+                    config=config,
+                    module_name=module_name,
+                    mode=mode,
+                    seq_len=seq_len,
+                    batch_size=batch_size,
+                    metadata=metadata,
+                )
+            )
     return rows
 
 
@@ -613,7 +877,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     extra_fields = sorted({key for row in rows for key in row} - set(ROW_FIELDNAMES))
     fieldnames = [*ROW_FIELDNAMES, *extra_fields]
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         for row in rows:
             writer.writerow({key: "" if row.get(key) is None else row.get(key) for key in fieldnames})
@@ -664,6 +928,7 @@ def render_results_markdown(
     json_path: Path,
 ) -> str:
     status_counts = build_status_counts(rows)
+    model = metadata["model"]
     command = str(metadata.get("command"))
     if metadata.get("cuda_visible_devices"):
         command = f"CUDA_VISIBLE_DEVICES={metadata['cuda_visible_devices']} {command}"
@@ -683,10 +948,19 @@ def render_results_markdown(
         f"- PyTorch / Python: `{metadata.get('pytorch_version')}` / `{metadata.get('python_version')}`",
         f"- Warmup/timed iterations: `{metadata['config']['warmup_iters']}` / `{metadata['config']['timed_iters']}`",
         f"- Dtype: `{metadata['config']['dtype']}`",
-        f"- Synthetic hidden/heads: `{metadata['config']['hidden_size']}` / `{metadata['config']['num_heads']}`",
+        f"- Model: `{model['model_name']}`",
+        f"- Model revision / commit hash: `{model['model_revision']}` / `{model['model_commit_hash']}`",
+        f"- Model type: `{model['model_type']}`",
         (
-            f"- Synthetic MoE intermediate/experts/top-k: `{metadata['config']['intermediate_size']}` / "
-            f"`{metadata['config']['num_experts']}` / `{metadata['config']['top_k']}`"
+            f"- Qwen attention shape: hidden_size=`{model['hidden_size']}`, "
+            f"num_attention_heads=`{model['num_attention_heads']}`, "
+            f"num_key_value_heads=`{model['num_key_value_heads']}`, head_dim=`{model['head_dim']}`, "
+            f"attention_backend=`{model['attention_backend']}`"
+        ),
+        (
+            f"- Qwen MoE shape: num_experts=`{model['num_experts']}`, "
+            f"num_experts_per_tok=`{model['num_experts_per_tok']}`, "
+            f"moe_intermediate_size=`{model['moe_intermediate_size']}`"
         ),
         f"- CSV artifact: `{csv_path.as_posix()}`",
         f"- JSON artifact: `{json_path.as_posix()}`",
@@ -694,6 +968,11 @@ def render_results_markdown(
         "",
         "The issue text mentioned 10 combinations, but the enumerated grid is 6 sequence lengths x 2 batch "
         "sizes = 12 cells. This report accounts for all 12 cells for each module and execution mode.",
+        "",
+        "This corrected run supersedes the prior canonical artifact set that used placeholder synthetic "
+        "dimensions. The module sizes and artifact metadata now come from "
+        f"`transformers.AutoConfig.from_pretrained(\"{model['model_name']}\")`; only random module weights and "
+        "synthetic inputs are used, so checkpoint shards are not downloaded.",
         "",
         "The runs are isolated attention-only or isolated MoE-only synthetic module runs. No overlapped "
         "Attention+MoE measurement is included.",
@@ -762,7 +1041,13 @@ def render_results_markdown(
     return "\n".join(lines)
 
 
-def write_results_markdown(path: Path, metadata: dict[str, Any], rows: list[dict[str, Any]], csv_path: Path, json_path: Path) -> None:
+def write_results_markdown(
+    path: Path,
+    metadata: dict[str, Any],
+    rows: list[dict[str, Any]],
+    csv_path: Path,
+    json_path: Path,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         render_results_markdown(metadata=metadata, rows=rows, csv_path=csv_path, json_path=json_path),
@@ -778,10 +1063,11 @@ def default_results_path(output_dir: Path) -> Path:
 
 def build_config(args: argparse.Namespace) -> BenchmarkConfig:
     dtype_name = normalize_dtype_name(args.dtype)
-    if args.hidden_size % args.num_heads != 0:
-        raise ValueError("--hidden-size must be divisible by --num-heads")
-    if args.top_k > args.num_experts:
-        raise ValueError("--top-k must be <= --num-experts")
+    if args.warmup_iters < 0:
+        raise ValueError("--warmup-iters must be >= 0")
+    if args.timed_iters <= 0:
+        raise ValueError("--timed-iters must be > 0")
+    model = resolve_model_config(model_name=args.model_name, model_revision=args.model_revision)
     return BenchmarkConfig(
         modules=parse_modules(args.modules),
         modes=parse_modes(args.modes),
@@ -791,12 +1077,8 @@ def build_config(args: argparse.Namespace) -> BenchmarkConfig:
         device=args.device,
         warmup_iters=int(args.warmup_iters),
         timed_iters=int(args.timed_iters),
-        hidden_size=int(args.hidden_size),
-        num_heads=int(args.num_heads),
-        intermediate_size=int(args.intermediate_size),
-        num_experts=int(args.num_experts),
-        top_k=int(args.top_k),
         seed=int(args.seed),
+        model=model,
     )
 
 
@@ -810,11 +1092,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--warmup-iters", type=int, default=3)
     parser.add_argument("--timed-iters", type=int, default=5)
-    parser.add_argument("--hidden-size", type=int, default=1024)
-    parser.add_argument("--num-heads", type=int, default=16)
-    parser.add_argument("--intermediate-size", type=int, default=4096)
-    parser.add_argument("--num-experts", type=int, default=8)
-    parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--model-revision", default=None)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--csv-path", default=None)
