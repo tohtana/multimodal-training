@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -413,32 +414,46 @@ def _build_workload(shape: ShapeConfig, device: torch.device, seed: int) -> _Wor
     )
 
 
+@contextmanager
+def _nvtx_range(label: str, *, enabled: bool):
+    if enabled and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(label)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+
+
 def _run_block(block: BlockSpec, state: _WorkloadState, shape: ShapeConfig) -> torch.Tensor:
     values = state.values
-    if block.kind == "attention_scores":
-        x = values["attention_input"]
-        output = torch.matmul(x, x.transpose(-1, -2)) / math.sqrt(float(x.shape[-1]))
-    elif block.kind == "attention_probs":
-        output = torch.softmax(values["attention_scores"], dim=-1)
-    elif block.kind == "attention_output":
-        output = torch.matmul(values["attention_probs"], values["attention_input"])
-    elif block.kind == "router_probs":
-        output = torch.softmax(values["moe_tokens"] @ values["router"], dim=-1)
-    elif block.kind == "topk_dispatch":
-        router_probs = values["router_probs"]
-        top_values, top_indices = torch.topk(router_probs, k=shape.top_k, dim=-1)
-        dispatch = torch.zeros_like(router_probs)
-        dispatch.scatter_(dim=-1, index=top_indices, src=top_values)
-        output = dispatch / dispatch.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    elif block.kind == "expert_hidden":
-        output = torch.tanh(torch.einsum("nh,ehm->nem", values["moe_tokens"], values["w1"]))
-    elif block.kind == "expert_output":
-        output = torch.einsum("nem,emh->neh", values["expert_hidden"], values["w2"])
-    elif block.kind == "moe_output":
-        combined = torch.sum(values["expert_output"] * values["dispatch"].unsqueeze(-1), dim=1)
-        output = combined.reshape(shape.batch, shape.seq_len, shape.hidden)
-    else:
-        raise ValueError(f"Unsupported block kind: {block.kind}")
+    nvtx_enabled = any(tensor.is_cuda for tensor in values.values())
+    with _nvtx_range(_profile_label(block), enabled=nvtx_enabled):
+        if block.kind == "attention_scores":
+            x = values["attention_input"]
+            output = torch.matmul(x, x.transpose(-1, -2)) / math.sqrt(float(x.shape[-1]))
+        elif block.kind == "attention_probs":
+            output = torch.softmax(values["attention_scores"], dim=-1)
+        elif block.kind == "attention_output":
+            output = torch.matmul(values["attention_probs"], values["attention_input"])
+        elif block.kind == "router_probs":
+            output = torch.softmax(values["moe_tokens"] @ values["router"], dim=-1)
+        elif block.kind == "topk_dispatch":
+            router_probs = values["router_probs"]
+            top_values, top_indices = torch.topk(router_probs, k=shape.top_k, dim=-1)
+            dispatch = torch.zeros_like(router_probs)
+            dispatch.scatter_(dim=-1, index=top_indices, src=top_values)
+            output = dispatch / dispatch.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        elif block.kind == "expert_hidden":
+            output = torch.tanh(torch.einsum("nh,ehm->nem", values["moe_tokens"], values["w1"]))
+        elif block.kind == "expert_output":
+            output = torch.einsum("nem,emh->neh", values["expert_hidden"], values["w2"])
+        elif block.kind == "moe_output":
+            combined = torch.sum(values["expert_output"] * values["dispatch"].unsqueeze(-1), dim=1)
+            output = combined.reshape(shape.batch, shape.seq_len, shape.hidden)
+        else:
+            raise ValueError(f"Unsupported block kind: {block.kind}")
 
     if len(block.outputs) != 1:
         raise ValueError(f"Block {block.name!r} must produce exactly one output value")
