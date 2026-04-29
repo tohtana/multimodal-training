@@ -34,6 +34,7 @@ INITIAL_VALUE_SOURCES = {
     "w2": "weight",
 }
 FINAL_OUTPUTS = ("attention_output", "moe_output")
+PROFILE_LABEL_PREFIX = "attn_moe_block::"
 
 
 @dataclass(frozen=True)
@@ -457,6 +458,7 @@ def _block_record(
     stream_role: str,
     timed_ms: float,
     output: torch.Tensor,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     finite = bool(torch.isfinite(output).all().item())
     checksum = _tensor_checksum(output)
@@ -473,6 +475,7 @@ def _block_record(
         "timed_ms": float(timed_ms),
         "finite": finite,
         "checksum": checksum,
+        "profile": profile,
     }
 
 
@@ -675,6 +678,387 @@ def _memory_peaks(device: torch.device) -> tuple[int | None, int | None]:
     )
 
 
+def _profile_label(block: BlockSpec) -> str:
+    return f"{PROFILE_LABEL_PREFIX}{block.name}"
+
+
+def _profiler_summary_disabled() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "activities": [],
+        "profile_memory": False,
+        "trace_path": None,
+        "trace_exported": False,
+        "synchronizes_blocks_for_memory_peaks": False,
+        "utilization_proxy_note": (
+            "PyTorch profiler does not report raw SM utilization here; CUDA/device time divided by "
+            "host wall time is only a utilization-like proxy."
+        ),
+    }
+
+
+def _profiler_summary_skipped(*, reason: str, trace_path: str | None = None) -> dict[str, Any]:
+    summary = _profiler_summary_disabled()
+    summary.update(
+        {
+            "requested": True,
+            "skip_reason": reason,
+            "trace_path": trace_path,
+        }
+    )
+    return summary
+
+
+def _event_metric_ms(event: Any, names: Sequence[str]) -> float | None:
+    for name in names:
+        if hasattr(event, name):
+            value = getattr(event, name)
+            if value is not None:
+                return float(value) / 1000.0
+    return None
+
+
+def _event_metric_int(event: Any, names: Sequence[str]) -> int | None:
+    for name in names:
+        if hasattr(event, name):
+            value = getattr(event, name)
+            if value is not None:
+                return int(value)
+    return None
+
+
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0.0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _extract_profiler_metrics(profiler: Any, *, cuda_profiled: bool) -> dict[str, dict[str, Any]]:
+    metrics: dict[str, dict[str, Any]] = {}
+    for event in profiler.key_averages():
+        key = getattr(event, "key", None)
+        if not isinstance(key, str) or not key.startswith(PROFILE_LABEL_PREFIX):
+            continue
+        device_time_total_ms = _event_metric_ms(event, ("device_time_total", "cuda_time_total"))
+        self_device_time_total_ms = _event_metric_ms(event, ("self_device_time_total", "self_cuda_time_total"))
+        metrics[key] = {
+            "profiler_event_count": int(getattr(event, "count", 0)),
+            "profiler_cpu_time_total_ms": _event_metric_ms(event, ("cpu_time_total",)),
+            "profiler_self_cpu_time_total_ms": _event_metric_ms(event, ("self_cpu_time_total",)),
+            "profiler_device_time_total_ms": device_time_total_ms,
+            "profiler_self_device_time_total_ms": self_device_time_total_ms,
+            "profiler_cuda_time_total_ms": device_time_total_ms if cuda_profiled else None,
+            "profiler_self_cuda_time_total_ms": self_device_time_total_ms if cuda_profiled else None,
+            "profiler_cpu_memory_usage_bytes": _event_metric_int(event, ("cpu_memory_usage",)),
+            "profiler_self_cpu_memory_usage_bytes": _event_metric_int(event, ("self_cpu_memory_usage",)),
+            "profiler_device_memory_usage_bytes": (
+                _event_metric_int(event, ("device_memory_usage",)) if cuda_profiled else None
+            ),
+            "profiler_self_device_memory_usage_bytes": (
+                _event_metric_int(event, ("self_device_memory_usage",)) if cuda_profiled else None
+            ),
+        }
+    return metrics
+
+
+def _new_block_profile(block: BlockSpec) -> dict[str, Any]:
+    return {
+        "record_function": _profile_label(block),
+        "wall_ms": 0.0,
+        "peak_allocated_bytes": None,
+        "peak_reserved_bytes": None,
+    }
+
+
+def _accumulate_profile_wall(profile: dict[str, Any], wall_ms: float) -> None:
+    profile["wall_ms"] = float(profile["wall_ms"]) + float(wall_ms)
+
+
+def _accumulate_profile_peaks(
+    profile: dict[str, Any],
+    *,
+    peak_allocated_bytes: int | None,
+    peak_reserved_bytes: int | None,
+) -> None:
+    if peak_allocated_bytes is not None:
+        current = profile["peak_allocated_bytes"]
+        profile["peak_allocated_bytes"] = (
+            peak_allocated_bytes if current is None else max(current, peak_allocated_bytes)
+        )
+    if peak_reserved_bytes is not None:
+        current = profile["peak_reserved_bytes"]
+        profile["peak_reserved_bytes"] = peak_reserved_bytes if current is None else max(current, peak_reserved_bytes)
+
+
+def _finalize_block_profiles(
+    *,
+    block_records: list[dict[str, Any]],
+    profiler_metrics: dict[str, dict[str, Any]],
+    cuda_profiled: bool,
+) -> None:
+    for record in block_records:
+        profile = record["profile"] or {}
+        metrics = profiler_metrics.get(str(profile.get("record_function")), {})
+        profile.update(metrics)
+        cuda_time_total_ms = profile.get("profiler_cuda_time_total_ms") if cuda_profiled else None
+        profile["cuda_time_total_ms_per_wall_ms_proxy"] = _safe_ratio(cuda_time_total_ms, profile.get("wall_ms"))
+        busy_fraction = profile["cuda_time_total_ms_per_wall_ms_proxy"]
+        profile["device_busy_fraction_proxy"] = None if busy_fraction is None else min(1.0, float(busy_fraction))
+        profile["utilization_proxy_note"] = (
+            "CUDA/device time over host wall time from PyTorch profiler; this is not raw SM utilization."
+        )
+        record["profile"] = profile
+
+
+def _run_warmup_iterations(
+    *,
+    schedule: str,
+    blocks: Sequence[BlockSpec],
+    waves: Sequence[Sequence[BlockSpec]],
+    state: _WorkloadState,
+    shape: ShapeConfig,
+    device: torch.device,
+    warmup_iters: int,
+) -> None:
+    if warmup_iters <= 0:
+        return
+    if schedule == "stream" and device.type == "cuda":
+        _run_stream_cuda(
+            blocks=blocks,
+            waves=waves,
+            state=state,
+            shape=shape,
+            device=device,
+            warmup_iters=0,
+            timed_iters=warmup_iters,
+        )
+    else:
+        _run_serial(
+            blocks=blocks,
+            waves=waves,
+            state=state,
+            shape=shape,
+            device=device,
+            warmup_iters=0,
+            timed_iters=warmup_iters,
+            stream_role="cpu" if schedule == "stream" and device.type == "cpu" else "default",
+        )
+
+
+def _run_profiled_serial(
+    *,
+    blocks: Sequence[BlockSpec],
+    waves: Sequence[Sequence[BlockSpec]],
+    state: _WorkloadState,
+    shape: ShapeConfig,
+    device: torch.device,
+    timed_iters: int,
+    stream_role: str,
+) -> tuple[list[dict[str, Any]], float]:
+    block_ms = {block.name: 0.0 for block in blocks}
+    outputs: dict[str, torch.Tensor] = {}
+    profiles = {block.name: _new_block_profile(block) for block in blocks}
+
+    timed_wall_start = time.perf_counter()
+    for _ in range(timed_iters):
+        for wave in waves:
+            for block in wave:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    wall_start = time.perf_counter()
+                    with torch.profiler.record_function(_profile_label(block)):
+                        start_event.record()
+                        output = _run_block(block, state, shape)
+                        end_event.record()
+                    end_event.synchronize()
+                    elapsed_ms = float(start_event.elapsed_time(end_event))
+                    peak_allocated, peak_reserved = _memory_peaks(device)
+                    wall_ms = (time.perf_counter() - wall_start) * 1000.0
+                else:
+                    wall_start = time.perf_counter()
+                    with torch.profiler.record_function(_profile_label(block)):
+                        output = _run_block(block, state, shape)
+                    wall_ms = (time.perf_counter() - wall_start) * 1000.0
+                    elapsed_ms = wall_ms
+                    peak_allocated, peak_reserved = None, None
+                outputs[block.name] = output
+                block_ms[block.name] += elapsed_ms
+                _accumulate_profile_wall(profiles[block.name], wall_ms)
+                _accumulate_profile_peaks(
+                    profiles[block.name],
+                    peak_allocated_bytes=peak_allocated,
+                    peak_reserved_bytes=peak_reserved,
+                )
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    wall_clock_ms = (time.perf_counter() - timed_wall_start) * 1000.0
+    return (
+        [
+            _block_record(
+                block,
+                stream_role=stream_role,
+                timed_ms=block_ms[block.name],
+                output=outputs[block.name],
+                profile=profiles[block.name],
+            )
+            for block in blocks
+        ],
+        wall_clock_ms,
+    )
+
+
+def _run_profiled_stream_cuda(
+    *,
+    blocks: Sequence[BlockSpec],
+    waves: Sequence[Sequence[BlockSpec]],
+    state: _WorkloadState,
+    shape: ShapeConfig,
+    device: torch.device,
+    timed_iters: int,
+) -> tuple[list[dict[str, Any]], float]:
+    streams = {block.name: torch.cuda.Stream(device=device) for block in blocks}
+    block_ms = {block.name: 0.0 for block in blocks}
+    outputs: dict[str, torch.Tensor] = {}
+    profiles = {block.name: _new_block_profile(block) for block in blocks}
+    ready_event = torch.cuda.Event(enable_timing=False)
+    ready_event.record(torch.cuda.current_stream(device))
+
+    timed_wall_start = time.perf_counter()
+    for _ in range(timed_iters):
+        completion_events: dict[str, torch.cuda.Event] = {}
+        for wave in waves:
+            for block in wave:
+                stream = streams[block.name]
+                completion = torch.cuda.Event(enable_timing=False)
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+                wall_start = time.perf_counter()
+                with torch.cuda.stream(stream):
+                    stream.wait_event(ready_event)
+                    for dependency in block.depends_on:
+                        stream.wait_event(completion_events[dependency])
+                    with torch.profiler.record_function(_profile_label(block)):
+                        start_event.record(stream)
+                        outputs[block.name] = _run_block(block, state, shape)
+                        end_event.record(stream)
+                    completion.record(stream)
+                completion.synchronize()
+                elapsed_ms = float(start_event.elapsed_time(end_event))
+                peak_allocated, peak_reserved = _memory_peaks(device)
+                wall_ms = (time.perf_counter() - wall_start) * 1000.0
+                completion_events[block.name] = completion
+                block_ms[block.name] += elapsed_ms
+                _accumulate_profile_wall(profiles[block.name], wall_ms)
+                _accumulate_profile_peaks(
+                    profiles[block.name],
+                    peak_allocated_bytes=peak_allocated,
+                    peak_reserved_bytes=peak_reserved,
+                )
+
+    torch.cuda.synchronize(device)
+    wall_clock_ms = (time.perf_counter() - timed_wall_start) * 1000.0
+    return (
+        [
+            _block_record(
+                block,
+                stream_role="per_block",
+                timed_ms=block_ms[block.name],
+                output=outputs[block.name],
+                profile=profiles[block.name],
+            )
+            for block in blocks
+        ],
+        wall_clock_ms,
+    )
+
+
+def _run_profiled_schedule(
+    *,
+    schedule: str,
+    blocks: Sequence[BlockSpec],
+    waves: Sequence[Sequence[BlockSpec]],
+    state: _WorkloadState,
+    shape: ShapeConfig,
+    device: torch.device,
+    warmup_iters: int,
+    timed_iters: int,
+    trace_output: str | Path | None,
+) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
+    _run_warmup_iterations(
+        schedule=schedule,
+        blocks=blocks,
+        waves=waves,
+        state=state,
+        shape=shape,
+        device=device,
+        warmup_iters=warmup_iters,
+    )
+
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    activity_names = ["CPU"]
+    if device.type == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+        activity_names.append("CUDA")
+
+    with torch.profiler.profile(activities=activities, profile_memory=True, acc_events=True) as profiler:
+        if schedule == "stream" and device.type == "cuda":
+            block_records, wall_clock_ms = _run_profiled_stream_cuda(
+                blocks=blocks,
+                waves=waves,
+                state=state,
+                shape=shape,
+                device=device,
+                timed_iters=timed_iters,
+            )
+        else:
+            block_records, wall_clock_ms = _run_profiled_serial(
+                blocks=blocks,
+                waves=waves,
+                state=state,
+                shape=shape,
+                device=device,
+                timed_iters=timed_iters,
+                stream_role="cpu" if schedule == "stream" and device.type == "cpu" else "default",
+            )
+
+    trace_path = str(trace_output) if trace_output is not None else None
+    trace_exported = False
+    if trace_output is not None:
+        path = Path(trace_output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        profiler.export_chrome_trace(str(path))
+        trace_exported = True
+
+    _finalize_block_profiles(
+        block_records=block_records,
+        profiler_metrics=_extract_profiler_metrics(profiler, cuda_profiled=device.type == "cuda"),
+        cuda_profiled=device.type == "cuda",
+    )
+    return (
+        block_records,
+        wall_clock_ms,
+        {
+            "enabled": True,
+            "activities": activity_names,
+            "profile_memory": True,
+            "trace_path": trace_path,
+            "trace_exported": trace_exported,
+            "synchronizes_blocks_for_memory_peaks": device.type == "cuda",
+            "record_function_prefix": PROFILE_LABEL_PREFIX,
+            "utilization_proxy_note": (
+                "PyTorch profiler does not report raw SM utilization here; per-block "
+                "device_busy_fraction_proxy is min(1, profiler CUDA/device time / block wall time)."
+            ),
+        },
+    )
+
+
 def _invalid_payload(
     *,
     schedule: str,
@@ -685,6 +1069,7 @@ def _invalid_payload(
     timed_iters: int,
     capabilities: dict[str, Any],
     errors: Sequence[ValidationError],
+    profiler: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -710,6 +1095,7 @@ def _invalid_payload(
             "value_lifetimes": [],
             "peak_allocated_bytes": None,
             "peak_reserved_bytes": None,
+            "profiler": profiler if profiler is not None else _profiler_summary_disabled(),
             "validation_errors": [error.to_json() for error in errors],
         },
     }
@@ -723,6 +1109,8 @@ def run_composite_schedule(
     timed_iters: int = 1,
     seed: int = 0,
     blocks: Sequence[BlockSpec] | None = None,
+    profile: bool = False,
+    profile_trace_output: str | Path | None = None,
 ) -> dict[str, Any]:
     if schedule not in SUPPORTED_SCHEDULES:
         raise ValueError(f"Unsupported schedule {schedule!r}; expected one of {SUPPORTED_SCHEDULES}")
@@ -745,6 +1133,11 @@ def run_composite_schedule(
             timed_iters=timed_iters,
             capabilities=capabilities,
             errors=validation_errors,
+            profiler=(
+                _profiler_summary_skipped(reason="schedule_invalid", trace_path=str(profile_trace_output))
+                if profile
+                else None
+            ),
         )
 
     if resolved_device.type == "cuda":
@@ -757,7 +1150,20 @@ def run_composite_schedule(
     if cycle_blocks:
         raise RuntimeError(f"Unexpected cycle after validation: {cycle_blocks}")
 
-    if schedule == "stream" and resolved_device.type == "cuda":
+    profiler_summary = _profiler_summary_disabled()
+    if profile:
+        block_records, wall_clock_ms, profiler_summary = _run_profiled_schedule(
+            schedule=schedule,
+            blocks=specs,
+            waves=waves,
+            state=state,
+            shape=shape,
+            device=resolved_device,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+            trace_output=profile_trace_output,
+        )
+    elif schedule == "stream" and resolved_device.type == "cuda":
         block_records, wall_clock_ms = _run_stream_cuda(
             blocks=specs,
             waves=waves,
@@ -810,6 +1216,7 @@ def run_composite_schedule(
             "value_lifetimes": value_lifetimes,
             "peak_allocated_bytes": peak_allocated,
             "peak_reserved_bytes": peak_reserved,
+            "profiler": profiler_summary,
             "validation_errors": [],
         },
     }
@@ -827,12 +1234,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--timed-iters", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-trace-output", type=str, default=None)
     parser.add_argument("--json-output", type=str, default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    profile_trace_output = args.profile_trace_output
+    if args.profile and profile_trace_output is None:
+        profile_trace_output = "block_profile_trace.json"
     payload = run_composite_schedule(
         schedule=args.schedule,
         device=args.device,
@@ -846,6 +1258,8 @@ def main() -> None:
         warmup_iters=args.warmup_iters,
         timed_iters=args.timed_iters,
         seed=args.seed,
+        profile=args.profile,
+        profile_trace_output=profile_trace_output,
     )
     text = json.dumps(payload, indent=2, sort_keys=True)
     if args.json_output:

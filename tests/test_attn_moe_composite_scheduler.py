@@ -202,6 +202,7 @@ def test_cpu_serial_json_shape() -> None:
     assert set(payload["summary"]["final_checksums"]) == {"attention_output", "moe_output"}
     assert payload["summary"]["peak_allocated_bytes"] is None
     assert payload["summary"]["peak_reserved_bytes"] is None
+    assert payload["summary"]["profiler"]["enabled"] is False
     assert payload["summary"]["validation_errors"] == []
 
 
@@ -293,12 +294,52 @@ def test_invalid_schedule_returns_stable_json_shape() -> None:
     assert payload["summary"]["value_lifetimes"] == []
     assert payload["summary"]["peak_allocated_bytes"] is None
     assert payload["summary"]["peak_reserved_bytes"] is None
+    assert payload["summary"]["profiler"]["enabled"] is False
     assert payload["shape"] == _tiny_shape().to_json()
     assert payload["iterations"] == {"warmup": 0, "timed": 1}
     assert payload["capabilities"]["cuda"]["requested"] == "cpu"
     [error] = payload["summary"]["validation_errors"]
     assert set(error) == {"code", "message", "block", "dependency"}
     assert error["code"] == "duplicate_block"
+
+
+def test_cpu_profiler_exports_trace_and_block_schema(tmp_path: Path) -> None:
+    trace_path = tmp_path / "block_profile_trace.json"
+    payload = run_composite_schedule(
+        schedule="serial",
+        device="cpu",
+        shape=_tiny_shape(),
+        warmup_iters=0,
+        timed_iters=1,
+        seed=789,
+        profile=True,
+        profile_trace_output=trace_path,
+    )
+
+    assert trace_path.exists()
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert isinstance(trace.get("traceEvents"), list)
+    profiler = payload["summary"]["profiler"]
+    assert profiler["enabled"] is True
+    assert profiler["activities"] == ["CPU"]
+    assert profiler["profile_memory"] is True
+    assert profiler["trace_path"] == str(trace_path)
+    assert profiler["trace_exported"] is True
+    assert "raw SM utilization" in profiler["utilization_proxy_note"]
+
+    assert len(payload["blocks"]) == 8
+    for block in payload["blocks"]:
+        profile = block["profile"]
+        assert profile["record_function"] == f"attn_moe_block::{block['name']}"
+        assert profile["wall_ms"] > 0.0
+        assert profile["peak_allocated_bytes"] is None
+        assert profile["peak_reserved_bytes"] is None
+        assert profile["profiler_event_count"] == 1
+        assert profile["profiler_cpu_time_total_ms"] is not None
+        assert profile["profiler_cuda_time_total_ms"] is None
+        assert profile["cuda_time_total_ms_per_wall_ms_proxy"] is None
+        assert profile["device_busy_fraction_proxy"] is None
+        assert "not raw SM utilization" in profile["utilization_proxy_note"]
 
 
 def test_capability_probe_is_structured_without_gpu_requirement() -> None:
