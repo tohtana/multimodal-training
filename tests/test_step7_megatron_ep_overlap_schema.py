@@ -22,6 +22,7 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
     build_invalid_environment_payload,
     build_matrix_summary,
     build_runtime_metadata,
+    build_torch_compile_metadata,
     compute_speedup,
     evaluate_stage_diff,
     normalize_moe_routing_mode,
@@ -35,12 +36,17 @@ from examples.attn_moe_overlap.megatron_overlap_schema import (
 )
 from examples.attn_moe_overlap.megatron_layer_runtime import (
     RuntimeConfig,
+    TorchCompileFailure,
     _build_equal_token_routing_state,
+    _install_torch_compile_safe_moe_cpu_handoff,
+    _prepare_stage_callable,
+    classify_exception,
     describe_attention_runtime,
     _resolve_profiler_schedule,
     _run_iteration_schedule,
 )
 from examples.attn_moe_overlap.step7_megatron_ep_overlap import (
+    _aggregate_stage_results,
     _build_run_config,
     _build_case_rerun_command,
     _collapse_timed_window_s,
@@ -1129,6 +1135,7 @@ def test_run_torch_profiler_capture_uses_script_rerun_command(tmp_path, monkeypa
         "moe_grouped_gemm": True,
         "moe_token_dispatcher_type": "alltoall",
         "overlap_moe_expert_parallel_comm": True,
+        "torch_compile": "off",
     }
     serial = _sample_case_payload(
         "case-serial", "serial", status="ok", seq_len=2048, batch_size=4
@@ -1642,6 +1649,7 @@ def test_matrix_summary_contract_and_status_count_invariant():
         "green_ctx_sms": {"attn": None, "moe": None},
         "device_sm_signature": {"0": 132, "1": 132},
         "moe_routing_mode": "normal",
+        "torch_compile": "off",
         "num_layer_pairs": 1,
     }
     summary = build_matrix_summary(
@@ -1717,6 +1725,7 @@ def test_matrix_summary_persists_backend_pairs_for_same_code_comparisons():
         "green_ctx_sms": {"attn": 64, "moe": 64},
         "device_sm_signature": {"0": 132, "1": 132},
         "moe_routing_mode": "normal",
+        "torch_compile": "off",
         "num_layer_pairs": 1,
     }
     summary = build_matrix_summary(
@@ -1787,6 +1796,7 @@ def test_matrix_summary_marks_backend_pair_as_both_failed_when_both_backends_fai
         "green_ctx_sms": {"attn": 64, "moe": 64},
         "device_sm_signature": {"0": 132, "1": 132},
         "moe_routing_mode": "normal",
+        "torch_compile": "off",
         "num_layer_pairs": 1,
     }
     summary = build_matrix_summary(
@@ -1824,6 +1834,7 @@ def test_ensure_output_dir_identity_matches_rejects_config_mismatch(tmp_path):
         "torch_profiler_wait_iters": None,
         "torch_profiler_active_iters": None,
         "moe_routing_mode": "normal",
+        "torch_compile": "off",
     }
     summary_path.write_text(
         json.dumps(
@@ -1865,6 +1876,7 @@ def test_build_run_config_persists_identity_fields_and_fingerprint():
         worker_timeout_s=180.0,
         num_experts=None,
         moe_routing_mode="normal",
+        torch_compile="on",
         mps_active_thread_pct=None,
         attn_mps_active_thread_pct=None,
     )
@@ -1886,6 +1898,7 @@ def test_build_run_config_persists_identity_fields_and_fingerprint():
     assert run_config["device_sm_signature"] == {"0": 132, "1": 132}
     assert run_config["torch_profiler_selection"] is None
     assert run_config["moe_routing_mode"] == "normal"
+    assert run_config["torch_compile"] == "on"
     assert isinstance(run_config["config_fingerprint"], str)
 
 
@@ -1947,6 +1960,7 @@ def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path
         "moe_grouped_gemm": True,
         "moe_token_dispatcher_type": "alltoall",
         "overlap_moe_expert_parallel_comm": False,
+        "torch_compile": "off",
     }
     status = _run_torch_profiler_capture(
         args=args,
@@ -1959,3 +1973,506 @@ def test_run_torch_profiler_capture_returns_off_without_successful_pair(tmp_path
     )
     assert status == "off"
     assert not (tmp_path / "out" / "torch_profiler" / "trace_index.json").exists()
+
+
+def _sample_worker_result(
+    role: str,
+    rank: int,
+    *,
+    status: str = "ok",
+    torch_compile_requested: str = "off",
+    torch_compile_status: str = "eager",
+    error_code: str | None = None,
+) -> dict[str, object]:
+    resolved_error_code = error_code
+    if resolved_error_code is None and status != "ok":
+        resolved_error_code = status
+    return {
+        "role": role,
+        "rank": rank,
+        "status": status,
+        "failure_origin": status != "ok",
+        "attention_backend": "auto",
+        "attention_impl": {"requested_backend": "auto"},
+        "moe_grouped_gemm": True,
+        "moe_token_dispatcher_type": "alltoall",
+        "overlap_moe_expert_parallel_comm": True,
+        "timing_ms": {"cuda": 1.0, "step_total": 1.1, "timed_wall": 5.0},
+        "timed_window_s": {"start_s": 1.0 + rank, "end_s": 1.5 + rank, "duration_ms": 500.0},
+        "schedule_timed_window_s": {"start_s": 1.0, "end_s": 2.0, "duration_ms": 1000.0},
+        "enqueue_windows": [(1.0, 1.1)],
+        "finite": {"all_finite": True, "first_nonfinite": None},
+        "output_signature": {"sum": 1.0, "mean": 0.1, "std": 0.2, "max_abs": 1.5},
+        "runtime": {"requested_sms": None, "granted_sms": None, "device_total_sms": None},
+        "moe_routing_mode": "normal",
+        "tokens_per_expert": None,
+        "local_tokens_per_expert": None,
+        "torch_compile": {
+            "requested": torch_compile_requested,
+            "status": torch_compile_status,
+        },
+        "error": {
+            "code": resolved_error_code,
+            "message": None if resolved_error_code is None else str(resolved_error_code),
+            "traceback": None,
+        },
+    }
+
+
+def test_build_case_rerun_command_preserves_torch_compile_flag(tmp_path):
+    case_payload = _sample_case_payload("case-compile", "overlap", status="ok")
+    case_payload["torch_compile"] = build_torch_compile_metadata(
+        requested="on",
+        by_role={"attn": {"status": "compiled"}, "moe": {"status": "compiled"}},
+    )
+    run_config = {
+        "model_name": "Qwen/Qwen3-30B-A3B",
+        "model_type": "qwen3_moe",
+        "topology": {"attn_dp_size": 2, "moe_ep_size": 4, "attn_gpu_ids": [0, 1], "moe_gpu_ids": [0, 1, 2, 3]},
+        "worker_timeout_s": 180.0,
+        "num_experts": None,
+        "mps_active_thread_pct": None,
+        "attn_mps_active_thread_pct": None,
+        "attention_backend": "auto",
+        "moe_grouped_gemm": True,
+        "moe_token_dispatcher_type": "alltoall",
+        "overlap_moe_expert_parallel_comm": False,
+        "torch_compile": "on",
+    }
+
+    command = _build_case_rerun_command(
+        run_config=run_config,
+        case_payload=case_payload,
+        output_dir=tmp_path / "rerun",
+        capture_nsys="off",
+        capture_torch_profiler="off",
+        warmup_iters=100,
+        timed_iters=100,
+    )
+
+    assert command[command.index("--torch-compile") + 1] == "on"
+
+
+def test_validate_case_payload_rejects_missing_torch_compile_metadata():
+    payload = _sample_case_payload("case-missing-compile", "serial", status="ok")
+    del payload["torch_compile"]
+
+    errors = validate_case_payload(payload)
+
+    assert "missing key: torch_compile" in errors
+
+
+def test_validate_case_payload_rejects_invalid_torch_compile_role_status():
+    payload = _sample_case_payload("case-invalid-compile", "serial", status="ok")
+    payload["torch_compile"] = {
+        "requested": "on",
+        "by_role": {"attn": {"status": "weird"}, "moe": {"status": "compiled"}},
+    }
+
+    errors = validate_case_payload(payload)
+
+    assert any("torch_compile.by_role.attn.status" in error for error in errors)
+
+
+def test_validate_matrix_summary_rejects_missing_torch_compile_run_config():
+    identity_fields = {
+        "seq_lens": [1024],
+        "batch_sizes": [1],
+        "dtypes": ["bf16"],
+        "nccl_tuples": ["4,16,32"],
+        "runtime_backends": ["mps_only"],
+        "green_ctx_sms": {"attn": None, "moe": None},
+        "device_sm_signature": {"0": 132},
+        "moe_routing_mode": "normal",
+        "torch_compile": "off",
+    }
+    summary = build_matrix_summary(
+        run_config={
+            "model_name": "Qwen/Qwen3-30B-A3B",
+            "model_type": "qwen3_moe",
+            **identity_fields,
+            "config_fingerprint": build_config_fingerprint(identity_fields),
+            "batch_size": 1,
+        },
+        cases=[_sample_case_payload("case-summary", "serial", status="ok", batch_size=1)],
+        total_points=1,
+    )
+    del summary["run_config"]["torch_compile"]
+
+    errors = validate_matrix_summary(summary)
+
+    assert any("run_config.torch_compile" in error for error in errors)
+
+
+@pytest.mark.parametrize(("stage_role", "expected_bias"), [("attn", 1.0), ("moe", 2.0)])
+def test_prepare_stage_callable_compiles_requested_role(stage_role, expected_bias):
+    class FakeLayer:
+        def __init__(self):
+            self.config = SimpleNamespace(moe_router_topk=1)
+            self.mlp = SimpleNamespace(
+                router=SimpleNamespace(forward=lambda input_tensor: input_tensor),
+                token_dispatcher=SimpleNamespace(local_expert_indices=[0]),
+            )
+
+        def _forward_attention(self, hidden_states, attention_mask):
+            del attention_mask
+            return hidden_states + 1.0, None
+
+        def _forward_mlp(self, hidden_states, inference_context=None):
+            del inference_context
+            return hidden_states + 2.0
+
+    compile_calls: list[object] = []
+
+    def _fake_compile(fn):
+        compile_calls.append(fn)
+
+        def _wrapped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    hidden_states = torch.ones((2, 1, 3), dtype=torch.float32)
+    attention_mask = torch.zeros((1, 1, 2, 2), dtype=torch.bool)
+    config = RuntimeConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        stage_role=stage_role,
+        runtime_backend="mps_only",
+        attention_backend="auto",
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=False,
+        dtype="bf16",
+        seq_len=2,
+        batch_size=1,
+        seed=1234,
+        expert_model_parallel_size=1,
+        num_experts=1,
+        torch_compile_enabled=True,
+    )
+
+    prepared = _prepare_stage_callable(
+        config=config,
+        layer=FakeLayer(),
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        compile_fn=_fake_compile,
+    )
+    output_tensor = prepared.run()
+
+    assert torch.allclose(output_tensor, hidden_states + expected_bias)
+    assert prepared.compile_payload == {"requested": "on", "status": "compiled"}
+    assert len(compile_calls) == 1
+    assert prepared.consume_equal_token_routing_state() is None
+
+
+def test_install_torch_compile_safe_moe_cpu_handoff_wraps_and_restores(monkeypatch):
+    module_globals: dict[str, object] = {}
+    exec(
+        """
+def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
+    return tensor, as_numpy, record_stream
+
+class FakeTokenDispatcher:
+    def dispatch_preprocess(self, hidden_states, routing_map, probs):
+        return hidden_states, probs
+
+    def token_dispatch(self, hidden_states, probs):
+        return hidden_states, probs
+
+    def dispatch_postprocess(self, hidden_states, probs):
+        return hidden_states, probs
+
+    def combine_preprocess(self, hidden_states):
+        return hidden_states
+
+    def token_combine(self, hidden_states):
+        return hidden_states
+
+    def combine_postprocess(self, hidden_states):
+        return hidden_states
+
+    def _maybe_dtoh_and_synchronize(self, point, tokens_per_expert=None):
+        del point
+        return maybe_move_tensor_to_cpu(tokens_per_expert, as_numpy=True, record_stream=True)
+""",
+        module_globals,
+    )
+    fake_dispatcher = module_globals["FakeTokenDispatcher"]()
+    dispatcher_cls = module_globals["FakeTokenDispatcher"]
+    original = module_globals["maybe_move_tensor_to_cpu"]
+    wrapped_by_name: dict[str, object] = {}
+
+    def _fake_disable(fn):
+        def _wrapped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        wrapped_by_name[fn.__name__] = _wrapped
+        return _wrapped
+
+    monkeypatch.setattr(torch._dynamo, "disable", _fake_disable)
+
+    restore = _install_torch_compile_safe_moe_cpu_handoff(fake_dispatcher)
+
+    assert module_globals["maybe_move_tensor_to_cpu"] is wrapped_by_name["maybe_move_tensor_to_cpu"]
+    for method_name in [
+        "dispatch_preprocess",
+        "token_dispatch",
+        "dispatch_postprocess",
+        "combine_preprocess",
+        "token_combine",
+        "combine_postprocess",
+    ]:
+        assert getattr(fake_dispatcher, method_name).__func__ is wrapped_by_name[method_name]
+
+    restore()
+
+    assert module_globals["maybe_move_tensor_to_cpu"] is original
+    for method_name in [
+        "dispatch_preprocess",
+        "token_dispatch",
+        "dispatch_postprocess",
+        "combine_preprocess",
+        "token_combine",
+        "combine_postprocess",
+    ]:
+        assert getattr(fake_dispatcher, method_name).__func__ is dispatcher_cls.__dict__[method_name]
+
+
+def test_prepare_stage_callable_compiles_equal_tokens_moe_with_router_override():
+    class FakeLayer:
+        def __init__(self):
+            self.config = SimpleNamespace(moe_router_topk=1)
+            self.mlp = SimpleNamespace(
+                router=SimpleNamespace(forward=lambda input_tensor: (_ for _ in ()).throw(AssertionError("router override missing"))),
+                token_dispatcher=SimpleNamespace(local_expert_indices=[0, 1]),
+            )
+
+        def _forward_mlp(self, hidden_states, inference_context=None):
+            del inference_context
+            probs, routing_map = self.mlp.router.forward(hidden_states)
+            assert routing_map.dtype == torch.bool
+            return hidden_states + probs.sum()
+
+    compile_calls: list[object] = []
+
+    def _fake_compile(fn):
+        compile_calls.append(fn)
+
+        def _wrapped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    hidden_states = torch.ones((2, 1, 3), dtype=torch.float32)
+    attention_mask = torch.zeros((1, 1, 2, 2), dtype=torch.bool)
+    layer = FakeLayer()
+    original_forward = layer.mlp.router.forward
+    config = RuntimeConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        stage_role="moe",
+        runtime_backend="mps_only",
+        attention_backend="auto",
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=False,
+        dtype="bf16",
+        seq_len=2,
+        batch_size=1,
+        seed=1234,
+        expert_model_parallel_size=1,
+        num_experts=2,
+        moe_routing_mode="equal_tokens",
+        torch_compile_enabled=True,
+    )
+
+    prepared = _prepare_stage_callable(
+        config=config,
+        layer=layer,
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        compile_fn=_fake_compile,
+    )
+
+    output_tensor = prepared.run()
+    state = prepared.consume_equal_token_routing_state()
+
+    assert torch.allclose(output_tensor, hidden_states + 2.0)
+    assert compile_calls
+    assert layer.mlp.router.forward is original_forward
+    assert state is not None
+    assert state.tokens_per_expert == [1, 1]
+    assert state.local_tokens_per_expert == [1, 1]
+
+
+def test_prepare_stage_callable_compile_failure_classifies_as_torch_compile_failed():
+    class FakeLayer:
+        def __init__(self):
+            self.config = SimpleNamespace(moe_router_topk=1)
+            self.mlp = SimpleNamespace(
+                router=SimpleNamespace(forward=lambda input_tensor: input_tensor),
+                token_dispatcher=SimpleNamespace(local_expert_indices=[0]),
+            )
+
+        def _forward_attention(self, hidden_states, attention_mask):
+            del attention_mask
+            return hidden_states, None
+
+    def _raise_compile(_fn):
+        raise RuntimeError("compile blew up")
+
+    config = RuntimeConfig(
+        model_name="Qwen/Qwen3-30B-A3B",
+        model_type="qwen3_moe",
+        stage_role="attn",
+        runtime_backend="mps_only",
+        attention_backend="auto",
+        moe_grouped_gemm=False,
+        moe_token_dispatcher_type="alltoall",
+        overlap_moe_expert_parallel_comm=False,
+        dtype="bf16",
+        seq_len=2,
+        batch_size=1,
+        seed=1234,
+        expert_model_parallel_size=1,
+        num_experts=None,
+        torch_compile_enabled=True,
+    )
+
+    with pytest.raises(TorchCompileFailure) as exc_info:
+        _prepare_stage_callable(
+            config=config,
+            layer=FakeLayer(),
+            hidden_states=torch.ones((2, 1, 3), dtype=torch.float32),
+            attention_mask=torch.zeros((1, 1, 2, 2), dtype=torch.bool),
+            compile_fn=_raise_compile,
+        )
+
+    status, error = classify_exception(exc_info.value)
+
+    assert status == "runtime_error"
+    assert error["code"] == "torch_compile_failed"
+
+
+def test_aggregate_stage_results_marks_compiled_when_all_workers_compile():
+    results = [
+        _sample_worker_result("attn", 0, torch_compile_requested="on", torch_compile_status="compiled"),
+        _sample_worker_result("attn", 1, torch_compile_requested="on", torch_compile_status="compiled"),
+    ]
+
+    stage = _aggregate_stage_results(
+        {"role": "attn", "stage_label": "attn_0", "pair_index": 0},
+        results,
+        expected_world_size=2,
+        torch_compile_requested="on",
+    )
+
+    assert stage["status"] == "ok"
+    assert stage["torch_compile"] == {"requested": "on", "status": "compiled"}
+
+
+def test_aggregate_stage_results_propagates_compile_failures():
+    results = [
+        _sample_worker_result("attn", 0, torch_compile_requested="on", torch_compile_status="compiled"),
+        _sample_worker_result(
+            "attn",
+            1,
+            status="runtime_error",
+            torch_compile_requested="on",
+            torch_compile_status="compile_failed",
+            error_code="torch_compile_failed",
+        ),
+    ]
+
+    stage = _aggregate_stage_results(
+        {"role": "attn", "stage_label": "attn_0", "pair_index": 0},
+        results,
+        expected_world_size=2,
+        torch_compile_requested="on",
+    )
+
+    assert stage["status"] == "runtime_error"
+    assert stage["error"]["code"] == "torch_compile_failed"
+    assert stage["torch_compile"] == {"requested": "on", "status": "compile_failed"}
+
+
+def test_aggregate_stage_results_rejects_mixed_successful_compile_statuses():
+    results = [
+        _sample_worker_result("attn", 0, torch_compile_requested="on", torch_compile_status="compiled"),
+        _sample_worker_result("attn", 1, torch_compile_requested="on", torch_compile_status="eager"),
+    ]
+
+    stage = _aggregate_stage_results(
+        {"role": "attn", "stage_label": "attn_0", "pair_index": 0},
+        results,
+        expected_world_size=2,
+        torch_compile_requested="on",
+    )
+
+    assert stage["status"] == "runtime_error"
+    assert stage["error"]["code"] == "torch_compile_status_mismatch"
+    assert stage["torch_compile"] == {"requested": "on", "status": "eager"}
+
+
+def test_run_case_attempt_prefers_torch_compile_failed_error(monkeypatch):
+    def _fake_launch_workers(*, stage_specs, common_config, timeout_s, mps_env):
+        del stage_specs, common_config, timeout_s, mps_env
+        return {
+            "status": "ok",
+            "schedule_timed_window_s": {"start_s": None, "end_s": None, "duration_ms": None},
+            "results": [
+                {
+                    **_sample_worker_result("attn", 0, status="runtime_error", error_code="runtime_error"),
+                    "error": {"code": "runtime_error", "message": "Schedule aborted", "traceback": None},
+                },
+                _sample_worker_result(
+                    "moe",
+                    0,
+                    status="runtime_error",
+                    torch_compile_requested="on",
+                    torch_compile_status="compile_failed",
+                    error_code="torch_compile_failed",
+                ),
+            ],
+        }
+
+    monkeypatch.setattr(
+        "examples.attn_moe_overlap.step7_megatron_ep_overlap._launch_workers",
+        _fake_launch_workers,
+    )
+
+    result = _run_case_attempt(
+        mode="serial",
+        common_config={
+            "model_name": "Qwen/Qwen3-30B-A3B",
+            "model_type": "qwen3_moe",
+            "runtime_backend": "mps_only",
+            "green_ctx_attn_sms": None,
+            "green_ctx_moe_sms": None,
+            "dtype": "bf16",
+            "seq_len": 16384,
+            "batch_size": 1,
+            "seed": 1234,
+            "warmup_iters": 100,
+            "timed_iters": 100,
+            "moe_ep_size": 1,
+            "num_experts": 128,
+            "moe_routing_mode": "equal_tokens",
+            "attn_mps_active_thread_pct": None,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "alltoall",
+            "overlap_moe_expert_parallel_comm": False,
+            "attention_backend": "auto",
+            "nccl_tuple": None,
+            "torch_compile": "on",
+        },
+        attn_gpu_ids=[0],
+        moe_gpu_ids=[0],
+        timeout_s=10.0,
+        mps_env={},
+    )
+
+    assert result["status"] == "runtime_error"
+    assert result["error"]["code"] == "torch_compile_failed"

@@ -15,6 +15,8 @@ MATRIX_SCHEMA_VERSION = "megatron_ep_overlap.matrix.v5"
 RUNTIME_BACKENDS = ("mps_only", "mps_green_ctx")
 TORCH_PROFILER_SELECTIONS = ("representative", "all-successful")
 MOE_ROUTING_MODES = ("normal", "equal_tokens")
+TORCH_COMPILE_REQUESTED_VALUES = ("on", "off")
+TORCH_COMPILE_STATUS_VALUES = ("eager", "compiled", "compile_failed")
 
 REQUIRED_STATUS_KEYS = (
     "ok",
@@ -85,6 +87,38 @@ def normalize_moe_routing_mode(moe_routing_mode: str) -> str:
     if normalized not in MOE_ROUTING_MODES:
         raise ValueError(f"Unsupported MoE routing mode: {moe_routing_mode}")
     return normalized
+
+
+def normalize_torch_compile_requested(requested: str) -> str:
+    normalized = requested.strip().lower()
+    if normalized not in TORCH_COMPILE_REQUESTED_VALUES:
+        raise ValueError(f"Unsupported torch compile request: {requested}")
+    return normalized
+
+
+def normalize_torch_compile_status(status: str) -> str:
+    normalized = status.strip().lower()
+    if normalized not in TORCH_COMPILE_STATUS_VALUES:
+        raise ValueError(f"Unsupported torch compile status: {status}")
+    return normalized
+
+
+def build_torch_compile_metadata(
+    *,
+    requested: str = "off",
+    by_role: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_requested = normalize_torch_compile_requested(requested)
+    raw_by_role = by_role or {}
+    normalized_by_role: dict[str, dict[str, str]] = {}
+    for role in ("attn", "moe"):
+        raw_role = raw_by_role.get(role) or {}
+        status = raw_role.get("status", "eager")
+        normalized_by_role[role] = {"status": normalize_torch_compile_status(str(status))}
+    return {
+        "requested": normalized_requested,
+        "by_role": normalized_by_role,
+    }
 
 
 def parse_int_csv(raw: str, *, field_name: str) -> list[int]:
@@ -528,6 +562,7 @@ def build_case_payload(
     baseline_diff: dict[str, Any] | None = None,
     error: dict[str, Any] | None = None,
     profiler: dict[str, Any] | None = None,
+    torch_compile: dict[str, Any] | None = None,
     attempt_count: int = 1,
     retry_trigger: str = "none",
     artifact_path: str | None = None,
@@ -602,6 +637,14 @@ def build_case_payload(
             "wait_iters": None,
             "active_iters": None,
         },
+        "torch_compile": (
+            build_torch_compile_metadata()
+            if torch_compile is None
+            else build_torch_compile_metadata(
+                requested=str(torch_compile.get("requested", "off")),
+                by_role=torch_compile.get("by_role"),
+            )
+        ),
         "attempt_count": int(attempt_count),
         "retry_trigger": retry_trigger,
         "artifact_path": artifact_path,
@@ -627,6 +670,7 @@ def build_invalid_environment_payload(
     message: str,
     moe_routing_mode: str = "normal",
     profiler: dict[str, Any] | None = None,
+    torch_compile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return build_case_payload(
         case_id=case_id,
@@ -644,6 +688,7 @@ def build_invalid_environment_payload(
         runtime=runtime,
         error={"code": "invalid_environment", "message": message, "traceback": None},
         profiler=profiler,
+        torch_compile=torch_compile,
     )
 
 
@@ -673,6 +718,7 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
         "baseline_diff",
         "error",
         "profiler",
+        "torch_compile",
         "attempt_count",
         "retry_trigger",
         "artifact_path",
@@ -1009,6 +1055,32 @@ def validate_case_payload(payload: dict[str, Any]) -> list[str]:
             value = profiler.get(key)
             if value is not None and (not isinstance(value, int) or value <= 0):
                 errors.append(f"profiler.{key} must be null or a positive integer")
+
+    torch_compile = payload.get("torch_compile")
+    if not isinstance(torch_compile, dict):
+        errors.append("torch_compile must be an object")
+    else:
+        requested = torch_compile.get("requested")
+        if requested not in TORCH_COMPILE_REQUESTED_VALUES:
+            errors.append(
+                "torch_compile.requested must be one of "
+                f"{TORCH_COMPILE_REQUESTED_VALUES}, got {requested!r}"
+            )
+        by_role = torch_compile.get("by_role")
+        if not isinstance(by_role, dict):
+            errors.append("torch_compile.by_role must be an object")
+        else:
+            for role in ("attn", "moe"):
+                role_payload = by_role.get(role)
+                if not isinstance(role_payload, dict):
+                    errors.append(f"torch_compile.by_role.{role} must be an object")
+                    continue
+                role_status = role_payload.get("status")
+                if role_status not in TORCH_COMPILE_STATUS_VALUES:
+                    errors.append(
+                        f"torch_compile.by_role.{role}.status must be one of "
+                        f"{TORCH_COMPILE_STATUS_VALUES}, got {role_status!r}"
+                    )
 
     tokens_per_expert = payload.get("tokens_per_expert")
     tokens_per_expert_min = payload.get("tokens_per_expert_min")
@@ -1637,6 +1709,11 @@ def validate_matrix_summary(summary: dict[str, Any]) -> list[str]:
         if moe_routing_mode not in MOE_ROUTING_MODES:
             errors.append(
                 f"run_config.moe_routing_mode must be one of {MOE_ROUTING_MODES}"
+            )
+        torch_compile = run_config.get("torch_compile")
+        if torch_compile not in TORCH_COMPILE_REQUESTED_VALUES:
+            errors.append(
+                f"run_config.torch_compile must be one of {TORCH_COMPILE_REQUESTED_VALUES}, got {torch_compile!r}"
             )
         num_layer_pairs = run_config.get("num_layer_pairs")
         if not isinstance(num_layer_pairs, int) or num_layer_pairs <= 0:
