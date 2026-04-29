@@ -101,6 +101,7 @@ MEMORY_FIELDNAMES = MEMORY_BASE_FIELDNAMES + tuple(
     field
     for prefix in BLOCK_FIELD_PREFIXES
     for field in (
+        f"{prefix}_wall_ms",
         f"{prefix}_peak_allocated_bytes",
         f"{prefix}_peak_allocated_mib",
         f"{prefix}_peak_reserved_bytes",
@@ -362,6 +363,7 @@ def _add_forward_profile_to_row(row: dict[str, Any], payload: dict[str, Any]) ->
     for block in payload["blocks"]:
         profile = block.get("profile") or {}
         prefix = f"forward_block_{block['name']}"
+        row[f"{prefix}_wall_ms"] = profile.get("wall_ms")
         allocated = profile.get("peak_allocated_bytes")
         reserved = profile.get("peak_reserved_bytes")
         _add_memory_value(row, f"{prefix}_peak_allocated", allocated)

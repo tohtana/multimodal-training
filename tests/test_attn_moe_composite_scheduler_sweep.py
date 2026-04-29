@@ -13,7 +13,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from examples.attn_moe_overlap.composite_scheduler_sweep import (  # noqa: E402
     DEFAULT_NCU_METRICS,
+    MEMORY_FIELDNAMES,
     SweepConfig,
+    _add_forward_profile_to_row,
     build_ncu_command,
     canonical_matrix,
     case_id,
@@ -90,6 +92,46 @@ def test_build_ncu_command_profiles_child_sweep_case(tmp_path: Path) -> None:
     assert command[command.index("--batch") + 1] == "2"
     assert command[command.index("--seq-len") + 1] == "4096"
     assert command[command.index("--child-json-output") + 1] == str(tmp_path / "child.json")
+
+
+def test_forward_profile_fields_include_wall_time_and_memory_values() -> None:
+    assert "forward_block_A0_attention_scores_wall_ms" in MEMORY_FIELDNAMES
+    assert "forward_block_M4_moe_output_wall_ms" in MEMORY_FIELDNAMES
+
+    row = {field: None for field in MEMORY_FIELDNAMES}
+    payload = {
+        "summary": {"wall_clock_ms": 12.5},
+        "blocks": [
+            {
+                "name": "A0_attention_scores",
+                "profile": {
+                    "wall_ms": 1.25,
+                    "peak_allocated_bytes": 2 * 1024**2,
+                    "peak_reserved_bytes": 3 * 1024**2,
+                },
+            },
+            {
+                "name": "M4_moe_output",
+                "profile": {
+                    "wall_ms": 2.5,
+                    "peak_allocated_bytes": 4 * 1024**2,
+                    "peak_reserved_bytes": 5 * 1024**2,
+                },
+            },
+        ],
+    }
+
+    _add_forward_profile_to_row(row, payload)
+
+    assert row["forward_profile_wall_clock_ms"] == 12.5
+    assert row["forward_block_A0_attention_scores_wall_ms"] == 1.25
+    assert row["forward_block_A0_attention_scores_peak_allocated_bytes"] == 2 * 1024**2
+    assert row["forward_block_A0_attention_scores_peak_allocated_mib"] == 2.0
+    assert row["forward_block_A0_attention_scores_peak_reserved_bytes"] == 3 * 1024**2
+    assert row["forward_block_M4_moe_output_wall_ms"] == 2.5
+    assert row["forward_block_M4_moe_output_peak_allocated_bytes"] == 4 * 1024**2
+    assert row["forward_block_M4_moe_output_peak_allocated_mib"] == 4.0
+    assert row["forward_block_M4_moe_output_peak_reserved_bytes"] == 5 * 1024**2
 
 
 def test_summarize_ncu_csv_groups_metrics_by_nvtx_renamed_block(tmp_path: Path) -> None:
