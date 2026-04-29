@@ -15,6 +15,25 @@ import torch
 SCHEMA_VERSION = "v1"
 SUPPORTED_SCHEDULES = ("serial", "stream")
 SUPPORTED_DEVICES = ("auto", "cpu", "cuda")
+SUPPORTED_GROUPS = ("attention", "moe")
+SUPPORTED_BLOCK_KINDS = {
+    "attention_scores": "attention",
+    "attention_probs": "attention",
+    "attention_output": "attention",
+    "router_probs": "moe",
+    "topk_dispatch": "moe",
+    "expert_hidden": "moe",
+    "expert_output": "moe",
+    "moe_output": "moe",
+}
+INITIAL_VALUE_SOURCES = {
+    "attention_input": "input",
+    "moe_tokens": "input",
+    "router": "weight",
+    "w1": "weight",
+    "w2": "weight",
+}
+FINAL_OUTPUTS = ("attention_output", "moe_output")
 
 
 @dataclass(frozen=True)
@@ -54,12 +73,24 @@ class BlockSpec:
     name: str
     kind: str
     depends_on: tuple[str, ...] = field(default_factory=tuple)
+    group: str | None = None
+    inputs: tuple[str, ...] = field(default_factory=tuple)
+    outputs: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def resolved_group(self) -> str | None:
+        return self.group if self.group is not None else SUPPORTED_BLOCK_KINDS.get(self.kind)
 
     def to_json(self) -> dict[str, Any]:
+        group = self.resolved_group
         return {
             "name": self.name,
+            "group": group,
+            "module": group,
             "kind": self.kind,
             "depends_on": list(self.depends_on),
+            "inputs": list(self.inputs),
+            "outputs": list(self.outputs),
         }
 
 
@@ -81,17 +112,73 @@ class ValidationError:
 
 @dataclass
 class _WorkloadState:
-    attention_input: torch.Tensor
-    moe_input: torch.Tensor
-    moe_router: torch.Tensor
-    moe_w1: torch.Tensor
-    moe_w2: torch.Tensor
+    values: dict[str, torch.Tensor]
+    value_sources: dict[str, str]
 
 
 def default_block_specs() -> list[BlockSpec]:
     return [
-        BlockSpec(name="attention", kind="attention"),
-        BlockSpec(name="moe", kind="moe"),
+        BlockSpec(
+            name="A0_attention_scores",
+            group="attention",
+            kind="attention_scores",
+            inputs=("attention_input",),
+            outputs=("attention_scores",),
+        ),
+        BlockSpec(
+            name="A1_attention_probs",
+            group="attention",
+            kind="attention_probs",
+            depends_on=("A0_attention_scores",),
+            inputs=("attention_scores",),
+            outputs=("attention_probs",),
+        ),
+        BlockSpec(
+            name="A2_attention_output",
+            group="attention",
+            kind="attention_output",
+            depends_on=("A1_attention_probs",),
+            inputs=("attention_probs", "attention_input"),
+            outputs=("attention_output",),
+        ),
+        BlockSpec(
+            name="M0_router_probs",
+            group="moe",
+            kind="router_probs",
+            inputs=("moe_tokens", "router"),
+            outputs=("router_probs",),
+        ),
+        BlockSpec(
+            name="M1_topk_dispatch",
+            group="moe",
+            kind="topk_dispatch",
+            depends_on=("M0_router_probs",),
+            inputs=("router_probs",),
+            outputs=("dispatch",),
+        ),
+        BlockSpec(
+            name="M2_expert_hidden",
+            group="moe",
+            kind="expert_hidden",
+            inputs=("moe_tokens", "w1"),
+            outputs=("expert_hidden",),
+        ),
+        BlockSpec(
+            name="M3_expert_output",
+            group="moe",
+            kind="expert_output",
+            depends_on=("M2_expert_hidden",),
+            inputs=("expert_hidden", "w2"),
+            outputs=("expert_output",),
+        ),
+        BlockSpec(
+            name="M4_moe_output",
+            group="moe",
+            kind="moe_output",
+            depends_on=("M1_topk_dispatch", "M3_expert_output"),
+            inputs=("dispatch", "expert_output"),
+            outputs=("moe_output",),
+        ),
     ]
 
 
@@ -113,11 +200,32 @@ def validate_schedule(blocks: Sequence[BlockSpec]) -> list[ValidationError]:
 
     names = set(counts)
     for block in blocks:
-        if block.kind not in {"attention", "moe"}:
+        expected_group = SUPPORTED_BLOCK_KINDS.get(block.kind)
+        if expected_group is None:
             errors.append(
                 ValidationError(
-                    code="unknown_kind",
+                    code="unsupported_block_kind",
                     message=f"Block {block.name!r} has unsupported kind {block.kind!r}",
+                    block=block.name,
+                )
+            )
+        group = block.resolved_group
+        if group not in SUPPORTED_GROUPS:
+            errors.append(
+                ValidationError(
+                    code="unsupported_block_group",
+                    message=f"Block {block.name!r} has unsupported group {group!r}",
+                    block=block.name,
+                )
+            )
+        elif expected_group is not None and group != expected_group:
+            errors.append(
+                ValidationError(
+                    code="unsupported_block_group",
+                    message=(
+                        f"Block {block.name!r} kind {block.kind!r} belongs to group "
+                        f"{expected_group!r}, not {group!r}"
+                    ),
                     block=block.name,
                 )
             )
@@ -171,7 +279,11 @@ def _topological_waves(blocks: Sequence[BlockSpec]) -> tuple[list[list[BlockSpec
     waves: list[list[BlockSpec]] = []
 
     while remaining:
-        ready_names = sorted(name for name in remaining if all(dep in satisfied for dep in by_name[name].depends_on))
+        ready_names = [
+            block.name
+            for block in blocks
+            if block.name in remaining and all(dep in satisfied for dep in by_name[block.name].depends_on)
+        ]
         if not ready_names:
             return waves, sorted(remaining)
         waves.append([by_name[name] for name in ready_names])
@@ -289,42 +401,49 @@ def _build_workload(shape: ShapeConfig, device: torch.device, seed: int) -> _Wor
     shape.validate()
     batch, seq_len, hidden = shape.batch, shape.seq_len, shape.hidden
     return _WorkloadState(
-        attention_input=_make_tensor((batch, seq_len, hidden), device=device, seed=seed + 11, scale=0.2),
-        moe_input=_make_tensor((batch, seq_len, hidden), device=device, seed=seed + 23, scale=0.2),
-        moe_router=_make_linspace_tensor((hidden, shape.num_experts), device=device, scale=0.05),
-        moe_w1=_make_linspace_tensor((shape.num_experts, hidden, hidden), device=device, scale=0.04),
-        moe_w2=_make_linspace_tensor((shape.num_experts, hidden, hidden), device=device, scale=0.04),
+        values={
+            "attention_input": _make_tensor((batch, seq_len, hidden), device=device, seed=seed + 11, scale=0.2),
+            "moe_tokens": _make_tensor((batch * seq_len, hidden), device=device, seed=seed + 23, scale=0.2),
+            "router": _make_linspace_tensor((hidden, shape.num_experts), device=device, scale=0.05),
+            "w1": _make_linspace_tensor((shape.num_experts, hidden, hidden), device=device, scale=0.04),
+            "w2": _make_linspace_tensor((shape.num_experts, hidden, hidden), device=device, scale=0.04),
+        },
+        value_sources=dict(INITIAL_VALUE_SOURCES),
     )
 
 
-def _run_attention(state: _WorkloadState) -> torch.Tensor:
-    x = state.attention_input
-    scores = torch.matmul(x, x.transpose(-1, -2)) / math.sqrt(float(x.shape[-1]))
-    probs = torch.softmax(scores, dim=-1)
-    return torch.matmul(probs, x)
-
-
-def _run_moe(state: _WorkloadState, shape: ShapeConfig) -> torch.Tensor:
-    x = state.moe_input
-    tokens = x.reshape(-1, shape.hidden)
-    router_probs = torch.softmax(tokens @ state.moe_router, dim=-1)
-    top_values, top_indices = torch.topk(router_probs, k=shape.top_k, dim=-1)
-    dispatch = torch.zeros_like(router_probs)
-    dispatch.scatter_(dim=-1, index=top_indices, src=top_values)
-    dispatch = dispatch / dispatch.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-    hidden = torch.tanh(torch.einsum("nh,ehm->nem", tokens, state.moe_w1))
-    expert_out = torch.einsum("nem,emh->neh", hidden, state.moe_w2)
-    combined = torch.sum(expert_out * dispatch.unsqueeze(-1), dim=1)
-    return combined.reshape(shape.batch, shape.seq_len, shape.hidden)
-
-
 def _run_block(block: BlockSpec, state: _WorkloadState, shape: ShapeConfig) -> torch.Tensor:
-    if block.kind == "attention":
-        return _run_attention(state)
-    if block.kind == "moe":
-        return _run_moe(state, shape)
-    raise ValueError(f"Unsupported block kind: {block.kind}")
+    values = state.values
+    if block.kind == "attention_scores":
+        x = values["attention_input"]
+        output = torch.matmul(x, x.transpose(-1, -2)) / math.sqrt(float(x.shape[-1]))
+    elif block.kind == "attention_probs":
+        output = torch.softmax(values["attention_scores"], dim=-1)
+    elif block.kind == "attention_output":
+        output = torch.matmul(values["attention_probs"], values["attention_input"])
+    elif block.kind == "router_probs":
+        output = torch.softmax(values["moe_tokens"] @ values["router"], dim=-1)
+    elif block.kind == "topk_dispatch":
+        router_probs = values["router_probs"]
+        top_values, top_indices = torch.topk(router_probs, k=shape.top_k, dim=-1)
+        dispatch = torch.zeros_like(router_probs)
+        dispatch.scatter_(dim=-1, index=top_indices, src=top_values)
+        output = dispatch / dispatch.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    elif block.kind == "expert_hidden":
+        output = torch.tanh(torch.einsum("nh,ehm->nem", values["moe_tokens"], values["w1"]))
+    elif block.kind == "expert_output":
+        output = torch.einsum("nem,emh->neh", values["expert_hidden"], values["w2"])
+    elif block.kind == "moe_output":
+        combined = torch.sum(values["expert_output"] * values["dispatch"].unsqueeze(-1), dim=1)
+        output = combined.reshape(shape.batch, shape.seq_len, shape.hidden)
+    else:
+        raise ValueError(f"Unsupported block kind: {block.kind}")
+
+    if len(block.outputs) != 1:
+        raise ValueError(f"Block {block.name!r} must produce exactly one output value")
+    values[block.outputs[0]] = output
+    state.value_sources[block.outputs[0]] = block.name
+    return output
 
 
 def _tensor_checksum(tensor: torch.Tensor) -> float:
@@ -341,15 +460,86 @@ def _block_record(
 ) -> dict[str, Any]:
     finite = bool(torch.isfinite(output).all().item())
     checksum = _tensor_checksum(output)
+    group = block.resolved_group
     return {
         "name": block.name,
+        "group": group,
+        "module": group,
         "kind": block.kind,
         "depends_on": list(block.depends_on),
+        "inputs": list(block.inputs),
+        "outputs": list(block.outputs),
         "stream_role": stream_role,
         "timed_ms": float(timed_ms),
         "finite": finite,
         "checksum": checksum,
     }
+
+
+def _tensor_metadata(tensor: torch.Tensor) -> dict[str, Any]:
+    numel = int(tensor.numel())
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "numel": numel,
+        "nbytes": int(numel * tensor.element_size()),
+    }
+
+
+def _value_lifetimes(
+    *,
+    blocks: Sequence[BlockSpec],
+    state: _WorkloadState,
+) -> list[dict[str, Any]]:
+    block_index = {block.name: index for index, block in enumerate(blocks)}
+    consumed_by: dict[str, list[str]] = {}
+    produced_by: dict[str, str] = {}
+    for block in blocks:
+        for value_name in block.inputs:
+            consumed_by.setdefault(value_name, []).append(block.name)
+        for value_name in block.outputs:
+            produced_by[value_name] = block.name
+
+    value_names = sorted(set(state.values) | set(consumed_by) | set(produced_by))
+    lifetimes: list[dict[str, Any]] = []
+    for value_name in value_names:
+        tensor = state.values.get(value_name)
+        producer = produced_by.get(value_name)
+        consumers = consumed_by.get(value_name, [])
+        consumer_indexes = [block_index[name] for name in consumers if name in block_index]
+        producer_index = block_index[producer] if producer is not None and producer in block_index else None
+        first_candidates = consumer_indexes + ([] if producer_index is None else [producer_index])
+        last_candidates = consumer_indexes + ([] if producer_index is None else [producer_index])
+        source = state.value_sources.get(value_name, "intermediate")
+        record: dict[str, Any] = {
+            "name": value_name,
+            "source": source,
+            "persistent": source in {"input", "weight"},
+            "input": source in {"input", "weight"},
+            "produced_by": producer,
+            "consumed_by": consumers,
+            "first_block_index": min(first_candidates) if first_candidates else None,
+            "last_block_index": max(last_candidates) if last_candidates else None,
+        }
+        if tensor is None:
+            record.update(
+                {
+                    "shape": None,
+                    "dtype": None,
+                    "device": None,
+                    "numel": None,
+                    "nbytes": None,
+                }
+            )
+        else:
+            record.update(_tensor_metadata(tensor))
+        lifetimes.append(record)
+    return lifetimes
+
+
+def _final_checksums(state: _WorkloadState) -> dict[str, float]:
+    return {name: _tensor_checksum(state.values[name]) for name in FINAL_OUTPUTS if name in state.values}
 
 
 def _timed_cpu_block(block: BlockSpec, state: _WorkloadState, shape: ShapeConfig) -> tuple[torch.Tensor, float]:
@@ -516,6 +706,8 @@ def _invalid_payload(
             "all_finite": None,
             "schedule_valid": False,
             "combined_checksum": None,
+            "final_checksums": None,
+            "value_lifetimes": [],
             "peak_allocated_bytes": None,
             "peak_reserved_bytes": None,
             "validation_errors": [error.to_json() for error in errors],
@@ -592,6 +784,8 @@ def run_composite_schedule(
     capabilities["cuda"]["peak_reserved_bytes"] = peak_reserved
     all_finite = all(bool(record["finite"]) for record in block_records)
     combined_checksum = float(sum(float(record["checksum"]) for record in block_records))
+    final_checksums = _final_checksums(state)
+    value_lifetimes = _value_lifetimes(blocks=specs, state=state)
     return {
         "schema_version": SCHEMA_VERSION,
         "schedule": schedule,
@@ -612,6 +806,8 @@ def run_composite_schedule(
             "all_finite": all_finite,
             "schedule_valid": True,
             "combined_checksum": combined_checksum,
+            "final_checksums": final_checksums,
+            "value_lifetimes": value_lifetimes,
             "peak_allocated_bytes": peak_allocated,
             "peak_reserved_bytes": peak_reserved,
             "validation_errors": [],
