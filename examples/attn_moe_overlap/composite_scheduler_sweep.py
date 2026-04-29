@@ -51,6 +51,10 @@ DEFAULT_NCU_METRICS = (
     "sm__throughput.avg.pct_of_peak_sustained_elapsed",
     "smsp__cycles_active.avg.pct_of_peak_sustained_elapsed",
 )
+NCU_DURATION_METRIC = "gpu__time_duration.sum"
+NCU_SM_THROUGHPUT_METRIC = "sm__throughput.avg.pct_of_peak_sustained_elapsed"
+NCU_SM_ACTIVE_METRIC = "smsp__cycles_active.avg.pct_of_peak_sustained_elapsed"
+MAX_NCU_PREFLIGHT_LOG_CHARS = 20_000
 BLOCK_NAMES = tuple(block.name for block in default_block_specs())
 BLOCK_FIELD_PREFIXES = tuple(f"forward_block_{name}" for name in BLOCK_NAMES)
 
@@ -147,6 +151,7 @@ class SweepConfig:
     ncu_metrics: tuple[str, ...]
     ncu_timeout_sec: int
     ncu_path: str
+    ncu_prefix: tuple[str, ...]
     cuda_visible_devices: str
     output_dir: Path
     command: str
@@ -194,6 +199,28 @@ def parse_metric_csv(raw: str) -> tuple[str, ...]:
     if not values:
         raise ValueError("ncu_metrics must not be empty")
     return values
+
+
+def parse_command_prefix(raw: str | None) -> tuple[str, ...]:
+    if raw is None or not raw.strip():
+        return ()
+    try:
+        return tuple(shlex.split(raw))
+    except ValueError as exc:
+        raise ValueError(f"ncu_prefix must be a shell-like command prefix, got {raw!r}") from exc
+
+
+def format_command(command: Sequence[str]) -> str:
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def truncate_log_text(text: str, *, max_chars: int = MAX_NCU_PREFLIGHT_LOG_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    head_chars = max_chars // 2
+    tail_chars = max_chars - head_chars
+    omitted = len(text) - max_chars
+    return text[:head_chars] + f"\n... truncated {omitted} characters ...\n" + text[-tail_chars:]
 
 
 def canonical_matrix(seq_lens: Sequence[int], batch_sizes: Sequence[int]) -> list[tuple[int, int]]:
@@ -546,11 +573,29 @@ def _float_or_none(raw: Any) -> float | None:
         return None
 
 
+def _csv_columns(line: str) -> list[str]:
+    try:
+        return next(csv.reader([line]))
+    except csv.Error:
+        return []
+
+
 def _find_ncu_csv_header(lines: Sequence[str]) -> int | None:
     for index, line in enumerate(lines):
-        if "Metric Name" in line and "Metric Value" in line:
+        columns = set(_csv_columns(line))
+        if "Metric Name" in columns and ({"Metric Value", "Average"} & columns):
+            return index
+        if any(metric in columns for metric in DEFAULT_NCU_METRICS) and ({"Kernel Name", "Name"} & columns):
             return index
     return None
+
+
+def _ncu_kernel_name(csv_row: dict[str, Any]) -> str:
+    for field in ("Kernel Name", "Name"):
+        value = csv_row.get(field)
+        if value:
+            return str(value)
+    return ""
 
 
 def _infer_block_from_kernel_name(kernel_name: str) -> str:
@@ -563,6 +608,31 @@ def _infer_block_from_kernel_name(kernel_name: str) -> str:
     return "unattributed"
 
 
+def _long_ncu_metric_value(csv_row: dict[str, Any], metric_name: str) -> float | None:
+    metric_value = _float_or_none(csv_row.get("Metric Value"))
+    if metric_value is not None:
+        return metric_value
+
+    average = _float_or_none(csv_row.get("Average"))
+    if average is None:
+        return None
+    if metric_name == NCU_DURATION_METRIC:
+        invocations = _float_or_none(csv_row.get("Invocations"))
+        if invocations is not None:
+            return average * invocations
+    return average
+
+
+def _add_metric_value(
+    grouped: dict[str, dict[str, list[float]]],
+    *,
+    block: str,
+    metric_name: str,
+    value: float,
+) -> None:
+    grouped.setdefault(block, {}).setdefault(metric_name, []).append(value)
+
+
 def summarize_ncu_csv(csv_path: Path) -> tuple[list[dict[str, Any]], str | None]:
     if not csv_path.exists():
         return [], "ncu_csv_missing"
@@ -573,25 +643,44 @@ def summarize_ncu_csv(csv_path: Path) -> tuple[list[dict[str, Any]], str | None]
 
     grouped: dict[str, dict[str, list[float]]] = {}
     metric_rows = 0
+    last_kernel_name = ""
     reader = csv.DictReader(lines[header_index:])
+    fieldnames = set(reader.fieldnames or [])
+    wide_metrics = tuple(metric for metric in DEFAULT_NCU_METRICS if metric in fieldnames)
     for csv_row in reader:
+        kernel_name = _ncu_kernel_name(csv_row)
+        if kernel_name:
+            last_kernel_name = kernel_name
+        block = _infer_block_from_kernel_name(kernel_name or last_kernel_name)
+
         metric_name = csv_row.get("Metric Name")
-        metric_value = _float_or_none(csv_row.get("Metric Value"))
-        if metric_name is None or metric_value is None:
+        if metric_name is not None:
+            metric_value = _long_ncu_metric_value(csv_row, metric_name)
+            if metric_value is None:
+                continue
+            _add_metric_value(grouped, block=block, metric_name=metric_name, value=metric_value)
+            metric_rows += 1
             continue
-        kernel_name = csv_row.get("Kernel Name") or csv_row.get("Name") or ""
-        block = _infer_block_from_kernel_name(kernel_name)
-        grouped.setdefault(block, {}).setdefault(metric_name, []).append(metric_value)
-        metric_rows += 1
+
+        row_metric_count = 0
+        for metric in wide_metrics:
+            metric_value = _float_or_none(csv_row.get(metric))
+            if metric_value is None:
+                continue
+            _add_metric_value(grouped, block=block, metric_name=metric, value=metric_value)
+            row_metric_count += 1
+        if row_metric_count == 0:
+            continue
+        metric_rows += row_metric_count
 
     if metric_rows == 0:
         return [], "ncu_csv_no_metric_rows"
 
     summaries: list[dict[str, Any]] = []
     for block, metrics in sorted(grouped.items()):
-        duration_values = metrics.get("gpu__time_duration.sum", [])
-        sm_throughput_values = metrics.get("sm__throughput.avg.pct_of_peak_sustained_elapsed", [])
-        sm_active_values = metrics.get("smsp__cycles_active.avg.pct_of_peak_sustained_elapsed", [])
+        duration_values = metrics.get(NCU_DURATION_METRIC, [])
+        sm_throughput_values = metrics.get(NCU_SM_THROUGHPUT_METRIC, [])
+        sm_active_values = metrics.get(NCU_SM_ACTIVE_METRIC, [])
         summaries.append(
             {
                 "block": block,
@@ -619,6 +708,7 @@ def build_ncu_command(
 ) -> list[str]:
     script_path = Path(__file__).resolve()
     return [
+        *config.ncu_prefix,
         config.ncu_path,
         "--target-processes",
         "all",
@@ -666,6 +756,17 @@ def build_ncu_command(
     ]
 
 
+def build_ncu_preflight_command(*, config: SweepConfig) -> list[str]:
+    return [
+        *config.ncu_prefix,
+        config.ncu_path,
+        "--query-metrics-mode",
+        "all",
+        "--metrics",
+        ",".join(config.ncu_metrics),
+    ]
+
+
 def _util_failure_rows_for_matrix(
     *,
     config: SweepConfig,
@@ -698,27 +799,23 @@ def _util_failure_rows_for_matrix(
 
 
 def run_ncu_preflight(*, config: SweepConfig, log_path: Path) -> tuple[bool, str | None, str, str]:
-    command = [
-        config.ncu_path,
-        "--query-metrics-mode",
-        "all",
-        "--metrics",
-        ",".join(config.ncu_metrics),
-    ]
+    command = build_ncu_preflight_command(config=config)
     started_at_utc = now_utc_iso()
     completed = subprocess.run(command, capture_output=True, text=True, timeout=config.ncu_timeout_sec, check=False)
     completed_at_utc = now_utc_iso()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
-        "\n".join(
-            [
-                "$ " + " ".join(shlex.quote(part) for part in command),
-                f"exit_code={completed.returncode}",
-                "--- stdout ---",
-                completed.stdout,
-                "--- stderr ---",
-                completed.stderr,
-            ]
+        truncate_log_text(
+            "\n".join(
+                [
+                    "$ " + format_command(command),
+                    f"exit_code={completed.returncode}",
+                    "--- stdout ---",
+                    completed.stdout,
+                    "--- stderr ---",
+                    completed.stderr,
+                ]
+            )
         ),
         encoding="utf-8",
     )
@@ -774,7 +871,7 @@ def run_ncu_case(
                 "profiler": "ncu",
                 "ncu_raw_csv": str(raw_csv_path),
                 "child_json": str(child_json_path),
-                "command": " ".join(shlex.quote(part) for part in command),
+                "command": format_command(command),
                 "started_at_utc": started_at_utc,
                 "completed_at_utc": completed_at_utc,
                 "error_type": "TimeoutExpired",
@@ -783,7 +880,7 @@ def run_ncu_case(
         )
         return [row]
 
-    command_text = " ".join(shlex.quote(part) for part in command)
+    command_text = format_command(command)
     if completed.returncode != 0:
         message = (completed.stderr or completed.stdout or "").splitlines()
         row = {field: None for field in UTILIZATION_FIELDNAMES}
@@ -926,7 +1023,7 @@ def run_utilization_sweep(*, config: SweepConfig, logger: RunLogger) -> list[dic
     logger.log("ncu preflight start")
     preflight_ok, reason, started_at_utc, completed_at_utc = run_ncu_preflight(config=config, log_path=preflight_log)
     if not preflight_ok:
-        command = f"{config.ncu_path} --query-metrics-mode all --metrics {','.join(config.ncu_metrics)}"
+        command = format_command(build_ncu_preflight_command(config=config))
         error_message = preflight_log.read_text(encoding="utf-8", errors="replace")[:1000]
         rows = _util_failure_rows_for_matrix(
             config=config,
@@ -1021,6 +1118,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-forward-blocks", action="store_true", default=True)
     parser.add_argument("--no-profile-forward-blocks", action="store_true")
     parser.add_argument("--ncu-path", default="ncu")
+    parser.add_argument(
+        "--ncu-prefix",
+        default="",
+        help='Optional command prefix for Nsight Compute, for example: --ncu-prefix "sudo -n -E"',
+    )
     parser.add_argument("--ncu-metrics", default=",".join(DEFAULT_NCU_METRICS))
     parser.add_argument("--ncu-timeout-sec", type=int, default=300)
     parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
@@ -1053,6 +1155,7 @@ def main() -> None:
         ncu_metrics=parse_metric_csv(args.ncu_metrics),
         ncu_timeout_sec=int(args.ncu_timeout_sec),
         ncu_path=args.ncu_path,
+        ncu_prefix=parse_command_prefix(args.ncu_prefix),
         cuda_visible_devices=args.cuda_visible_devices,
         output_dir=args.output_dir,
         command=command,
