@@ -96,6 +96,20 @@ def _enum_name(value: Any) -> str | None:
     return str(value)
 
 
+MEGATRON_BLOCKS_BY_ROLE = {
+    "attn": ("A0_qkv", "A1_rotary", "A2_core_attention", "A3_output_projection"),
+    "moe": (
+        "M0_router",
+        "M1_dispatch_preprocess",
+        "M2_token_dispatch",
+        "M3_dispatch_postprocess",
+        "M4_experts",
+        "M5_combine_preprocess",
+        "M6_token_combine",
+    ),
+}
+
+
 def describe_attention_runtime(layer: Any, requested_backend: str) -> dict[str, Any]:
     config = getattr(layer, "config", None)
     self_attention = getattr(layer, "self_attention", None)
@@ -455,7 +469,9 @@ def _prepare_stage_callable(
         if config.stage_role == "attn":
             def stage_impl(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
                 stage_state["equal_token_routing_state"] = None
-                output_tensor, _ = layer._forward_attention(hidden_states, attention_mask=attention_mask)
+                output_tensor, _ = layer._forward_attention(
+                    hidden_states, attention_mask=attention_mask
+                )
                 return output_tensor
 
             eager_runner = lambda: stage_impl(hidden_states, attention_mask)
@@ -542,6 +558,12 @@ class _SingleLayerMegatronTrainer:
         from python.ray.megatron_trainer import MegatronBaseTrainer
 
         class _Impl(MegatronBaseTrainer):
+            def _get_device(self):
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                device = torch.device(f"cuda:{local_rank}")
+                torch.cuda.set_device(device)
+                return device
+
             def build_model(self):
                 self._build_megatron_model()
                 self.megatron_model.eval()
@@ -563,7 +585,7 @@ class MegatronSingleLayerRuntime:
         if config.stage_role not in {"attn", "moe"}:
             raise ValueError(f"Unsupported stage_role: {config.stage_role}")
         self.config = config
-        self.device = torch.device("cuda:0")
+        self.device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}")
         self.trainer: _SingleLayerMegatronTrainer | None = None
         self.layer = None
         self.hidden_states: torch.Tensor | None = None
@@ -598,6 +620,17 @@ class MegatronSingleLayerRuntime:
         self.hidden_states = self._build_hidden_states(hidden_size)
         self.attention_mask = self._build_attention_mask()
         self._initialize_execution_stream()
+        self._prepare_stage_runner(requires_grad=False)
+
+    def _prepare_stage_runner(self, *, requires_grad: bool) -> None:
+        if self.layer is None or self.hidden_states is None or self.attention_mask is None:
+            raise RuntimeError("Cannot prepare stage runner before layer/input initialization")
+
+        self._stage_cleanup()
+        self._stage_cleanup = _noop_cleanup
+        self.hidden_states = self.hidden_states.detach()
+        if requires_grad:
+            self.hidden_states.requires_grad_(True)
         try:
             prepared_stage = _prepare_stage_callable(
                 config=self.config,
@@ -612,6 +645,275 @@ class MegatronSingleLayerRuntime:
         self._consume_equal_token_routing_state = prepared_stage.consume_equal_token_routing_state
         self._stage_cleanup = prepared_stage.cleanup
         self._torch_compile_status = str(prepared_stage.compile_payload["status"])
+
+    def _clear_gradients(self) -> None:
+        if self.layer is None:
+            return
+        for parameter in self.layer.parameters():
+            parameter.grad = None
+        if self.hidden_states is not None:
+            self.hidden_states.grad = None
+
+    def describe_layer_mapping(self) -> dict[str, Any]:
+        if self.layer is None:
+            self.initialize()
+        assert self.layer is not None
+
+        def _children(module: Any) -> list[dict[str, str]]:
+            if module is None or not hasattr(module, "named_children"):
+                return []
+            return [
+                {"name": name, "class": type(child).__name__}
+                for name, child in module.named_children()
+            ]
+
+        layer = self.layer
+        self_attention = getattr(layer, "self_attention", None)
+        mlp = getattr(layer, "mlp", None)
+        return {
+            "stage_role": self.config.stage_role,
+            "measured_blocks": list(MEGATRON_BLOCKS_BY_ROLE[self.config.stage_role]),
+            "layer_class": type(layer).__name__,
+            "stage_method": (
+                "layer._forward_attention"
+                if self.config.stage_role == "attn"
+                else "layer._forward_mlp"
+            ),
+            "self_attention": {
+                "class": type(self_attention).__name__ if self_attention is not None else None,
+                "module": type(self_attention).__module__ if self_attention is not None else None,
+                "children": _children(self_attention),
+                "core_attention_class": (
+                    type(getattr(self_attention, "core_attention", None)).__name__
+                    if getattr(self_attention, "core_attention", None) is not None
+                    else None
+                ),
+                "core_attention_module": (
+                    type(getattr(self_attention, "core_attention", None)).__module__
+                    if getattr(self_attention, "core_attention", None) is not None
+                    else None
+                ),
+            },
+            "mlp": {
+                "class": type(mlp).__name__ if mlp is not None else None,
+                "module": type(mlp).__module__ if mlp is not None else None,
+                "children": _children(mlp),
+                "public_methods": [
+                    name
+                    for name in (
+                        "router_and_preprocess",
+                        "dispatch",
+                        "routed_experts_compute",
+                        "combine",
+                        "shared_experts_compute",
+                    )
+                    if callable(getattr(mlp, name, None))
+                ],
+            },
+            "block_mapping": {
+                "A0_qkv": "Attention.forward get_query_key_value_tensors(...) including projection/split setup",
+                "A1_rotary": "Attention.forward rotary embedding application block",
+                "A2_core_attention": "Attention.forward self.core_attention(...) or checkpointed core attention",
+                "A3_output_projection": "Attention.forward self.linear_proj(core_attn_out)",
+                "M0_router": "MoELayer.router_and_preprocess self.router(hidden_states)",
+                "M1_dispatch_preprocess": "MoELayer.router_and_preprocess token_dispatcher.dispatch_preprocess(...)",
+                "M2_token_dispatch": "MoELayer.dispatch token_dispatcher.token_dispatch(...)",
+                "M3_dispatch_postprocess": "MoELayer.routed_experts_compute token_dispatcher.dispatch_postprocess(...)",
+                "M4_experts": "MoELayer.routed_experts_compute self.experts(...)",
+                "M5_combine_preprocess": "MoELayer.routed_experts_compute token_dispatcher.combine_preprocess(...)",
+                "M6_token_combine": "MoELayer.combine token_combine(...) plus combine_postprocess(...)",
+            },
+            "block_mapping_note": (
+                "Fine blocks are instrumented inside Megatron-LM internals with "
+                "megatron.core.transformer.profiling.profile_block. The bridge benchmark "
+                "runs only MegatronSingleLayerRuntime stage paths and reads the helper stats."
+            ),
+        }
+
+    def run_stage_measurement(
+        self,
+        *,
+        warmup_iters: int,
+        timed_iters: int,
+        include_backward: bool,
+        enable_cuda_profiler: bool = False,
+    ) -> dict[str, Any]:
+        if self.layer is None or self.hidden_states is None or self.attention_mask is None:
+            self.initialize()
+
+        assert self.layer is not None
+        assert self.hidden_states is not None
+        assert self.execution_stream is not None
+        assert self._stage_runner is not None
+
+        total_iters = int(warmup_iters) + int(timed_iters)
+        if total_iters <= 0:
+            raise ValueError("warmup_iters + timed_iters must be > 0")
+        if int(timed_iters) <= 0:
+            raise ValueError("timed_iters must be > 0")
+
+        self._prepare_stage_runner(requires_grad=include_backward)
+        assert self._stage_runner is not None
+        self._run_torch_compile_preflight()
+
+        import torch.distributed as dist
+        from megatron.core.transformer.profiling import (
+            get_block_stats,
+            reset_block_stats,
+            set_block_profiling,
+        )
+
+        forward_cuda_ms: list[float] = []
+        total_cuda_ms: list[float] = []
+        forward_wall_ms: list[float] = []
+        total_wall_ms: list[float] = []
+        first_nonfinite: dict[str, Any] | None = None
+        output_tensor: torch.Tensor | None = None
+        profiler_started = False
+        memory_before: dict[str, int] | None = None
+        memory_after: dict[str, int] | None = None
+
+        block_stats: dict[str, Any] = {}
+
+        try:
+            set_block_profiling(
+                True,
+                collect_stats=False,
+                collect_cuda_timing=True,
+                collect_memory=True,
+            )
+            reset_block_stats()
+            for iter_idx in range(total_iters):
+                is_timed = iter_idx >= int(warmup_iters)
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+                if is_timed and not forward_cuda_ms:
+                    self.execution_stream.synchronize()
+                    reset_block_stats()
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                    memory_before = {
+                        "allocated": int(torch.cuda.memory_allocated(self.device)),
+                        "reserved": int(torch.cuda.memory_reserved(self.device)),
+                    }
+                    if enable_cuda_profiler:
+                        torch.cuda.cudart().cudaProfilerStart()
+                        profiler_started = True
+
+                self._clear_gradients()
+                forward_start_event = torch.cuda.Event(enable_timing=True)
+                forward_end_event = torch.cuda.Event(enable_timing=True)
+                total_start_event = torch.cuda.Event(enable_timing=True)
+                total_end_event = torch.cuda.Event(enable_timing=True)
+
+                active_stream = self.execution_stream
+                total_start_s = time.perf_counter()
+                total_start_event.record(active_stream)
+                forward_start_event.record(active_stream)
+                forward_start_s = time.perf_counter()
+                set_block_profiling(
+                    True,
+                    collect_stats=is_timed and not enable_cuda_profiler,
+                    collect_cuda_timing=True,
+                    collect_memory=True,
+                )
+                try:
+                    with torch.cuda.stream(active_stream):
+                        if include_backward:
+                            output_tensor = self._stage_runner()
+                        else:
+                            with torch.no_grad():
+                                output_tensor = self._stage_runner()
+                finally:
+                    set_block_profiling(False, collect_stats=False)
+                forward_end_event.record(active_stream)
+                active_stream.synchronize()
+                forward_end_s = time.perf_counter()
+
+                if self.config.stage_role == "moe" and self.config.moe_routing_mode == "equal_tokens":
+                    state = self._consume_equal_token_routing_state()
+                    if state is None:
+                        raise RuntimeError("equal_tokens stage runner did not produce routing state")
+                else:
+                    self._consume_equal_token_routing_state()
+
+                if include_backward:
+                    if output_tensor is None:
+                        raise RuntimeError("stage runner produced no output tensor")
+                    loss = output_tensor.float().square().mean()
+                    loss.backward()
+
+                total_end_event.record(active_stream)
+                active_stream.synchronize()
+                total_end_s = time.perf_counter()
+
+                if is_timed:
+                    forward_cuda_ms.append(float(forward_start_event.elapsed_time(forward_end_event)))
+                    total_cuda_ms.append(float(total_start_event.elapsed_time(total_end_event)))
+                    forward_wall_ms.append((forward_end_s - forward_start_s) * 1000.0)
+                    total_wall_ms.append((total_end_s - total_start_s) * 1000.0)
+
+                if (
+                    first_nonfinite is None
+                    and output_tensor is not None
+                    and torch.is_floating_point(output_tensor)
+                ):
+                    if not torch.isfinite(output_tensor).all():
+                        first_nonfinite = {
+                            "module": f"{self.config.stage_role}_layer",
+                            "phase": "forward",
+                            "tensor": "output",
+                            "iter": int(iter_idx),
+                        }
+
+            if profiler_started:
+                torch.cuda.cudart().cudaProfilerStop()
+                profiler_started = False
+            self.execution_stream.synchronize()
+            block_stats = get_block_stats(reset=True)
+            memory_after = {
+                "allocated": int(torch.cuda.memory_allocated(self.device)),
+                "reserved": int(torch.cuda.memory_reserved(self.device)),
+                "max_allocated": int(torch.cuda.max_memory_allocated(self.device)),
+                "max_reserved": int(torch.cuda.max_memory_reserved(self.device)),
+            }
+        finally:
+            set_block_profiling(False, collect_stats=False)
+            if profiler_started:
+                torch.cuda.cudart().cudaProfilerStop()
+            self._clear_gradients()
+            self.cleanup()
+
+        def _mean(values: list[float]) -> float | None:
+            return float(sum(values) / len(values)) if values else None
+
+        return {
+            "status": "ok",
+            "stage_role": self.config.stage_role,
+            "blocks": list(MEGATRON_BLOCKS_BY_ROLE[self.config.stage_role]),
+            "mode": "forward_backward" if include_backward else "forward",
+            "attention_backend": self.config.attention_backend,
+            "attention_impl": self.attention_runtime,
+            "moe_grouped_gemm": self.config.moe_grouped_gemm,
+            "moe_token_dispatcher_type": self.config.moe_token_dispatcher_type,
+            "moe_routing_mode": self.config.moe_routing_mode,
+            "timing_ms": {
+                "forward_cuda_mean": _mean(forward_cuda_ms),
+                "forward_wall_mean": _mean(forward_wall_ms),
+                "total_cuda_mean": _mean(total_cuda_ms),
+                "total_wall_mean": _mean(total_wall_ms),
+            },
+            "memory": {
+                "before": memory_before,
+                "after": memory_after,
+            },
+            "finite": {
+                "all_finite": first_nonfinite is None,
+                "first_nonfinite": first_nonfinite,
+            },
+            "output_signature": tensor_signature(output_tensor),
+            "block_stats": block_stats,
+            "torch_compile": self.torch_compile_payload(),
+        }
 
     def cleanup(self) -> None:
         try:
@@ -699,6 +1001,7 @@ class MegatronSingleLayerRuntime:
             "megatron_overlap_moe_expert_parallel_comm": (
                 True if self.config.overlap_moe_expert_parallel_comm else None
             ),
+            "megatron_seed": int(self.config.seed),
             "megatron_num_layers": 1,
             "load_weights": False,
             "use_cpu_initialization": True,
