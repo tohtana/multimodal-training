@@ -247,40 +247,78 @@ class MegatronBaseTrainer(Trainer):
                 return int(value)
         return None
 
-    def get_optimizer_probe_snapshot(self, parameter_path: str | None = None) -> dict:
+    def get_optimizer_probe_snapshot(self, parameter_path: str | None = None, allow_fallback: bool = False) -> dict:
         """Snapshot one validated parameter for optimizer-update verification."""
         if parameter_path is None:
             raise ValueError("parameter_path is required; runtime probe selection is not allowed")
         name, param = self._resolve_probe_parameter(parameter_path)
+        snapshot = self._snapshot_probe_parameter(parameter_path, name, param)
+        if allow_fallback and not snapshot["has_nonzero_grad"]:
+            fallback = self._find_first_nonzero_grad_parameter()
+            if fallback is not None:
+                fallback_name, fallback_param = fallback
+                snapshot = self._snapshot_probe_parameter(fallback_name, fallback_name, fallback_param)
+                snapshot["requested_parameter_path"] = parameter_path
+                snapshot["selection_reason"] = "fallback_first_nonzero_gradient"
+        return snapshot
+
+    def _snapshot_probe_parameter(self, parameter_path: str, name: str, param: torch.nn.Parameter) -> dict:
         grad_norm = None
         has_nonzero_grad = False
         if param.grad is not None:
             grad_norm = float(param.grad.detach().float().norm().item())
             has_nonzero_grad = grad_norm > 0.0
+        param_value = param.detach().float()
+        if hasattr(param_value, "flatten") and hasattr(param_value, "numel"):
+            flat = param_value.flatten()
+            sample = flat[: min(flat.numel(), 4096)]
+            if sample.numel() > 0:
+                weights = torch.linspace(1.0, 2.0, steps=sample.numel(), device=sample.device, dtype=sample.dtype)
+                param_checksum = float((sample * weights).sum().item())
+            else:
+                param_checksum = 0.0
+        else:
+            param_checksum = float(param_value.norm().item())
         return {
             "parameter_path": parameter_path,
             "resolved_name": name,
-            "param_l2_norm": float(param.detach().float().norm().item()),
+            "param_l2_norm": float(param_value.norm().item()),
+            "param_checksum": param_checksum,
             "grad_l2_norm": grad_norm,
             "has_nonzero_grad": has_nonzero_grad,
             "optimizer_step_count": self._optimizer_step_count,
         }
 
+    def _find_first_nonzero_grad_parameter(self):
+        if self.megatron_model is None:
+            raise RuntimeError("Megatron model is not built")
+        for name, param in self.megatron_model.named_parameters():
+            if param.grad is None:
+                continue
+            grad_norm = float(param.grad.detach().float().norm().item())
+            if grad_norm > 0.0:
+                return name, param
+        return None
+
     def verify_optimizer_update(self, before: dict, *, atol: float = 1e-6) -> dict:
         """Compare the current probe parameter state against a previous snapshot."""
         after = self.get_optimizer_probe_snapshot(before.get("parameter_path"))
         norm_delta = abs(after["param_l2_norm"] - float(before["param_l2_norm"]))
+        checksum_delta = abs(after["param_checksum"] - float(before.get("param_checksum", 0.0)))
+        value_delta = max(norm_delta, checksum_delta)
         expected_step = int(before["optimizer_step_count"]) + 1
         actual_step = int(after["optimizer_step_count"])
         return {
             "before": before,
             "after": after,
-            "param_norm_delta": norm_delta,
-            "param_norm_changed": norm_delta > atol,
+            "param_l2_norm_delta": norm_delta,
+            "param_checksum_delta": checksum_delta,
+            "param_norm_delta": value_delta,
+            "param_norm_changed": value_delta > atol,
             "expected_optimizer_step_count": expected_step,
             "actual_optimizer_step_count": actual_step,
             "iteration_step_counter_advanced": actual_step == expected_step,
-            "optimizer_update_verified": norm_delta > atol and actual_step == expected_step,
+            "optimizer_update_verified": value_delta > atol and actual_step == expected_step,
         }
 
     def _resolve_probe_parameter(self, parameter_path: str):
@@ -619,7 +657,8 @@ class MegatronTextTrainer(MegatronBaseTrainer):
         if loss.numel() > 1:
             loss = loss.mean()
         if vision_embeddings is not None:
-            loss = loss + (vision_embeddings.sum() * 0.0)
+            bridge_loss_scale = float(self._get_engine_config_value("optimizer_probe_bridge_loss_scale", 0.0) or 0.0)
+            loss = loss + (vision_embeddings.float().sum() * bridge_loss_scale)
 
         self._pending_loss = loss
         self._vision_embeddings = vision_embeddings

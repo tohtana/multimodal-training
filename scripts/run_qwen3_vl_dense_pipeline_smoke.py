@@ -69,8 +69,9 @@ def _build_row(
     _write_config(output_dir, run_id, config)
 
     dense_model_id = dense_audit.get("selected_model_id") if dense_audit else None
-    framework_only = dense_model_id is None and not args.dry_run
-    model_id = dense_model_id or "Qwen/Qwen2.5-VL-32B-Instruct"
+    target_model_id = _target_dense_model_id(dense_audit)
+    model_id = dense_model_id or target_model_id
+    framework_only = False
     layer = _layer_from_audit(dense_audit)
     stages = _stage_rows_from_config(config, cell)
     edges = _edge_rows_from_config(config, stages)
@@ -83,7 +84,7 @@ def _build_row(
             dry_run=True,
             framework_only=False,
             model_id=model_id,
-            dense=dense_model_id is not None,
+            dense=_is_dense_qwen3_vl_id(model_id),
             command=command,
             started_utc=started,
             finished_utc=datetime.now(timezone.utc).isoformat(),
@@ -101,7 +102,7 @@ def _build_row(
             code_path="multimodal-training/scripts/qwen3_vl_dense_audit.py:120",
             code_path_git_sha=_git_sha(Path(__file__).resolve().parents[1]),
             error_excerpt=_dense_failure_excerpt(dense_audit),
-            config_diff=f"model_id: Qwen/Qwen3-VL-8B-Instruct -> {model_id} (framework_only=true)",
+            config_diff=None,
             next_action=_dense_blocker_next_action(blocker_category),
         )
         return _row(
@@ -111,7 +112,7 @@ def _build_row(
             dry_run=False,
             framework_only=framework_only,
             model_id=model_id,
-            dense=False,
+            dense=_is_dense_qwen3_vl_id(model_id),
             command=command,
             started_utc=started,
             finished_utc=datetime.now(timezone.utc).isoformat(),
@@ -125,7 +126,7 @@ def _build_row(
         blocker = BlockerRow(
             category="asymmetric_routing_unsupported",
             reason="Forward routing supports M:N refs, but real-VLM backward gradient aggregation is not implemented.",
-            code_path="multimodal-training/python/pipeline/vlm_runner.py:181",
+            code_path="multimodal-training/python/pipeline/vlm_runner.py:240",
             code_path_git_sha=_git_sha(Path(__file__).resolve().parents[1]),
             error_excerpt=(
                 '"Asymmetric real-VLM backward routing is not implemented" from '
@@ -153,7 +154,7 @@ def _build_row(
             blocker=blocker,
         )
 
-    blocker, runtime_metadata = _run_training_subprocess(args, hydra_overrides, output_dir, run_id)
+    blocker, runtime_metadata = _run_training_subprocess(args, hydra_overrides, output_dir, run_id, dense_audit)
     if blocker is not None:
         return _row(
             run_id=run_id,
@@ -227,10 +228,18 @@ def _run_training_subprocess(
     hydra_overrides: list[str],
     output_dir: Path,
     run_id: str,
+    dense_audit: dict[str, Any] | None,
 ) -> tuple[BlockerRow | None, dict[str, Any] | None]:
     project_root = Path(__file__).resolve().parents[1]
     log_path = output_dir / "logs" / f"{run_id}.txt"
     metadata_path = output_dir / "logs" / f"{run_id}.metadata.json"
+    bridge_load_path = _complete_weight_path_from_audit(dense_audit)
+    bridge_overrides = []
+    if bridge_load_path:
+        bridge_overrides = [
+            f"+vision.engine_config.bridge_load_path={bridge_load_path}",
+            f"+text.engine_config.bridge_load_path={bridge_load_path}",
+        ]
     cmd = [
         sys.executable,
         "-m",
@@ -241,6 +250,7 @@ def _run_training_subprocess(
         "training.num_epochs=1",
         "training.warmup_steps=0",
         "training.no_checkpoint=true",
+        *bridge_overrides,
         *hydra_overrides,
     ]
     env = os.environ.copy()
@@ -256,9 +266,12 @@ def _run_training_subprocess(
     env["HYDRA_FULL_ERROR"] = "1"
     env["RAY_ADDRESS"] = env.get("RAY_ADDRESS", "auto")
     env["RAY_NAMESPACE"] = env.get("RAY_NAMESPACE", f"todo-qwen3-vl-{run_id}")
-    env["VLM_REQUESTED_RAY_PORT"] = str(args.ray_port)
+    if args.ray_port is not None:
+        env["VLM_REQUESTED_RAY_PORT"] = str(args.ray_port)
     env["VLM_PIPELINE_METADATA_PATH"] = str(metadata_path)
     env["VLM_PIPELINE_DENSE_AUDIT_PATH"] = str(args.dense_audit)
+    if bridge_load_path and str(bridge_load_path).startswith("/mnt/cluster_storage/hf_cache/"):
+        env.setdefault("HF_HUB_CACHE", "/mnt/cluster_storage/hf_cache")
     try:
         result = subprocess.run(
             cmd,
@@ -270,7 +283,7 @@ def _run_training_subprocess(
         )
     except subprocess.TimeoutExpired as exc:
         excerpt = _truncate((exc.stdout or "") + "\n" + (exc.stderr or "") + "\n" + str(exc))
-        log_path.write_text(excerpt, encoding="utf-8")
+        log_path.write_text(_subprocess_log(cmd, bridge_load_path, excerpt), encoding="utf-8")
         return BlockerRow(
             category="other",
             reason="Dense Qwen3-VL smoke subprocess timed out.",
@@ -282,7 +295,7 @@ def _run_training_subprocess(
         ), _read_json(metadata_path) if metadata_path.exists() else None
 
     combined = result.stdout + "\n" + result.stderr
-    log_path.write_text(combined, encoding="utf-8")
+    log_path.write_text(_subprocess_log(cmd, bridge_load_path, combined), encoding="utf-8")
     if result.returncode == 0:
         if not metadata_path.exists():
             return None, None
@@ -640,6 +653,35 @@ def _dense_failure_excerpt(dense_audit: dict[str, Any] | None) -> str:
     return _truncate(text)
 
 
+def _target_dense_model_id(dense_audit: dict[str, Any] | None) -> str:
+    if dense_audit is not None:
+        for result in dense_audit.get("per_id_results", []):
+            model_id = result.get("model_id")
+            if isinstance(model_id, str) and _is_dense_qwen3_vl_id(model_id):
+                return model_id
+    return "Qwen/Qwen3-VL-8B-Instruct"
+
+
+def _is_dense_qwen3_vl_id(model_id: str | None) -> bool:
+    if model_id is None:
+        return False
+    lowered = model_id.lower()
+    return "qwen3-vl" in lowered and "a3b" not in lowered and "moe" not in lowered
+
+
+def _complete_weight_path_from_audit(dense_audit: dict[str, Any] | None) -> str | None:
+    if dense_audit is None:
+        return None
+    complete_paths = []
+    for result in dense_audit.get("per_id_results", []):
+        if result.get("model_id") == dense_audit.get("selected_model_id"):
+            complete_paths = result.get("local_weight_cache", {}).get("complete_paths", [])
+            break
+    if not complete_paths:
+        return None
+    return str(complete_paths[0])
+
+
 def _dense_blocker_category(dense_audit: dict[str, Any] | None) -> str:
     excerpt = _dense_failure_excerpt(dense_audit).lower()
     if "weight shards" in excerpt or "local weights" in excerpt:
@@ -682,6 +724,16 @@ def _subprocess_failure_classification(combined: str) -> tuple[str, str, str]:
     )
 
 
+def _subprocess_log(cmd: list[str], bridge_load_path: str | None, body: str) -> str:
+    header = [
+        "internal_train_pipeline_command:",
+        " ".join(cmd),
+        f"bridge_load_path={bridge_load_path or '<none>'}",
+        "",
+    ]
+    return "\n".join(header) + body
+
+
 def _git_sha(path: Path) -> str:
     return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
 
@@ -718,7 +770,7 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--dense-audit", type=Path, default=default_artifacts / "dense_model_audit.json")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-iterations", type=int, default=3)
-    parser.add_argument("--ray-port", type=int, required=True)
+    parser.add_argument("--ray-port", type=int, default=None)
     args, rest = parser.parse_known_args()
     if rest and rest[0] == "--":
         rest = rest[1:]

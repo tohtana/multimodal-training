@@ -193,14 +193,25 @@ def _layer_override_roundtrip_claim_is_supported(layer_truncation: dict[str, Any
 
 def _local_weight_cache_status(model_id: str) -> dict[str, Any]:
     cache_roots = [
-        os.environ.get("HF_HOME"),
-        os.path.expanduser("~/.cache/huggingface"),
+        os.environ.get("HF_HUB_CACHE"),
+        (Path(os.environ["HF_HOME"]) / "hub") if os.environ.get("HF_HOME") else None,
+        Path(os.path.expanduser("~/.cache/huggingface")) / "hub",
         "/mnt/cluster_storage/hf_cache",
+        "/mnt/cluster_storage/hf_cache/hub",
         "/mnt/local_storage/huggingface",
+        "/mnt/local_storage/huggingface/hub",
         "/mnt/user_storage/huggingface",
+        "/mnt/user_storage/huggingface/hub",
     ]
     rel = "hub/models--" + model_id.replace("/", "--")
-    hf_candidates = [Path(root) / rel for root in cache_roots if root]
+    direct_rel = "models--" + model_id.replace("/", "--")
+    hf_candidates: list[Path] = []
+    for root in cache_roots:
+        if not root:
+            continue
+        root_path = Path(root)
+        hf_candidates.append(root_path / direct_rel)
+        hf_candidates.append(root_path / rel)
 
     modelscope_roots = [
         os.environ.get("MODELSCOPE_CACHE"),
@@ -248,10 +259,18 @@ def _weight_file_status(path: Path) -> dict[str, Any]:
             "required_files": [],
             "present_files": [],
             "missing_files": [],
+            "required_count": 0,
+            "present_count": 0,
+            "expected_total_bytes": None,
             "present_bytes": 0,
         }
 
-    required_files = _required_safetensor_files(index_path)
+    try:
+        index_payload = _read_json(index_path) if index_path.exists() else {}
+    except json.JSONDecodeError:
+        index_payload = {}
+    required_files = _required_safetensor_files(index_payload)
+    expected_total_bytes = index_payload.get("metadata", {}).get("total_size")
     present_files = []
     missing_files = []
     present_bytes = 0
@@ -270,6 +289,9 @@ def _weight_file_status(path: Path) -> dict[str, Any]:
         "required_files": required_files,
         "present_files": present_files,
         "missing_files": missing_files,
+        "required_count": len(required_files),
+        "present_count": len(present_files),
+        "expected_total_bytes": expected_total_bytes,
         "present_bytes": present_bytes,
     }
 
@@ -285,13 +307,7 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
     return result
 
 
-def _required_safetensor_files(index_path: Path) -> list[str]:
-    if not index_path.exists():
-        return []
-    try:
-        payload = _read_json(index_path)
-    except json.JSONDecodeError:
-        return []
+def _required_safetensor_files(payload: dict[str, Any]) -> list[str]:
     return sorted(set(str(filename) for filename in payload.get("weight_map", {}).values()))
 
 

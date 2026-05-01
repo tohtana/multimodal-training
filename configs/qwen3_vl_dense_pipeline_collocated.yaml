@@ -59,6 +59,7 @@ text:
     sequence_parallel_size: 1
     attention_backend: "unfused"
     load_weights: true
+    optimizer_probe_bridge_loss_scale: 0.001
 
 training:
   batch_size: 1

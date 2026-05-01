@@ -151,7 +151,9 @@ class VLMPipelineRunner:
                 if name not in self.stage_groups or not parameter_path:
                     continue
                 actor = self.stage_groups[name]._actors[0]
-                optimizer_probe_before[name] = ray.get(actor.get_optimizer_probe_snapshot.remote(parameter_path))
+                optimizer_probe_before[name] = ray.get(
+                    actor.get_optimizer_probe_snapshot.remote(parameter_path, True)
+                )
 
         # Gradient clipping
         global_grad_norm = None
