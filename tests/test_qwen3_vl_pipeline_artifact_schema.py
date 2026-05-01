@@ -56,10 +56,19 @@ def _base_payload(status="ok"):
                 resource_set="vision_gpus",
                 actor_count=4,
                 physical_gpu_ids={0: "gpu0", 1: "gpu1", 2: "gpu2", 3: "gpu3"},
+                cuda_visible_devices={0: "0", 1: "1", 2: "2", 3: "3"},
                 requested_device_ids=[0, 1, 2, 3],
                 placement_match=True,
                 process_group_world_size=4,
                 megatron={"tp": 4, "cp": 1, "pp": 1, "ep": 1},
+                actor_runtime={
+                    i: {
+                        "cuda_visible_devices": str(i),
+                        "physical_gpu_id": f"gpu{i}",
+                        "process_group": {"initialized": True, "world_size": 4, "rank": i, "local_rank": 0},
+                    }
+                    for i in range(4)
+                },
             )
         ],
         "edges": [
@@ -74,10 +83,15 @@ def _base_payload(status="ok"):
             iterations=1,
             warmup_iterations=0,
             batch_size=1,
+            loss_values=[1.0] if status == "ok" else [],
+            backward_completed=status == "ok",
+            selected_parameter_grad_nonzero=status == "ok",
+            parameter_norm_delta=0.1 if status == "ok" else None,
             optimizer_update_verified=status == "ok",
             iteration_step_counter_advanced=status == "ok",
             expected_optimizer_step_delta=1,
             actual_optimizer_step_delta=1 if status == "ok" else None,
+            optimizer_probe={"vision": {"param_norm_delta": 0.1}} if status == "ok" else {},
         ),
         "metrics": MetricsRow(
             loss_finite=status == "ok",

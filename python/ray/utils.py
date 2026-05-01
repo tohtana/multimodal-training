@@ -7,6 +7,17 @@ import ray
 logger = logging.getLogger(__name__)
 
 
+def _path_is_under_prefix(path: str, prefix: str) -> bool:
+    if not path or not prefix:
+        return False
+    abs_path = os.path.abspath(path)
+    abs_prefix = os.path.abspath(prefix)
+    try:
+        return os.path.commonpath([abs_path, abs_prefix]) == abs_prefix
+    except ValueError:
+        return False
+
+
 def _unique_log_path(archive_dir: str, timestamp: str, suffix: str = "") -> str:
     base_name = f"train_{timestamp}{suffix}.log"
     candidate = os.path.join(archive_dir, base_name)
@@ -77,16 +88,28 @@ def prepare_runtime_environment() -> dict[str, str]:
     if os.environ.get("WANDB_API_KEY"):
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
-    # Propagate the current conda env's site-packages to Ray actors so they
-    # pick up the correct package versions (e.g. transformers, deepspeed).
+    # Propagate the active interpreter's site-packages to Ray actors so they
+    # pick up task-local venv packages before falling back to the base image.
     import site
     import sys
 
-    conda_prefix = os.environ.get("CONDA_PREFIX", "")
-    site_packages = site.getsitepackages()
-    extra_paths = [p for p in site_packages if conda_prefix and conda_prefix in p]
-    existing_pythonpath = os.environ.get("PYTHONPATH", "")
-    all_paths = extra_paths + ([existing_pythonpath] if existing_pythonpath else [])
+    prefixes = [
+        sys.prefix,
+        sys.exec_prefix,
+        os.environ.get("VIRTUAL_ENV", ""),
+        os.environ.get("CONDA_PREFIX", ""),
+    ]
+    site_packages = []
+    for path in site.getsitepackages():
+        if any(_path_is_under_prefix(path, prefix) for prefix in prefixes):
+            site_packages.append(path)
+
+    all_paths = []
+    for path in [*site_packages, *os.environ.get("PYTHONPATH", "").split(os.pathsep)]:
+        if path and not os.path.isabs(path):
+            path = os.path.abspath(path)
+        if path and path not in all_paths:
+            all_paths.append(path)
     if all_paths:
         env_vars["PYTHONPATH"] = os.pathsep.join(all_paths)
 
@@ -106,7 +129,12 @@ def prepare_runtime_environment() -> dict[str, str]:
 def initialize_ray():
     env_vars = prepare_runtime_environment()
     if not ray.is_initialized():
-        ray.init(runtime_env={"env_vars": env_vars})
+        init_kwargs = {"runtime_env": {"env_vars": env_vars}}
+        if os.environ.get("RAY_ADDRESS"):
+            init_kwargs["address"] = os.environ["RAY_ADDRESS"]
+        if os.environ.get("RAY_NAMESPACE"):
+            init_kwargs["namespace"] = os.environ["RAY_NAMESPACE"]
+        ray.init(**init_kwargs)
 
 
 def init_distributed_comm(backend: str = "nccl", use_deepspeed: bool = False):

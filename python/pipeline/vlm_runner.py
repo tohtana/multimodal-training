@@ -79,6 +79,7 @@ class VLMPipelineRunner:
         parallel_size: int = 1,
         clip_grad_norm: bool = False,
         max_grad_norm: float = 1.0,
+        optimizer_probe_paths: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         """Run one pipeline iteration following the DAG schedule.
 
@@ -144,6 +145,14 @@ class VLMPipelineRunner:
             if name in stage_grad_refs:
                 ray.get(stage_grad_refs[name])
 
+        optimizer_probe_before: dict[str, Any] = {}
+        if optimizer_probe_paths:
+            for name, parameter_path in optimizer_probe_paths.items():
+                if name not in self.stage_groups or not parameter_path:
+                    continue
+                actor = self.stage_groups[name]._actors[0]
+                optimizer_probe_before[name] = ray.get(actor.get_optimizer_probe_snapshot.remote(parameter_path))
+
         # Gradient clipping
         global_grad_norm = None
         if clip_grad_norm:
@@ -153,7 +162,59 @@ class VLMPipelineRunner:
         for name in self.topo_order:
             self.stage_groups[name].execute_all("optimizer_step", global_grad_norm)
 
-        return {"loss": avg_loss, "global_grad_norm": global_grad_norm}
+        optimizer_probe_after: dict[str, Any] = {}
+        for name, before in optimizer_probe_before.items():
+            actor = self.stage_groups[name]._actors[0]
+            optimizer_probe_after[name] = ray.get(actor.verify_optimizer_update.remote(before))
+
+        return {
+            "loss": avg_loss,
+            "global_grad_norm": global_grad_norm,
+            "backward_completed": True,
+            "optimizer_probe": optimizer_probe_after,
+        }
+
+    def reset_cuda_memory_stats(self) -> None:
+        for name in self.topo_order:
+            self.stage_groups[name].execute_all("reset_cuda_memory_stats")
+
+    def collect_runtime_metadata(self) -> dict[str, Any]:
+        """Collect actor placement, process-group, layer, memory, and edge metadata."""
+        stages: dict[str, Any] = {}
+        for name in self.topo_order:
+            group = self.stage_groups[name]
+            actor_runtime = ray.get(group.execute_all_async("get_runtime_metadata"))
+            layer_counts = ray.get(group.execute_all_async("get_effective_layer_counts"))
+            memory = ray.get(group.execute_all_async("get_cuda_memory_stats"))
+            stages[name] = {
+                "resource_set": getattr(group, "resource_set", None),
+                "actor_count": len(group._actors),
+                "physical_gpu_ids": getattr(group, "physical_gpu_ids", {}),
+                "cuda_visible_devices": getattr(group, "cuda_visible_devices", {}),
+                "requested_device_ids": getattr(group, "requested_device_ids", None),
+                "placement_match": getattr(group, "placement_match", None),
+                "actor_runtime": {idx: value for idx, value in enumerate(actor_runtime)},
+                "layer_counts": {idx: value for idx, value in enumerate(layer_counts)},
+                "memory": {idx: value for idx, value in enumerate(memory)},
+            }
+
+        edges: list[dict[str, Any]] = []
+        for edge in self.pipeline.edges:
+            routing = self.router.get_routing(edge.src, edge.dst) if self.router is not None else None
+            edges.append(
+                {
+                    "from_stage": edge.src,
+                    "to_stage": edge.dst,
+                    "transfer_tier": self.router.get_transport(edge.src, edge.dst) if self.router is not None else "unknown",
+                    "routing_map": {
+                        "num_src": routing.num_src if routing is not None else len(self.stage_groups[edge.src]._actors),
+                        "num_dst": routing.num_dst if routing is not None else len(self.stage_groups[edge.dst]._actors),
+                        "src_to_dst": routing.src_to_dst if routing is not None else {},
+                        "dst_to_src": routing.dst_to_src if routing is not None else {},
+                    },
+                }
+            )
+        return {"stages": stages, "edges": edges}
 
     def _route_forward_refs(self, src_stage: str, dst_stage: str, pred_refs: list) -> list:
         if self.router is None:

@@ -219,11 +219,33 @@ class MegatronBaseTrainer(Trainer):
     def get_effective_layer_counts(self) -> dict:
         """Return effective layer counts visible to the instantiated Megatron args."""
         self._initialize_megatron()
+        vision_layers = int(getattr(self.megatron_args, "vision_num_layers", 0) or 0) or self._infer_visual_layer_count()
         return {
             "megatron_num_layers": int(getattr(self.megatron_args, "num_layers", 0) or 0),
-            "vision_effective_layers": int(getattr(self.megatron_args, "vision_num_layers", 0) or 0) or None,
+            "vision_effective_layers": vision_layers,
             "language_effective_layers": int(getattr(self.megatron_args, "num_layers", 0) or 0),
         }
+
+    def _infer_visual_layer_count(self) -> int | None:
+        visual = getattr(self.megatron_model, "visual", None)
+        if visual is None:
+            return None
+        if hasattr(visual, "visual"):
+            visual = visual.visual
+        for attr in ("blocks", "layers"):
+            value = getattr(visual, attr, None)
+            if value is not None:
+                try:
+                    return len(value)
+                except TypeError:
+                    pass
+        model_config = getattr(getattr(self.megatron_model, "visual", None), "model_config", None)
+        vision_config = getattr(model_config, "vision_config", None)
+        for attr in ("depth", "num_hidden_layers"):
+            value = getattr(vision_config, attr, None)
+            if value is not None:
+                return int(value)
+        return None
 
     def get_optimizer_probe_snapshot(self, parameter_path: str | None = None) -> dict:
         """Snapshot one validated parameter for optimizer-update verification."""
@@ -273,6 +295,9 @@ class MegatronBaseTrainer(Trainer):
         named_params = dict(self.megatron_model.named_parameters())
         if normalized in named_params:
             return normalized, named_params[normalized]
+        for name, param in named_params.items():
+            if name.endswith(normalized) or normalized.endswith(name):
+                return name, param
 
         raise KeyError(f"Parameter path '{parameter_path}' was not found on megatron_model")
 

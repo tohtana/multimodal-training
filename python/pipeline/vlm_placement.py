@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 TrainerResolver = Callable[[str, dict], tuple[type, dict]]
 ActorGroupFactory = Callable[..., Any]
-GpuIdCollector = Callable[[list], list[str]]
+GpuIdCollector = Callable[[list], dict[int, str] | list[str]]
+CudaVisibleCollector = Callable[[list], dict[int, str] | list[str]]
 
 
 @dataclass
@@ -35,6 +36,7 @@ class VLMStageGroup:
     actor_group: Any
     actor_count: int
     physical_gpu_ids: dict[int, str]
+    cuda_visible_devices: dict[int, str]
     requested_device_ids: list[int] | None
     placement_match: bool
 
@@ -75,6 +77,7 @@ def build_vlm_stage_groups(
     *,
     actor_group_factory: ActorGroupFactory = ActorGroup,
     gpu_id_collector: GpuIdCollector = gather_gpu_ids,
+    cuda_visible_collector: CudaVisibleCollector | None = None,
 ) -> tuple[PlacementPlan, dict[str, VLMStageGroup]]:
     """Build real VLM actor groups from pipeline resource sets.
 
@@ -113,6 +116,7 @@ def build_vlm_stage_groups(
                 trainer_resolver=trainer_resolver,
                 actor_group_factory=actor_group_factory,
                 gpu_id_collector=gpu_id_collector,
+                cuda_visible_collector=cuda_visible_collector,
                 sharing_count=sharing_count[rs_name],
                 placement_group_handle=parent_pg,
             )
@@ -211,6 +215,7 @@ def _create_single_stage_group(
     trainer_resolver: TrainerResolver,
     actor_group_factory: ActorGroupFactory,
     gpu_id_collector: GpuIdCollector,
+    cuda_visible_collector: CudaVisibleCollector | None,
     sharing_count: int,
     placement_group_handle,
 ) -> VLMStageGroup:
@@ -225,17 +230,22 @@ def _create_single_stage_group(
         actor_init_kwargs=init_kwargs,
         collocation_factor=sharing_count,
     )
-    physical_gpu_ids = {rank: gpu_id for rank, gpu_id in enumerate(gpu_id_collector(actor_group._actors))}
+    physical_gpu_ids = _normalize_rank_map(gpu_id_collector(actor_group._actors))
+    if cuda_visible_collector is None:
+        cuda_visible_devices = _gather_cuda_visible_devices(actor_group._actors)
+    else:
+        cuda_visible_devices = _normalize_rank_map(cuda_visible_collector(actor_group._actors))
     requested = list(resource_set.device_ids) if resource_set.device_ids is not None else None
-    placement_match = _placement_matches(requested, physical_gpu_ids)
+    placement_match = _placement_matches(requested, cuda_visible_devices)
 
     logger.info(
         "Created VLM stage group '%s': resource_set=%s actors=%s requested_device_ids=%s "
-        "physical_gpu_ids=%s placement_match=%s",
+        "cuda_visible_devices=%s physical_gpu_ids=%s placement_match=%s",
         stage.name,
         resource_set.name,
         resource_set.num_gpus,
         requested,
+        cuda_visible_devices,
         physical_gpu_ids,
         placement_match,
     )
@@ -253,12 +263,31 @@ def _create_single_stage_group(
         actor_group=actor_group,
         actor_count=resource_set.num_gpus,
         physical_gpu_ids=physical_gpu_ids,
+        cuda_visible_devices=cuda_visible_devices,
         requested_device_ids=requested,
         placement_match=placement_match,
     )
 
 
-def _placement_matches(requested_device_ids: list[int] | None, physical_gpu_ids: dict[int, str]) -> bool:
+def _normalize_rank_map(values: dict[int, str] | list[str]) -> dict[int, str]:
+    if isinstance(values, dict):
+        return {int(rank): str(value) for rank, value in values.items()}
+    return {rank: str(value) for rank, value in enumerate(values)}
+
+
+def _gather_cuda_visible_devices(actors: list) -> dict[int, str]:
+    visible_refs = [actor.get_cuda_visible_devices.remote() for actor in actors]
+    return {rank: value for rank, value in enumerate(ray.get(visible_refs))}
+
+
+def _placement_matches(requested_device_ids: list[int] | None, cuda_visible_devices: dict[int, str]) -> bool:
     if requested_device_ids is None:
         return True
-    return {str(device_id) for device_id in requested_device_ids} == set(physical_gpu_ids.values())
+    requested = {str(device_id) for device_id in requested_device_ids}
+    visible: set[str] = set()
+    for raw_value in cuda_visible_devices.values():
+        for token in str(raw_value).split(","):
+            token = token.strip()
+            if token:
+                visible.add(token)
+    return requested == visible

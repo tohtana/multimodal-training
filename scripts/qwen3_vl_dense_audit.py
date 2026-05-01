@@ -135,14 +135,20 @@ def _audit_one_model_id(model_id: str, phase0: dict[str, Any], *, allow_weight_d
         result["failures"].append(f"ms-swift conversion failed: {_excerpt(exc)}")
 
     result["local_weight_cache"] = _local_weight_cache_status(model_id)
+    result["checks"]["local_weight_files"] = "ok" if result["local_weight_cache"]["complete"] else "incomplete"
     result["weight_download_allowed"] = allow_weight_download
     result["layer_truncation"] = _select_layer_truncation(hf_config, phase0)
     result["probe_parameter_path"] = _select_probe_paths(phase0)
+    result["checks"]["layer_override_roundtrip"] = (
+        "ok" if _layer_override_roundtrip_claim_is_supported(result["layer_truncation"]) else "unvalidated"
+    )
 
+    if not result["local_weight_cache"]["complete"] and not allow_weight_download:
+        result["failures"].append(
+            "local dense weight shards are incomplete and weight download is disabled: "
+            f"{result['local_weight_cache']['summary']}"
+        )
     if result["failures"]:
-        return result
-    if not _layer_override_roundtrip_claim_is_supported(result["layer_truncation"]):
-        result["failures"].append("layer override path was identified but not runtime-roundtrip validated")
         return result
     if any(value is None for value in result["probe_parameter_path"].values()):
         result["failures"].append("no validated probe parameter path for at least one stage")
@@ -189,13 +195,123 @@ def _local_weight_cache_status(model_id: str) -> dict[str, Any]:
     cache_roots = [
         os.environ.get("HF_HOME"),
         os.path.expanduser("~/.cache/huggingface"),
+        "/mnt/cluster_storage/hf_cache",
         "/mnt/local_storage/huggingface",
         "/mnt/user_storage/huggingface",
     ]
     rel = "hub/models--" + model_id.replace("/", "--")
-    candidates = [str(Path(root) / rel) for root in cache_roots if root]
-    existing = [path for path in candidates if os.path.exists(path)]
-    return {"exists": bool(existing), "paths_checked": candidates, "existing_paths": existing}
+    hf_candidates = [Path(root) / rel for root in cache_roots if root]
+
+    modelscope_roots = [
+        os.environ.get("MODELSCOPE_CACHE"),
+        os.path.expanduser("~/.cache/modelscope/hub"),
+        "/mnt/local_storage/modelscope_cache",
+        "/mnt/user_storage/modelscope_cache",
+    ]
+    modelscope_rel = Path("models") / model_id
+    modelscope_candidates = [Path(root) / modelscope_rel for root in modelscope_roots if root]
+
+    candidate_roots: list[Path] = []
+    for root in hf_candidates:
+        snapshot_root = root / "snapshots"
+        if snapshot_root.exists():
+            candidate_roots.extend(path for path in snapshot_root.iterdir() if path.is_dir())
+        candidate_roots.append(root)
+    candidate_roots.extend(modelscope_candidates)
+    candidate_roots = _dedupe_paths(candidate_roots)
+
+    statuses = [_weight_file_status(path) for path in candidate_roots]
+    existing = [status for status in statuses if status["exists"]]
+    complete = [status for status in statuses if status["complete"]]
+    partial = [status for status in statuses if status["index_exists"] and not status["complete"]]
+    summary = _weight_cache_summary(existing=existing, complete=complete, partial=partial)
+    return {
+        "exists": bool(existing),
+        "complete": bool(complete),
+        "paths_checked": [str(path) for path in _dedupe_paths([*hf_candidates, *modelscope_candidates])],
+        "existing_paths": [status["path"] for status in existing],
+        "complete_paths": [status["path"] for status in complete],
+        "partial_paths": [status["path"] for status in partial],
+        "candidate_statuses": statuses,
+        "summary": summary,
+    }
+
+
+def _weight_file_status(path: Path) -> dict[str, Any]:
+    index_path = path / "model.safetensors.index.json"
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "index_exists": False,
+            "complete": False,
+            "required_files": [],
+            "present_files": [],
+            "missing_files": [],
+            "present_bytes": 0,
+        }
+
+    required_files = _required_safetensor_files(index_path)
+    present_files = []
+    missing_files = []
+    present_bytes = 0
+    for filename in required_files:
+        shard_path = path / filename
+        if shard_path.exists() and shard_path.stat().st_size > 0:
+            present_files.append(filename)
+            present_bytes += shard_path.stat().st_size
+        else:
+            missing_files.append(filename)
+    return {
+        "path": str(path),
+        "exists": True,
+        "index_exists": index_path.exists(),
+        "complete": bool(required_files) and not missing_files,
+        "required_files": required_files,
+        "present_files": present_files,
+        "missing_files": missing_files,
+        "present_bytes": present_bytes,
+    }
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    result = []
+    seen = set()
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return result
+
+
+def _required_safetensor_files(index_path: Path) -> list[str]:
+    if not index_path.exists():
+        return []
+    try:
+        payload = _read_json(index_path)
+    except json.JSONDecodeError:
+        return []
+    return sorted(set(str(filename) for filename in payload.get("weight_map", {}).values()))
+
+
+def _weight_cache_summary(
+    *,
+    existing: list[dict[str, Any]],
+    complete: list[dict[str, Any]],
+    partial: list[dict[str, Any]],
+) -> str:
+    if complete:
+        return f"complete weights under {complete[0]['path']}"
+    if partial:
+        first = partial[0]
+        return (
+            f"incomplete weights under {first['path']} "
+            f"({len(first['present_files'])}/{len(first['required_files'])} shards present)"
+        )
+    if existing:
+        return "cache directory exists but no model.safetensors.index.json with complete shards was found"
+    return "no local cache directory found"
 
 
 def _is_dense_qwen3_vl_id(model_id: str) -> bool:

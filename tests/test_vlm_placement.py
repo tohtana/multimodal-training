@@ -1,7 +1,7 @@
 import pytest
 
 from python.pipeline.stage import EdgeConfig, Pipeline, Placement, ResourceSet, Stage
-from python.pipeline.vlm_placement import build_vlm_stage_groups
+from python.pipeline.vlm_placement import build_vlm_stage_groups, _placement_matches
 
 
 class FakeActorGroup:
@@ -50,6 +50,10 @@ def _gpu_ids(actors):
     return [f"gpu-{actor.split('-')[-1]}" for actor in actors]
 
 
+def _cuda_visible_devices(actors):
+    return [actor.split("-")[-1] for actor in actors]
+
+
 def _pipeline(vision_gpus=2, text_gpus=4):
     return Pipeline(
         stages=[Stage(name="vision", is_source=True), Stage(name="text", is_terminal=True)],
@@ -83,6 +87,7 @@ def test_vlm_stage_groups_use_asymmetric_resource_set_actor_counts():
         _resolver,
         actor_group_factory=FakeActorGroup,
         gpu_id_collector=_gpu_ids,
+        cuda_visible_collector=_cuda_visible_devices,
     )
 
     assert groups["vision"].actor_count == 2
@@ -100,6 +105,7 @@ def test_vlm_stage_groups_support_symmetric_resource_sets():
         _resolver,
         actor_group_factory=FakeActorGroup,
         gpu_id_collector=_gpu_ids,
+        cuda_visible_collector=_cuda_visible_devices,
     )
 
     assert groups["vision"].actor_count == 4
@@ -116,6 +122,7 @@ def test_vlm_stage_groups_preserve_plan_object_identity():
         _resolver,
         actor_group_factory=FakeActorGroup,
         gpu_id_collector=_gpu_ids,
+        cuda_visible_collector=_cuda_visible_devices,
     )
 
     assert plan.resource_set_to_actor_group["vision_rs"] is groups["vision"]
@@ -135,7 +142,14 @@ def test_vlm_stage_group_tears_down_created_groups_on_failure():
             _resolver,
             actor_group_factory=FakeActorGroup,
             gpu_id_collector=_gpu_ids,
+            cuda_visible_collector=_cuda_visible_devices,
         )
 
     assert len(FakeActorGroup.created) == 1
     assert FakeActorGroup.created[0].shutdown_called is True
+
+
+@pytest.mark.cpu_only
+def test_placement_match_compares_requested_ids_to_cuda_visible_devices_not_uuid():
+    assert _placement_matches([0, 1], {0: "0", 1: "1"}) is True
+    assert _placement_matches([0, 1], {0: "GPU-uuid-a", 1: "GPU-uuid-b"}) is False

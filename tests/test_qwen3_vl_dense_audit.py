@@ -1,6 +1,8 @@
+import json
+
 import pytest
 
-from scripts.qwen3_vl_dense_audit import assert_non_layer_fields_unchanged
+from scripts.qwen3_vl_dense_audit import assert_non_layer_fields_unchanged, _local_weight_cache_status
 
 
 class Obj:
@@ -54,3 +56,38 @@ def test_non_layer_guard_rejects_hidden_size_change():
             effective,
             allowed_layer_fields={"text_config.num_hidden_layers", "vision_config.depth"},
         )
+
+
+@pytest.mark.cpu_only
+def test_local_weight_cache_requires_all_indexed_safetensor_shards(monkeypatch, tmp_path):
+    cache_root = tmp_path / "hf"
+    snapshot = cache_root / "hub/models--Unit--Test-Model/snapshots/revision"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"partial")
+
+    monkeypatch.setenv("HF_HOME", str(cache_root))
+    monkeypatch.setenv("MODELSCOPE_CACHE", str(tmp_path / "modelscope"))
+
+    status = _local_weight_cache_status("Unit/Test-Model")
+
+    assert status["exists"] is True
+    assert status["complete"] is False
+    assert status["partial_paths"] == [str(snapshot)]
+    assert "1/2 shards present" in status["summary"]
+
+    (snapshot / "model-00002-of-00002.safetensors").write_bytes(b"complete")
+    status = _local_weight_cache_status("Unit/Test-Model")
+
+    assert status["complete"] is True
+    assert status["complete_paths"] == [str(snapshot)]

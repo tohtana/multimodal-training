@@ -1017,3 +1017,28 @@ class Trainer(RayActor):
     def reset_peak_memory(self):
         """Reset peak memory statistics for fresh tracking."""
         torch.cuda.reset_peak_memory_stats()
+
+    def reset_cuda_memory_stats(self) -> bool:
+        """Reset CUDA peak memory counters when CUDA is available."""
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.reset_peak_memory_stats()
+        return True
+
+    def get_cuda_memory_stats(self) -> dict:
+        """Return current and peak CUDA memory counters in bytes."""
+        if not torch.cuda.is_available():
+            return {
+                "cuda_available": False,
+                "allocated_bytes": 0,
+                "reserved_bytes": 0,
+                "max_allocated_bytes": 0,
+                "max_reserved_bytes": 0,
+            }
+        return {
+            "cuda_available": True,
+            "allocated_bytes": int(torch.cuda.memory_allocated()),
+            "reserved_bytes": int(torch.cuda.memory_reserved()),
+            "max_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            "max_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+        }

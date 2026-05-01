@@ -67,3 +67,7 @@ class RayActor:
             str: Physical GPU UUID, or "cpu" if CUDA is not available
         """
         return get_physical_gpu_id()
+
+    def get_cuda_visible_devices(self) -> str:
+        """Return the actor process CUDA device visibility string."""
+        return os.environ.get("CUDA_VISIBLE_DEVICES", "")

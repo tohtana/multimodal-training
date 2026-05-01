@@ -94,14 +94,15 @@ def _build_row(
         )
 
     if dense_model_id is None:
+        blocker_category = _dense_blocker_category(dense_audit)
         blocker = BlockerRow(
-            category="dense_model_unavailable",
-            reason="No dense Qwen3-VL candidate passed the local compatibility and layer-override audit.",
+            category=blocker_category,
+            reason=_dense_blocker_reason(blocker_category),
             code_path="multimodal-training/scripts/qwen3_vl_dense_audit.py:120",
             code_path_git_sha=_git_sha(Path(__file__).resolve().parents[1]),
             error_excerpt=_dense_failure_excerpt(dense_audit),
             config_diff=f"model_id: Qwen/Qwen3-VL-8B-Instruct -> {model_id} (framework_only=true)",
-            next_action="Validate a dense Qwen3-VL override path that round-trips through the Megatron bridge.",
+            next_action=_dense_blocker_next_action(blocker_category),
         )
         return _row(
             run_id=run_id,
@@ -152,7 +153,7 @@ def _build_row(
             blocker=blocker,
         )
 
-    blocker = _run_training_subprocess(args, hydra_overrides, output_dir, run_id)
+    blocker, runtime_metadata = _run_training_subprocess(args, hydra_overrides, output_dir, run_id)
     if blocker is not None:
         return _row(
             run_id=run_id,
@@ -172,6 +173,35 @@ def _build_row(
             error_excerpt=blocker.error_excerpt,
         )
 
+    if runtime_metadata is None:
+        blocker = BlockerRow(
+            category="other",
+            reason="Dense Qwen3-VL subprocess exited successfully but did not emit runtime evidence.",
+            code_path="multimodal-training/python/train_pipeline.py:94",
+            code_path_git_sha=_git_sha(Path(__file__).resolve().parents[1]),
+            error_excerpt="VLM_PIPELINE_METADATA_PATH was missing or empty after subprocess return code 0.",
+            config_diff=None,
+            next_action="Keep train_pipeline runtime metadata emission enabled and rerun the smoke cell.",
+        )
+        return _row(
+            run_id=run_id,
+            status="blocked",
+            cell=cell,
+            dry_run=False,
+            framework_only=False,
+            model_id=dense_model_id,
+            dense=True,
+            command=command,
+            started_utc=started,
+            finished_utc=datetime.now(timezone.utc).isoformat(),
+            layer=layer,
+            stages=stages,
+            edges=edges,
+            blocker=blocker,
+        )
+
+    runtime = runtime_metadata.get("post_training") or runtime_metadata.get("post_init")
+    runtime_training = runtime_metadata.get("training") or {}
     return _row(
         run_id=run_id,
         status="ok",
@@ -183,11 +213,12 @@ def _build_row(
         command=command,
         started_utc=started,
         finished_utc=datetime.now(timezone.utc).isoformat(),
-        layer=layer,
-        stages=stages,
-        edges=edges,
+        layer=_layer_from_runtime(dense_audit, runtime),
+        stages=_stage_rows_from_runtime(config, runtime, cell),
+        edges=_edge_rows_from_runtime(runtime, _stage_rows_from_runtime(config, runtime, cell)),
         blocker=None,
-        training_ok=True,
+        training=_training_from_runtime(runtime_training, args.max_iterations),
+        metrics=_metrics_from_runtime(runtime_training),
     )
 
 
@@ -196,9 +227,10 @@ def _run_training_subprocess(
     hydra_overrides: list[str],
     output_dir: Path,
     run_id: str,
-) -> BlockerRow | None:
+) -> tuple[BlockerRow | None, dict[str, Any] | None]:
     project_root = Path(__file__).resolve().parents[1]
     log_path = output_dir / "logs" / f"{run_id}.txt"
+    metadata_path = output_dir / "logs" / f"{run_id}.metadata.json"
     cmd = [
         sys.executable,
         "-m",
@@ -212,9 +244,21 @@ def _run_training_subprocess(
         *hydra_overrides,
     ]
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(project_root)
+    pythonpath_parts = [
+        str(project_root),
+        str(project_root.parent / "ms-swift"),
+        str(project_root.parent / "Megatron-LM"),
+        str(project_root.parent / "DeepSpeed"),
+    ]
+    if env.get("PYTHONPATH"):
+        pythonpath_parts.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
     env["HYDRA_FULL_ERROR"] = "1"
-    env["RAY_ADDRESS"] = f"127.0.0.1:{args.ray_port}"
+    env["RAY_ADDRESS"] = env.get("RAY_ADDRESS", "auto")
+    env["RAY_NAMESPACE"] = env.get("RAY_NAMESPACE", f"todo-qwen3-vl-{run_id}")
+    env["VLM_REQUESTED_RAY_PORT"] = str(args.ray_port)
+    env["VLM_PIPELINE_METADATA_PATH"] = str(metadata_path)
+    env["VLM_PIPELINE_DENSE_AUDIT_PATH"] = str(args.dense_audit)
     try:
         result = subprocess.run(
             cmd,
@@ -235,23 +279,36 @@ def _run_training_subprocess(
             error_excerpt=excerpt,
             config_diff=None,
             next_action="Reduce the layer count only or inspect the timed-out Ray actor logs.",
-        )
+        ), _read_json(metadata_path) if metadata_path.exists() else None
 
     combined = result.stdout + "\n" + result.stderr
     log_path.write_text(combined, encoding="utf-8")
     if result.returncode == 0:
-        return None
+        if not metadata_path.exists():
+            return None, None
+        metadata = _read_json(metadata_path)
+        if metadata.get("status") != "ok":
+            return BlockerRow(
+                category="other",
+                reason="Dense Qwen3-VL subprocess returned 0 but runtime metadata is not ok.",
+                code_path="multimodal-training/python/train_pipeline.py:96",
+                code_path_git_sha=_git_sha(project_root),
+                error_excerpt=_truncate(json.dumps(metadata.get("error_excerpt") or metadata.get("status"))),
+                config_diff=None,
+                next_action="Inspect the metadata JSON and make train_pipeline fail non-zero for this condition.",
+            ), metadata
+        return None, metadata
 
-    category = "oom" if "out of memory" in combined.lower() else "other"
+    category, reason, next_action = _subprocess_failure_classification(combined)
     return BlockerRow(
         category=category,
-        reason="Dense Qwen3-VL smoke subprocess failed.",
+        reason=reason,
         code_path="multimodal-training/python/train_pipeline.py:98",
         code_path_git_sha=_git_sha(project_root),
         error_excerpt=_truncate(combined),
         config_diff=None,
-        next_action="Inspect the per-run log and either fix the code path or record the resource blocker.",
-    )
+        next_action=next_action,
+    ), _read_json(metadata_path) if metadata_path.exists() else None
 
 
 def _row(
@@ -272,6 +329,8 @@ def _row(
     blocker: BlockerRow | None,
     error_excerpt: str | None = None,
     training_ok: bool = False,
+    training: TrainingRow | None = None,
+    metrics: MetricsRow | None = None,
 ) -> RunRow:
     return RunRow(
         run_id=run_id,
@@ -290,16 +349,20 @@ def _row(
         layer_truncation=layer,
         stages=stages,
         edges=edges,
-        training=TrainingRow(
+        training=training or TrainingRow(
             iterations=0 if dry_run else 1,
             warmup_iterations=0,
             batch_size=1,
+            loss_values=[],
+            backward_completed=False,
+            selected_parameter_grad_nonzero=False,
+            parameter_norm_delta=None,
             optimizer_update_verified=training_ok,
             iteration_step_counter_advanced=training_ok,
             expected_optimizer_step_delta=0 if dry_run else 1,
             actual_optimizer_step_delta=0 if dry_run else (1 if training_ok else None),
         ),
-        metrics=MetricsRow(
+        metrics=metrics or MetricsRow(
             loss_finite=training_ok,
             iter_time_ms_p50=None,
             iter_time_ms_p90=None,
@@ -352,6 +415,141 @@ def _edge_rows_from_config(config: dict[str, Any], stages: list[StageRow]) -> li
             )
         )
     return rows
+
+
+def _stage_rows_from_runtime(config: dict[str, Any], runtime: dict[str, Any] | None, cell: str) -> list[StageRow]:
+    if runtime is None:
+        raise ValueError("runtime metadata is required for ok rows")
+    pipeline = config.get("pipeline", {})
+    resource_sets = {rs["name"]: rs for rs in pipeline.get("resource_sets", [])}
+    placements = {p["stage"]: p["resource_set"] for p in pipeline.get("placements", [])}
+    runtime_stages = runtime.get("stages", {})
+    rows = []
+    for stage in pipeline.get("stages", []):
+        name = stage["name"]
+        rs_name = placements[name]
+        rs = resource_sets[rs_name]
+        expected_actor_count = int(rs["num_gpus"])
+        stage_runtime = runtime_stages.get(name)
+        if stage_runtime is None:
+            raise ValueError(f"runtime metadata missing stage {name}")
+        actor_runtime = _int_keyed_dict(stage_runtime.get("actor_runtime", {}))
+        physical_gpu_ids = _int_keyed_dict(stage_runtime.get("physical_gpu_ids", {}))
+        cuda_visible_devices = _int_keyed_dict(stage_runtime.get("cuda_visible_devices", {}))
+        if not physical_gpu_ids and actor_runtime:
+            physical_gpu_ids = {
+                rank: str(metadata.get("physical_gpu_id", ""))
+                for rank, metadata in actor_runtime.items()
+            }
+        if not cuda_visible_devices and actor_runtime:
+            cuda_visible_devices = {
+                rank: str(metadata.get("cuda_visible_devices", ""))
+                for rank, metadata in actor_runtime.items()
+            }
+        first_runtime = actor_runtime.get(0, {})
+        process_group = first_runtime.get("process_group", {})
+        actor_count = int(stage_runtime.get("actor_count") or len(actor_runtime))
+        if actor_count != expected_actor_count:
+            raise AssertionError(
+                f"StageRow.actor_count must equal ResourceSet.num_gpus for {name}: "
+                f"{actor_count} != {expected_actor_count}"
+            )
+        rows.append(
+            StageRow(
+                name=name,
+                resource_set=rs_name,
+                actor_count=actor_count,
+                physical_gpu_ids=physical_gpu_ids,
+                cuda_visible_devices=cuda_visible_devices,
+                requested_device_ids=rs.get("device_ids"),
+                placement_match=bool(stage_runtime.get("placement_match")),
+                process_group_world_size=int(process_group.get("world_size", actor_count)),
+                megatron={**(first_runtime.get("megatron") or {}), "cell": cell},
+                actor_runtime=actor_runtime,
+            )
+        )
+    return rows
+
+
+def _edge_rows_from_runtime(runtime: dict[str, Any] | None, stages: list[StageRow]) -> list[EdgeRow]:
+    if runtime is None:
+        raise ValueError("runtime metadata is required for ok rows")
+    stage_counts = {stage.name: stage.actor_count for stage in stages}
+    rows = []
+    for edge in runtime.get("edges", []):
+        routing_map = dict(edge.get("routing_map") or {})
+        routing_map.setdefault("num_src", stage_counts[edge["from_stage"]])
+        routing_map.setdefault("num_dst", stage_counts[edge["to_stage"]])
+        rows.append(
+            EdgeRow(
+                from_stage=edge["from_stage"],
+                to_stage=edge["to_stage"],
+                transfer_tier=edge.get("transfer_tier") or "unknown",
+                routing_map=routing_map,
+            )
+        )
+    return rows
+
+
+def _layer_from_runtime(dense_audit: dict[str, Any] | None, runtime: dict[str, Any] | None) -> LayerTruncationRow:
+    layer = (dense_audit or {}).get("layer_truncation", {})
+    vision_effective = layer.get("vision_effective_layers")
+    language_effective = layer.get("language_effective_layers")
+    if runtime is not None:
+        vision_counts = _first_actor_layer_counts(runtime, "vision")
+        text_counts = _first_actor_layer_counts(runtime, "text")
+        vision_effective = vision_counts.get("vision_effective_layers") or vision_effective
+        language_effective = text_counts.get("language_effective_layers") or language_effective
+    return LayerTruncationRow(
+        vision_source_field=layer.get("vision_source_field"),
+        language_source_field=layer.get("language_source_field"),
+        vision_override_path=layer.get("vision_override_path"),
+        language_override_path=layer.get("language_override_path"),
+        vision_effective_layers=vision_effective,
+        language_effective_layers=language_effective,
+        vision_original_layers=layer.get("vision_original_layers"),
+        language_original_layers=layer.get("language_original_layers"),
+    )
+
+
+def _training_from_runtime(raw: dict[str, Any], max_iterations: int) -> TrainingRow:
+    return TrainingRow(
+        iterations=int(raw.get("iterations", max_iterations)),
+        warmup_iterations=0,
+        batch_size=1,
+        loss_values=[float(value) for value in raw.get("loss_values", [])],
+        backward_completed=bool(raw.get("backward_completed")),
+        selected_parameter_grad_nonzero=bool(raw.get("selected_parameter_grad_nonzero")),
+        parameter_norm_delta=raw.get("parameter_norm_delta"),
+        optimizer_update_verified=bool(raw.get("optimizer_update_verified")),
+        iteration_step_counter_advanced=bool(raw.get("iteration_step_counter_advanced")),
+        expected_optimizer_step_delta=int(raw.get("expected_optimizer_step_delta", max_iterations)),
+        actual_optimizer_step_delta=raw.get("actual_optimizer_step_delta"),
+        optimizer_probe=dict(raw.get("optimizer_probe") or {}),
+    )
+
+
+def _metrics_from_runtime(raw: dict[str, Any]) -> MetricsRow:
+    return MetricsRow(
+        loss_finite=bool(raw.get("loss_finite")),
+        iter_time_ms_p50=raw.get("iter_time_ms_p50"),
+        iter_time_ms_p90=raw.get("iter_time_ms_p90"),
+        cuda_max_allocated_bytes=raw.get("cuda_max_allocated_bytes"),
+        cuda_max_reserved_bytes=raw.get("cuda_max_reserved_bytes"),
+    )
+
+
+def _first_actor_layer_counts(runtime: dict[str, Any], stage_name: str) -> dict[str, Any]:
+    layer_counts = ((runtime.get("stages", {}).get(stage_name) or {}).get("layer_counts") or {})
+    if "0" in layer_counts:
+        return layer_counts["0"]
+    if 0 in layer_counts:
+        return layer_counts[0]
+    return {}
+
+
+def _int_keyed_dict(raw: dict[Any, Any]) -> dict[int, Any]:
+    return {int(key): value for key, value in raw.items()}
 
 
 def _layer_from_audit(dense_audit: dict[str, Any] | None) -> LayerTruncationRow:
@@ -440,6 +638,48 @@ def _dense_failure_excerpt(dense_audit: dict[str, Any] | None) -> str:
         failures.extend(result.get("failures", []))
     text = "; ".join(failures) or "No dense model selected"
     return _truncate(text)
+
+
+def _dense_blocker_category(dense_audit: dict[str, Any] | None) -> str:
+    excerpt = _dense_failure_excerpt(dense_audit).lower()
+    if "weight shards" in excerpt or "local weights" in excerpt:
+        return "dense_weights_unavailable"
+    return "dense_model_unavailable"
+
+
+def _dense_blocker_reason(category: str) -> str:
+    if category == "dense_weights_unavailable":
+        return "Dense Qwen3-VL compatibility passed, but complete local safetensor shards are unavailable."
+    return "No dense Qwen3-VL candidate passed the local compatibility and layer-override audit."
+
+
+def _dense_blocker_next_action(category: str) -> str:
+    if category == "dense_weights_unavailable":
+        return "Pre-populate complete Qwen3-VL-8B weight shards under /mnt/local_storage or a shared HF cache."
+    return "Validate a dense Qwen3-VL override path that round-trips through the Megatron bridge."
+
+
+def _subprocess_failure_classification(combined: str) -> tuple[str, str, str]:
+    lowered = combined.lower()
+    if "out of memory" in lowered:
+        return (
+            "oom",
+            "Dense Qwen3-VL smoke subprocess ran out of GPU memory.",
+            "Apply layer-only truncation and rerun the same cell with runtime layer-count validation.",
+        )
+    if "downloading [model-" in lowered and "safetensors" in lowered:
+        return (
+            "dense_weights_unavailable",
+            "Dense Qwen3-VL smoke reached real Ray actor construction but blocked while downloading missing "
+            "weight shards.",
+            "Pre-populate complete Qwen3-VL-8B safetensor shards under /mnt/local_storage or a shared HF "
+            "cache, then rerun.",
+        )
+    return (
+        "other",
+        "Dense Qwen3-VL smoke subprocess failed.",
+        "Inspect the per-run log and either fix the code path or record the resource blocker.",
+    )
 
 
 def _git_sha(path: Path) -> str:
