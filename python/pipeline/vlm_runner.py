@@ -17,6 +17,8 @@ import ray
 import torch
 
 from .dag import PipelineDAG
+from .placement import PlacementPlan
+from .router import CrossStageRouter
 from .scheduler import OpType, PipelineScheduler, SequentialScheduler
 from .stage import Pipeline
 
@@ -39,6 +41,8 @@ class VLMPipelineRunner:
         pipeline: Pipeline,
         stage_groups: dict[str, Any],
         scheduler: PipelineScheduler | None = None,
+        placement_plan: PlacementPlan | None = None,
+        router: CrossStageRouter | None = None,
     ):
         """
         Args:
@@ -51,6 +55,8 @@ class VLMPipelineRunner:
         self.dag = PipelineDAG(pipeline)
         self.topo_order = self.dag.topological_sort()
         self.scheduler = scheduler or SequentialScheduler()
+        self.placement_plan = placement_plan
+        self.router = router
 
         # Identify source and terminal stages from the pipeline config
         self._source_stages = [s.name for s in pipeline.stages if s.is_source]
@@ -109,7 +115,7 @@ class VLMPipelineRunner:
                 else:
                     # Non-source (e.g., text): forward_step(upstream_refs, iteration_list)
                     pred_name = preds[0]
-                    pred_refs = stage_output_refs[pred_name]
+                    pred_refs = self._route_forward_refs(pred_name, name, stage_output_refs[pred_name])
                     iteration_list = [iteration] * len(group._actors)
                     refs = group.execute_all_async("forward_step", pred_refs, iteration_list)
 
@@ -124,6 +130,7 @@ class VLMPipelineRunner:
                 else:
                     # Non-terminal (e.g., vision): backward_step(downstream_grad_refs)
                     succ_name = succs[0]
+                    self._ensure_backward_routing_supported(name, succ_name)
                     grad_refs = stage_grad_refs[succ_name]
                     refs = group.execute_all_async("backward_step", grad_refs)
 
@@ -147,6 +154,36 @@ class VLMPipelineRunner:
             self.stage_groups[name].execute_all("optimizer_step", global_grad_norm)
 
         return {"loss": avg_loss, "global_grad_norm": global_grad_norm}
+
+    def _route_forward_refs(self, src_stage: str, dst_stage: str, pred_refs: list) -> list:
+        if self.router is None:
+            return pred_refs
+
+        routing = self.router.get_routing(src_stage, dst_stage)
+        if routing.num_src != len(pred_refs):
+            raise RuntimeError(
+                f"VLM routing source count mismatch for {src_stage}->{dst_stage}: "
+                f"routing.num_src={routing.num_src}, refs={len(pred_refs)}"
+            )
+
+        dst_group = self.stage_groups[dst_stage]
+        routed_refs = []
+        for dst_rank in range(len(dst_group._actors)):
+            if dst_rank not in routing.dst_to_src:
+                raise RuntimeError(f"No source rank routed to {dst_stage}[{dst_rank}]")
+            routed_refs.append(pred_refs[routing.dst_to_src[dst_rank]])
+        return routed_refs
+
+    def _ensure_backward_routing_supported(self, src_stage: str, dst_stage: str) -> None:
+        if self.router is None or self.router.is_symmetric(src_stage, dst_stage):
+            return
+        routing = self.router.get_routing(src_stage, dst_stage)
+        raise NotImplementedError(
+            "Asymmetric real-VLM backward routing is not implemented: "
+            f"{src_stage}->{dst_stage} has {routing.num_src} source actors and {routing.num_dst} "
+            "destination actors. Vision-gradient aggregation across multiple downstream text ranks "
+            "must be implemented before this row can be marked supported."
+        )
 
     def _extract_loss(self, stage_output_refs: dict[str, list]) -> float:
         """Extract average loss from terminal stage forward results."""

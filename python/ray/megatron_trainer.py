@@ -152,6 +152,10 @@ class MegatronBaseTrainer(Trainer):
         # Ensure model parameters are on the active CUDA device for test forwards.
         device = self._get_device()
         self.megatron_model.to(device)
+        if self.optimizer is None:
+            self._build_optimizer(self.megatron_model.parameters())
+            total_steps = int(self.config.get("num_epochs", 1)) * int(self.config.get("num_iterations", 1))
+            self._build_scheduler(max(1, total_steps))
 
     def is_process_group_initialized(self):
         import torch.distributed as dist
@@ -181,6 +185,96 @@ class MegatronBaseTrainer(Trainer):
             "path": self._weights_load_path,
             "path_exists": bool(self._weights_load_path and os.path.exists(self._weights_load_path)),
         }
+
+    def get_runtime_metadata(self) -> dict:
+        """Return placement, process-group, and Megatron runtime metadata."""
+        import os
+        import torch.distributed as dist
+
+        initialized = dist.is_initialized()
+        return {
+            "rank": self.rank,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "physical_gpu_id": get_physical_gpu_id(),
+            "process_group": {
+                "initialized": initialized,
+                "world_size": dist.get_world_size() if initialized else 1,
+                "rank": dist.get_rank() if initialized else self.rank,
+                "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            },
+            "megatron": {
+                "tp": int(getattr(self.megatron_args, "tensor_model_parallel_size", 1) or 1),
+                "cp": int(getattr(self.megatron_args, "context_parallel_size", 1) or 1),
+                "pp": int(getattr(self.megatron_args, "pipeline_model_parallel_size", 1) or 1),
+                "ep": int(getattr(self.megatron_args, "expert_model_parallel_size", 1) or 1),
+            },
+            "optimizer": {
+                "present": self.optimizer is not None,
+                "step_count": self._optimizer_step_count,
+                "scheduler_present": hasattr(self, "scheduler") and self.scheduler is not None,
+            },
+            "weights": self.get_weight_load_status(),
+        }
+
+    def get_effective_layer_counts(self) -> dict:
+        """Return effective layer counts visible to the instantiated Megatron args."""
+        self._initialize_megatron()
+        return {
+            "megatron_num_layers": int(getattr(self.megatron_args, "num_layers", 0) or 0),
+            "vision_effective_layers": int(getattr(self.megatron_args, "vision_num_layers", 0) or 0) or None,
+            "language_effective_layers": int(getattr(self.megatron_args, "num_layers", 0) or 0),
+        }
+
+    def get_optimizer_probe_snapshot(self, parameter_path: str | None = None) -> dict:
+        """Snapshot one validated parameter for optimizer-update verification."""
+        if parameter_path is None:
+            raise ValueError("parameter_path is required; runtime probe selection is not allowed")
+        name, param = self._resolve_probe_parameter(parameter_path)
+        grad_norm = None
+        has_nonzero_grad = False
+        if param.grad is not None:
+            grad_norm = float(param.grad.detach().float().norm().item())
+            has_nonzero_grad = grad_norm > 0.0
+        return {
+            "parameter_path": parameter_path,
+            "resolved_name": name,
+            "param_l2_norm": float(param.detach().float().norm().item()),
+            "grad_l2_norm": grad_norm,
+            "has_nonzero_grad": has_nonzero_grad,
+            "optimizer_step_count": self._optimizer_step_count,
+        }
+
+    def verify_optimizer_update(self, before: dict, *, atol: float = 1e-6) -> dict:
+        """Compare the current probe parameter state against a previous snapshot."""
+        after = self.get_optimizer_probe_snapshot(before.get("parameter_path"))
+        norm_delta = abs(after["param_l2_norm"] - float(before["param_l2_norm"]))
+        expected_step = int(before["optimizer_step_count"]) + 1
+        actual_step = int(after["optimizer_step_count"])
+        return {
+            "before": before,
+            "after": after,
+            "param_norm_delta": norm_delta,
+            "param_norm_changed": norm_delta > atol,
+            "expected_optimizer_step_count": expected_step,
+            "actual_optimizer_step_count": actual_step,
+            "iteration_step_counter_advanced": actual_step == expected_step,
+            "optimizer_update_verified": norm_delta > atol and actual_step == expected_step,
+        }
+
+    def _resolve_probe_parameter(self, parameter_path: str):
+        if self.megatron_model is None:
+            raise RuntimeError("Megatron model is not built")
+
+        normalized = parameter_path
+        for prefix in ("self.", "megatron_model."):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+
+        named_params = dict(self.megatron_model.named_parameters())
+        if normalized in named_params:
+            return normalized, named_params[normalized]
+
+        raise KeyError(f"Parameter path '{parameter_path}' was not found on megatron_model")
 
 
 @ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)

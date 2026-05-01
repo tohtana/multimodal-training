@@ -21,6 +21,7 @@ class Trainer(RayActor):
         RayActor.__init__(self, rank)
         self.config = config
         self.backend = None
+        self._optimizer_step_count = 0
 
         seed = config["seed"]
         set_seed(seed)
@@ -198,14 +199,20 @@ class Trainer(RayActor):
             clip_coeff = self._clip_gradients(global_grad_norm, max_norm)
 
         # Step optimizer
+        stepped = False
         if self.use_deepspeed:
             self.deepspeed_engine.step()
+            stepped = True
         elif self.optimizer is not None:
             self.optimizer.step()
+            stepped = True
 
         # Step LR scheduler after optimizer
         if hasattr(self, "scheduler") and self.scheduler is not None:
             self.scheduler.step()
+
+        if stepped:
+            self._optimizer_step_count += 1
 
         return clip_coeff
 

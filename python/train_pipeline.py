@@ -18,10 +18,10 @@ import hydra
 import ray
 import torch
 from omegaconf import DictConfig
-from ray.experimental.collective import create_collective_group
 
 from .pipeline.config_loader import parse_pipeline_dict
 from .pipeline.stage import Pipeline
+from .pipeline.vlm_placement import build_vlm_stage_groups, configure_vlm_cross_stage_communication
 from .pipeline.vlm_runner import VLMPipelineRunner
 from .ray.utils import ensure_run_log_file
 
@@ -30,9 +30,7 @@ if "RAY_TRAIN_LOG_FILE" not in os.environ:
     ensure_run_log_file()
 
 from .checkpoint import find_latest_checkpoint
-from .ray.actor_group import ActorGroup
 from .ray.logger import setup_logging
-from .ray.tensor_transfer import gather_gpu_ids
 from .ray.utils import initialize_ray
 from .train_ray import normalize_component_config
 from .trainer_registry import resolve_trainer
@@ -121,106 +119,54 @@ def main(cfg: DictConfig):
                 component_type = stage.name
         stage_configs[stage.name] = _build_stage_config(cfg, component_type)
 
-    # Training parameters
     parallel_size = cfg.training.parallel_size
     dp_size = cfg.training.dp_size
-    collocate = cfg.training.collocate
-    total_actors = dp_size * parallel_size
+    logger.info("DP size: %s, global parallel_size: %s", dp_size, parallel_size)
 
-    # Collocation factor = number of collocated stage groups sharing the same GPUs
-    num_stages = len(pipeline.stages)
-    collocation_factor = num_stages if collocate else 1
-
-    logger.info(f"DP size: {dp_size}, Parallel size: {parallel_size}, Total actors: {total_actors}")
-    logger.info(f"Collocation: {collocate}, collocation_factor: {collocation_factor}")
-
-    # Create actor groups for each stage
-    stage_groups: dict[str, ActorGroup] = {}
-    prev_pg = None
-
-    for stage in pipeline.stages:
-        stage_cfg = stage_configs[stage.name]
+    def trainer_resolver(stage_name: str, stage_cfg: dict):
         component_type = stage_cfg.get("component_type")
         if component_type is None:
-            for s in cfg.pipeline.stages:
-                if s.name == stage.name:
-                    component_type = s.get("component_type", stage.name)
+            for raw_stage in cfg.pipeline.stages:
+                if raw_stage.name == stage_name:
+                    component_type = raw_stage.get("component_type", stage_name)
                     break
+        if component_type is None:
+            component_type = stage_name
 
-        model_type = stage_cfg["model_type"]
-        engine = stage_cfg.get("engine")
-
-        TrainerClass, init_kwargs = resolve_trainer(
+        return resolve_trainer(
             component_type=component_type,
-            engine=engine,
-            model_type=model_type,
+            engine=stage_cfg.get("engine"),
+            model_type=stage_cfg["model_type"],
             config=stage_cfg,
         )
 
-        group = ActorGroup(
-            stage_cfg,
-            TrainerClass,
-            num_actors=total_actors,
-            collocate=collocate,
-            placement_group_handle=prev_pg if collocate else None,
-            actor_init_kwargs=init_kwargs,
-            collocation_factor=collocation_factor,
+    placement_plan, vlm_stage_groups = build_vlm_stage_groups(
+        pipeline=pipeline,
+        stage_configs=stage_configs,
+        trainer_resolver=trainer_resolver,
+    )
+    stage_groups = {name: group for name, group in vlm_stage_groups.items()}
+
+    try:
+        for name in stage_groups:
+            stage_groups[name].execute_all("build_model")
+            logger.info("Stage '%s' model built", name)
+
+        for name in stage_groups:
+            stage_groups[name].execute_all("initialize_trainer")
+        logger.info("All trainers initialized")
+
+        router = configure_vlm_cross_stage_communication(
+            pipeline=pipeline,
+            placement_plan=placement_plan,
+            stage_configs=stage_configs,
         )
 
-        stage_groups[stage.name] = group
-        if collocate and prev_pg is None:
-            prev_pg = group.placement_group
-
-        logger.info(f"Created ActorGroup for stage '{stage.name}': {total_actors} actors, engine={engine}")
-
-    # Build models and initialize trainers
-    for name in stage_groups:
-        stage_groups[name].execute_all("build_model")
-        logger.info(f"Stage '{name}' model built")
-
-    for name in stage_groups:
-        stage_groups[name].execute_all("initialize_trainer")
-    logger.info("All trainers initialized")
-
-    # Set up cross-stage communication
-    if collocate:
-        logger.info("Setting up CUDA IPC for collocated actors...")
-        # For collocated stages, set up CUDA IPC between adjacent stages in DAG order.
-        # Skip edges involving bridge stages — bridge doesn't use IPC (Ray ObjectRef
-        # passing between same-GPU actors is efficient enough for v1).
-        ordered_names = [s.name for s in pipeline.stages]
-        for i in range(len(ordered_names) - 1):
-            src_name = ordered_names[i]
-            dst_name = ordered_names[i + 1]
-
-            src_component = stage_configs[src_name].get("component_type", src_name)
-            dst_component = stage_configs[dst_name].get("component_type", dst_name)
-            if src_component == "bridge" or dst_component == "bridge":
-                logger.info(f"Skipping IPC setup for edge {src_name}->{dst_name} (bridge stage)")
-                continue
-
-            src_group = stage_groups[src_name]
-            dst_group = stage_groups[dst_name]
-
-            src_gpu_ids = gather_gpu_ids(src_group._actors)
-            dst_gpu_ids = gather_gpu_ids(dst_group._actors)
-            logger.info(f"{src_name} GPU IDs: {src_gpu_ids}, {dst_name} GPU IDs: {dst_gpu_ids}")
-
-            for j in range(total_actors):
-                src_group._actors[j].set_receiver_info.remote([dst_gpu_ids[j]], use_ipc=True)
-                dst_group._actors[j].set_receiver_info.remote([src_gpu_ids[j]], use_ipc=True)
-
-            ray.get([a.get_rank.remote() for a in src_group._actors])
-        logger.info("CUDA IPC setup complete")
-    else:
-        logger.info("Creating NCCL collective group for cross-GPU communication...")
-        all_actors = []
-        for name in stage_groups:
-            all_actors.extend(stage_groups[name]._actors)
-        create_collective_group(all_actors, backend="nccl")
-
-    # Create pipeline runner
-    runner = VLMPipelineRunner(pipeline, stage_groups)
+        runner = VLMPipelineRunner(pipeline, stage_groups, placement_plan=placement_plan, router=router)
+    except Exception:
+        for group in stage_groups.values():
+            group.shutdown()
+        raise
 
     # Training configuration
     num_epochs = cfg.training.num_epochs
@@ -331,6 +277,8 @@ def main(cfg: DictConfig):
     else:
         logger.info("Pipeline training completed!")
 
+    for group in stage_groups.values():
+        group.shutdown()
     ray.shutdown()
 
 
