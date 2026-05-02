@@ -13,6 +13,15 @@ from .payloads import (
     TextBackwardOutputs,
     VisionOutputs,
 )
+from .qwen3_vision_contract import (
+    apply_qwen3_vision_backward,
+    extract_qwen3_vision_embeddings,
+    get_qwen3_visual_payload,
+    is_qwen3_vl_model_type,
+    QWEN3_VISUAL_PAYLOAD_META_KEY,
+    Qwen3VisionGradients,
+    Qwen3VisionPayload,
+)
 from .tensor_transfer import TensorTransferRequest, receive_tensor
 from .trainer import Trainer
 from .utils import get_physical_gpu_id
@@ -299,19 +308,66 @@ class MegatronVisionTrainer(MegatronBaseTrainer):
 
         raise RuntimeError(f"Unsupported vision outputs type: {type(outputs)}")
 
+    def _resolve_qwen3_spatial_merge_size(self, visual_module) -> tuple[int, str]:
+        processor = getattr(self, "processor", None)
+        image_processor = getattr(processor, "image_processor", None)
+        merge_size = getattr(image_processor, "merge_size", None)
+        if merge_size is not None:
+            return int(merge_size), "processor.image_processor.merge_size"
+
+        for obj, source in (
+            (visual_module, "visual_module.spatial_merge_size"),
+            (getattr(visual_module, "config", None), "visual_module.config.spatial_merge_size"),
+            (
+                getattr(getattr(self, "megatron_model", None), "visual", None),
+                "megatron_model.visual.spatial_merge_size",
+            ),
+            (
+                getattr(getattr(getattr(self, "megatron_model", None), "visual", None), "config", None),
+                "megatron_model.visual.config.spatial_merge_size",
+            ),
+        ):
+            merge_size = getattr(obj, "spatial_merge_size", None) if obj is not None else None
+            if merge_size is not None:
+                return int(merge_size), source
+
+        engine_config = self.config.get("engine_config", {})
+        merge_size = engine_config.get("spatial_merge_size")
+        if merge_size is not None:
+            return int(merge_size), "engine_config.spatial_merge_size"
+
+        raise RuntimeError("Qwen3-VL requires spatial_merge_size; could not resolve it from processor/config/module.")
+
     def forward_step(self, iteration: int = -1):
         batch = self._dummy_batch
         pixel_values = batch["pixel_values"]
         image_grid_thw = batch["image_grid_thw"]
+        video_grid_thw = batch.get("video_grid_thw")
 
         autocast_context = self._get_autocast_context()
         visual_module = self._get_visual_module()
         with autocast_context:
             outputs = visual_module(hidden_states=pixel_values, grid_thw=image_grid_thw)
-        embeddings = self._extract_vision_embeddings(outputs)
+        meta = {"iteration": iteration}
+        pending_output = None
 
-        self._pending_outputs.append(embeddings)
-        return VisionOutputs(embeddings=embeddings, meta={"iteration": iteration})
+        if is_qwen3_vl_model_type(self.config.get("model_type")):
+            spatial_merge_size, spatial_merge_source = self._resolve_qwen3_spatial_merge_size(visual_module)
+            embeddings, qwen3_meta = extract_qwen3_vision_embeddings(
+                outputs,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                spatial_merge_size=spatial_merge_size,
+                spatial_merge_size_source=spatial_merge_source,
+            )
+            meta.update(qwen3_meta)
+            pending_output = qwen3_meta[QWEN3_VISUAL_PAYLOAD_META_KEY]
+        else:
+            embeddings = self._extract_vision_embeddings(outputs)
+            pending_output = embeddings
+
+        self._pending_outputs.append(pending_output)
+        return VisionOutputs(embeddings=embeddings, meta=meta)
 
     def _retrieve_gradient_tensor(self, vision_grad_ref):
         if vision_grad_ref is None:
@@ -346,6 +402,18 @@ class MegatronVisionTrainer(MegatronBaseTrainer):
             raise RuntimeError("No pending vision outputs for backward.")
         outputs = self._pending_outputs.popleft()
 
+        if isinstance(outputs, Qwen3VisionPayload):
+            if isinstance(vision_grad, (Qwen3VisionGradients, dict)):
+                apply_qwen3_vision_backward(outputs, vision_grad)
+                return
+            if outputs.deepstack_visual_embeds:
+                raise RuntimeError(
+                    "Qwen3 structured vision output includes deepstack tensors, but backward received only "
+                    "a primary gradient tensor."
+                )
+            outputs.primary_embeddings.backward(gradient=vision_grad, retain_graph=False)
+            return
+
         if vision_grad.dim() == 2 and outputs.dim() == 3:
             if outputs.shape[0] == 1:
                 vision_grad = vision_grad.unsqueeze(0)
@@ -364,7 +432,11 @@ class MegatronVisionTrainer(MegatronBaseTrainer):
             raise RuntimeError("No pending vision outputs for backward.")
         if vision_grad_ref is None:
             outputs = self._pending_outputs.popleft()
-            outputs.sum().backward()
+            if isinstance(outputs, Qwen3VisionPayload):
+                tensors = [outputs.primary_embeddings, *outputs.deepstack_visual_embeds]
+                sum(tensor.sum() for tensor in tensors).backward()
+            else:
+                outputs.sum().backward()
             return {"backward_time_ms": 0.0}
 
         vision_grad = self._retrieve_gradient_tensor(vision_grad_ref)
@@ -416,11 +488,13 @@ class MegatronTextTrainer(MegatronBaseTrainer):
             if isinstance(vision_payload, list):
                 if len(vision_payload) != 1:
                     raise RuntimeError(
-                        f"[r{self.rank}] Expected single vision payload, got nested list of {len(vision_payload)} items."
+                        f"[r{self.rank}] Expected single vision payload, "
+                        f"got nested list of {len(vision_payload)} items."
                     )
                 vision_payload = vision_payload[0]
 
             normalized = normalize_vision_outputs(vision_payload)
+            qwen3_visual_payload = get_qwen3_visual_payload(normalized.meta)
             vision_iteration = normalized.meta.get("iteration")
             if vision_iteration is not None and vision_iteration != iteration:
                 raise RuntimeError(
@@ -439,6 +513,12 @@ class MegatronTextTrainer(MegatronBaseTrainer):
                 if not isinstance(vision_embeddings, torch.Tensor):
                     raise RuntimeError(
                         f"[r{self.rank}] Vision embeddings must be a tensor (got {type(vision_embeddings)})."
+                    )
+                if qwen3_visual_payload is not None:
+                    raise RuntimeError(
+                        "MegatronTextTrainer does not yet consume separated Qwen3 structured visual payloads. "
+                        "Use the HF/DeepSpeed-style Qwen3 text adapter path or implement the ms-swift deepstack "
+                        "injection path before enabling Megatron Qwen3 text."
                     )
                 vision_embeddings = vision_embeddings.detach().requires_grad_(True)
 

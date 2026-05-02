@@ -9,6 +9,14 @@ import torch.nn as nn
 from ..tensor_parallel import VocabParallelEmbedding
 from ..tensor_parallel.cross_entropy import vocab_parallel_causal_cross_entropy
 from .payloads import normalize_vision_outputs, TextBackwardOutputs
+from .qwen3_vision_contract import (
+    collect_qwen3_vision_gradients,
+    get_qwen3_visual_payload,
+    make_qwen3_payload_leaf,
+    prepare_qwen3_text_inputs,
+    Qwen3VisionGradients,
+    Qwen3VisionPayload,
+)
 from .tensor_transfer import TensorTransferRequest, prepare_tensor_for_transfer, receive_tensor
 from .trainer import Trainer
 from .utils import get_physical_gpu_id, init_distributed_comm
@@ -35,6 +43,8 @@ class BaseTextTrainer(Trainer):
         self.receiver_gpu_ids = None  # GPU IDs of vision trainers (for sending gradients back)
         self.use_ipc = False  # Whether to use CUDA IPC for this actor
         self._vision_grad_owner_rank = rank  # Which rank should receive gradients from this actor
+        self.vision_embeddings = None
+        self._qwen3_visual_payload = None
         logger.debug(f"[r{self.rank}] {self.__class__.__name__} initialized")
 
     @abstractmethod
@@ -815,6 +825,7 @@ class BaseTextTrainer(Trainer):
 
         vision_payload = normalize_vision_outputs(vision_data)
         vision_embeddings_data = vision_payload.embeddings
+        qwen3_visual_payload = get_qwen3_visual_payload(vision_payload.meta)
         vision_sample_index = vision_payload.meta.get("sample_index")
         vision_iteration = vision_payload.meta.get("iteration")
 
@@ -847,7 +858,12 @@ class BaseTextTrainer(Trainer):
         # Get vision forward timing if available
         vision_forward_time_ms = vision_payload.meta.get("forward_time_ms", 0.0)
 
-        loss = self._forward_step_impl(vision_embeddings, vision_sample_index, iteration)
+        loss = self._forward_step_impl(
+            vision_embeddings,
+            vision_sample_index,
+            iteration,
+            qwen3_visual_payload=qwen3_visual_payload,
+        )
 
         # Synchronize and measure timing only when profiling is enabled
         result = {"loss": loss}
@@ -906,7 +922,13 @@ class BaseTextTrainer(Trainer):
             image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
             return inputs_embeds.masked_scatter(image_mask, vision_embeds_flat)
 
-    def _forward_step_impl(self, vision_embeddings, vision_sample_index=None, iteration=-1):
+    def _forward_step_impl(
+        self,
+        vision_embeddings,
+        vision_sample_index=None,
+        iteration=-1,
+        qwen3_visual_payload: Qwen3VisionPayload | None = None,
+    ):
         """
         Implementation of forward pass. Used by both forward_step and forward_step_with_broadcast.
 
@@ -990,20 +1012,31 @@ class BaseTextTrainer(Trainer):
         if vision_embeddings.device != device:
             vision_embeddings = vision_embeddings.to(device, non_blocking=True)
 
-        # Handle vision embeddings shape
-        if vision_embeddings.dim() == 2:
-            # [num_tokens, hidden_size] -> add batch dimension
-            vision_embeddings = vision_embeddings.unsqueeze(0)
-        # Now vision_embeddings is [batch_size, num_vision_tokens, hidden_size] or [1, num_tokens, hidden]
+        self._qwen3_visual_payload = None
+        if qwen3_visual_payload is not None:
+            vision_embeddings_flat = vision_embeddings.reshape(-1, vision_embeddings.shape[-1])
+            self._qwen3_visual_payload = make_qwen3_payload_leaf(
+                qwen3_visual_payload,
+                primary_embeddings=vision_embeddings_flat,
+                device=device,
+                dtype=inputs_embeds.dtype,
+            )
+            self.vision_embeddings = self._qwen3_visual_payload.primary_embeddings
+        else:
+            # Handle vision embeddings shape
+            if vision_embeddings.dim() == 2:
+                # [num_tokens, hidden_size] -> add batch dimension
+                vision_embeddings = vision_embeddings.unsqueeze(0)
+            # Now vision_embeddings is [batch_size, num_vision_tokens, hidden_size] or [1, num_tokens, hidden]
 
-        # Enable gradient computation for vision embeddings (needed for backward pass)
-        # Detach first so the new tensor is a leaf and gets .grad populated.
-        # If this came via CUDA IPC, this also avoids keeping the shared memory alive.
-        vision_embeddings = vision_embeddings.detach().clone().requires_grad_(True)
-        vision_embeddings.retain_grad()
+            # Enable gradient computation for vision embeddings (needed for backward pass)
+            # Detach first so the new tensor is a leaf and gets .grad populated.
+            # If this came via CUDA IPC, this also avoids keeping the shared memory alive.
+            vision_embeddings = vision_embeddings.detach().clone().requires_grad_(True)
+            vision_embeddings.retain_grad()
 
-        # Save for backward pass
-        self.vision_embeddings = vision_embeddings
+            # Save for backward pass
+            self.vision_embeddings = vision_embeddings
 
         # Get actual model (unwrap DeepSpeed if needed)
         actual_model = self._get_actual_model()
@@ -1026,7 +1059,20 @@ class BaseTextTrainer(Trainer):
                 f"positions with other values. This indicates incorrect label preprocessing."
             )
 
-        inputs_embeds = self._apply_vision_embeddings(inputs_embeds, input_ids, vision_embeddings, batch)
+        text_forward_kwargs = {}
+        if self._qwen3_visual_payload is not None:
+            prepared_qwen3_inputs = prepare_qwen3_text_inputs(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                payload=self._qwen3_visual_payload,
+                image_token_id=image_token_id,
+                video_token_id=getattr(self.model_config, "video_token_id", None),
+            )
+            inputs_embeds = prepared_qwen3_inputs.inputs_embeds
+            text_forward_kwargs["visual_pos_masks"] = prepared_qwen3_inputs.visual_pos_masks
+            text_forward_kwargs["deepstack_visual_embeds"] = list(prepared_qwen3_inputs.deepstack_visual_embeds)
+        else:
+            inputs_embeds = self._apply_vision_embeddings(inputs_embeds, input_ids, vision_embeddings, batch)
 
         logger.debug(
             f"[r{self.rank}] {self.__class__.__name__}: inputs_embeds shape={inputs_embeds.shape}, "
@@ -1042,6 +1088,7 @@ class BaseTextTrainer(Trainer):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                **text_forward_kwargs,
             )
 
             # Get logits from lm_head
@@ -1110,33 +1157,39 @@ class BaseTextTrainer(Trainer):
             torch.cuda.synchronize()
             backward_time_ms = (time.perf_counter() - backward_start) * 1000
 
-        # Extract gradients from vision_embeddings leaf tensor
-        if self.vision_embeddings is None or self.vision_embeddings.grad is None:
+        # Extract gradients from vision_embeddings leaf tensor or structured Qwen3 payload leaves.
+        if self._qwen3_visual_payload is not None:
+            grad_to_send = collect_qwen3_vision_gradients(self._qwen3_visual_payload)
+        elif self.vision_embeddings is None or self.vision_embeddings.grad is None:
             raise RuntimeError(
                 f"[r{self.rank}] vision_embeddings or its gradient is None! "
                 f"This should not happen - check that vision_embeddings.requires_grad=True in forward."
             )
+        else:
+            # vision_embeddings has shape [batch_size, num_vision_tokens, hidden_size] or [1, num_tokens, hidden_size]
+            # Flatten to [num_vision_tokens, hidden_size] to match what vision trainer expects
+            vision_grad = self.vision_embeddings.grad
+            if vision_grad.dim() == 3 and vision_grad.shape[0] == 1:
+                vision_grad = vision_grad.squeeze(0)  # Remove batch dimension if it's 1
 
-        # vision_embeddings has shape [batch_size, num_vision_tokens, hidden_size] or [1, num_tokens, hidden_size]
-        # Flatten to [num_vision_tokens, hidden_size] to match what vision trainer expects
-        vision_grad = self.vision_embeddings.grad
-        if vision_grad.dim() == 3 and vision_grad.shape[0] == 1:
-            vision_grad = vision_grad.squeeze(0)  # Remove batch dimension if it's 1
+            logger.debug(
+                f"[r{self.rank}] {self.__class__.__name__} backward_step: "
+                f"vision_grad shape={vision_grad.shape}"
+            )
 
-        logger.debug(
-            f"[r{self.rank}] {self.__class__.__name__} backward_step: " f"vision_grad shape={vision_grad.shape}"
-        )
-
-        # Detach and clone for transfer
-        grad_to_send = vision_grad.detach().clone()
+            # Detach and clone for transfer
+            grad_to_send = vision_grad.detach().clone()
 
         # Clear saved tensors to release memory
         self.loss = None
         self.vision_embeddings = None
+        self._qwen3_visual_payload = None
 
         # Build result dict, conditionally including timing
-        def _build_result(grad_data):
+        def _build_result(grad_data, extra_meta=None):
             meta = {"backward_time_ms": backward_time_ms} if profile_time else {}
+            if extra_meta:
+                meta.update(extra_meta)
             return TextBackwardOutputs(grad=grad_data, meta=meta)
 
         if grad_to_send is None:
@@ -1144,6 +1197,15 @@ class BaseTextTrainer(Trainer):
 
         # Use CUDA IPC if configured and receiver info is available
         if self.use_ipc and self.receiver_gpu_ids is not None:
+            if isinstance(grad_to_send, Qwen3VisionGradients):
+                logger.debug(
+                    f"[r{self.rank}] {self.__class__.__name__}: "
+                    "Using Ray object transport for structured Qwen3 gradients; CUDA IPC is tensor-only."
+                )
+                return _build_result(
+                    grad_to_send,
+                    {"qwen3_structured_grad_transport": "ray_object_fallback"},
+                )
             sender_gpu_id = get_physical_gpu_id()
             # Detach the gradient tensor before creating IPC handle
             # Gradients are leaf tensors but may still have autograd metadata

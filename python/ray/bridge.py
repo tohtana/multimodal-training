@@ -13,12 +13,22 @@ TextBackwardOutputs for the upstream VisionTrainer.
 import logging
 import os
 from collections import deque
+from dataclasses import replace
 
 import ray
 import torch
 import torch.nn as nn
 
 from .payloads import TextBackwardOutputs, VisionOutputs, normalize_text_backward_outputs, normalize_vision_outputs
+from .qwen3_vision_contract import (
+    apply_qwen3_vision_backward,
+    coerce_qwen3_vision_gradients,
+    collect_qwen3_vision_gradients,
+    QWEN3_VISUAL_PAYLOAD_META_KEY,
+    Qwen3VisionGradients,
+    Qwen3VisionPayload,
+    qwen3_payload_metadata,
+)
 from .trainer import Trainer
 
 logger = logging.getLogger(__name__)
@@ -49,6 +59,49 @@ class BridgeTrainer(Trainer):
         self._pending_inputs: deque[torch.Tensor] = deque()
         self._pending_outputs: deque[torch.Tensor] = deque()
         logger.debug(f"[r{self.rank}] BridgeTrainer initialized")
+
+    @staticmethod
+    def _make_bridge_input_tensor(tensor: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        tensor = tensor.to(device=device, dtype=dtype)
+        if not tensor.requires_grad:
+            tensor = tensor.detach().requires_grad_(True)
+        tensor.retain_grad()
+        return tensor
+
+    def _make_qwen3_bridge_input_payload(
+        self,
+        payload: Qwen3VisionPayload,
+        *,
+        primary_embeddings: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Qwen3VisionPayload:
+        primary = self._make_bridge_input_tensor(primary_embeddings, device=device, dtype=dtype)
+        deepstack = tuple(
+            self._make_bridge_input_tensor(tensor, device=device, dtype=dtype)
+            for tensor in payload.deepstack_visual_embeds
+        )
+        return replace(payload, primary_embeddings=primary, deepstack_visual_embeds=deepstack)
+
+    def _project_qwen3_payload(self, payload: Qwen3VisionPayload) -> Qwen3VisionPayload:
+        projected_primary = self.model(payload.primary_embeddings)
+        projected_deepstack = tuple(self.model(tensor) for tensor in payload.deepstack_visual_embeds)
+        return replace(payload, primary_embeddings=projected_primary, deepstack_visual_embeds=projected_deepstack)
+
+    @staticmethod
+    def _move_qwen3_gradients_to_payload(
+        gradients: Qwen3VisionGradients,
+        payload: Qwen3VisionPayload,
+    ) -> Qwen3VisionGradients:
+        primary_grad = gradients.primary_grad.to(
+            device=payload.primary_embeddings.device,
+            dtype=payload.primary_embeddings.dtype,
+        )
+        deepstack_grads = tuple(
+            grad.to(device=tensor.device, dtype=tensor.dtype)
+            for grad, tensor in zip(gradients.deepstack_grads, payload.deepstack_visual_embeds)
+        )
+        return Qwen3VisionGradients(primary_grad=primary_grad, deepstack_grads=deepstack_grads)
 
     def build_model(self):
         device = self._get_device()
@@ -97,13 +150,47 @@ class BridgeTrainer(Trainer):
 
         vision_payload = normalize_vision_outputs(upstream_data)
         embeddings = vision_payload.embeddings
+        qwen3_payload = vision_payload.meta.get(QWEN3_VISUAL_PAYLOAD_META_KEY)
+        if qwen3_payload is not None and not isinstance(qwen3_payload, Qwen3VisionPayload):
+            raise RuntimeError(f"Invalid Qwen3 visual payload type: {type(qwen3_payload)}")
 
         # Move to device if needed
         device = next(self.model.parameters()).device
+        dtype = next(self.model.parameters()).dtype
+        if isinstance(qwen3_payload, Qwen3VisionPayload):
+            if isinstance(embeddings, torch.Tensor):
+                primary_embeddings = embeddings
+            else:
+                primary_embeddings = torch.as_tensor(embeddings)
+            input_payload = self._make_qwen3_bridge_input_payload(
+                qwen3_payload,
+                primary_embeddings=primary_embeddings,
+                device=device,
+                dtype=dtype,
+            )
+
+            autocast_ctx = self._get_autocast_context()
+            with autocast_ctx:
+                projected_payload = self._project_qwen3_payload(input_payload)
+
+            self._pending_inputs.append(input_payload)
+            self._pending_outputs.append(projected_payload)
+
+            meta = dict(vision_payload.meta)
+            meta["iteration"] = iteration
+            meta.update(qwen3_payload_metadata(projected_payload))
+            meta["qwen3_bridge_projected_structured"] = True
+
+            return VisionOutputs(
+                embeddings=projected_payload.primary_embeddings,
+                attention_mask=vision_payload.attention_mask,
+                meta=meta,
+            )
+
         if isinstance(embeddings, torch.Tensor):
-            embeddings = embeddings.to(device=device)
+            embeddings = embeddings.to(device=device, dtype=dtype)
         else:
-            embeddings = torch.as_tensor(embeddings, device=device)
+            embeddings = torch.as_tensor(embeddings, device=device, dtype=dtype)
 
         # Ensure grad tracking for backward
         if not embeddings.requires_grad:
@@ -149,6 +236,20 @@ class BridgeTrainer(Trainer):
 
         projected = self._pending_outputs.popleft()
         input_embeddings = self._pending_inputs.popleft()
+
+        if isinstance(projected, Qwen3VisionPayload):
+            if isinstance(grad_tensor, torch.Tensor):
+                if projected.deepstack_visual_embeds:
+                    raise RuntimeError(
+                        "Bridge received only a primary gradient tensor for a structured Qwen3 payload with "
+                        "deepstack tensors."
+                    )
+                grad_tensor = Qwen3VisionGradients(primary_grad=grad_tensor)
+            structured_grad = coerce_qwen3_vision_gradients(grad_tensor)
+            structured_grad = self._move_qwen3_gradients_to_payload(structured_grad, projected)
+            apply_qwen3_vision_backward(projected, structured_grad)
+            upstream_grad = collect_qwen3_vision_gradients(input_embeddings)
+            return TextBackwardOutputs(grad=upstream_grad, meta=dict(grad_payload.meta))
 
         # Move grad to same device as output
         device = projected.device
