@@ -15,9 +15,12 @@ from .payloads import (
 )
 from .qwen3_vision_contract import (
     apply_qwen3_vision_backward,
+    collect_qwen3_vision_gradients,
     extract_qwen3_vision_embeddings,
     get_qwen3_visual_payload,
     is_qwen3_vl_model_type,
+    make_qwen3_payload_leaf,
+    prepare_qwen3_text_inputs,
     QWEN3_VISUAL_PAYLOAD_META_KEY,
     Qwen3VisionGradients,
     Qwen3VisionPayload,
@@ -27,6 +30,103 @@ from .trainer import Trainer
 from .utils import get_physical_gpu_id
 
 logger = logging.getLogger(__name__)
+
+
+class _PrecomputedQwen3VisualAdapter:
+    """ms-swift visual adapter that consumes a separated Qwen3 visual payload."""
+
+    def __init__(
+        self,
+        payload: Qwen3VisionPayload,
+        *,
+        primary_embeddings: torch.Tensor,
+        image_token_id: int,
+        video_token_id: int | None,
+    ):
+        self._payload = payload
+        self._primary_embeddings = primary_embeddings
+        self._image_token_id = image_token_id
+        self._video_token_id = video_token_id
+        self.payload: Qwen3VisionPayload | None = None
+        self.dtype = primary_embeddings.dtype
+
+    @staticmethod
+    def _apply_megatron_visual_slices(
+        visual_pos_masks: torch.Tensor | None,
+        deepstack_visual_embeds: torch.Tensor | None,
+        packed_seq_params=None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if visual_pos_masks is None or deepstack_visual_embeds is None:
+            return visual_pos_masks, deepstack_visual_embeds
+
+        try:
+            from megatron.core import parallel_state
+            from megatron.training import get_args
+
+            args = get_args()
+        except Exception:
+            return visual_pos_masks, deepstack_visual_embeds
+        if args is None:
+            return visual_pos_masks, deepstack_visual_embeds
+
+        if int(getattr(args, "context_parallel_size", 1)) > 1:
+            from swift.megatron.trainers.utils import split_cp_inputs
+
+            device = visual_pos_masks.device
+            cp_mask = torch.full(visual_pos_masks.shape[:1], -1, dtype=torch.long, device=device)
+            cp_mask[visual_pos_masks[:, 0]] = torch.arange(visual_pos_masks.sum(), device=device)
+            cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+            cp_mask = split_cp_inputs(cp_mask, cu_seqlens, 0)
+            visual_pos_masks = split_cp_inputs(visual_pos_masks, cu_seqlens, 0)
+            deepstack_visual_embeds = deepstack_visual_embeds[:, cp_mask[(cp_mask != -1)]]
+
+        tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        if bool(getattr(args, "sequence_parallel", False)) and tp_world_size > 1:
+            visual_pos_masks = visual_pos_masks.view(tp_world_size, -1, *visual_pos_masks.shape[1:])
+            mask_tokens = visual_pos_masks.sum(dim=(1, 2)).tolist()
+            visual_start = 0 if tp_rank == 0 else sum(mask_tokens[:tp_rank])
+            visual_end = visual_start + mask_tokens[tp_rank]
+            visual_pos_masks = visual_pos_masks[tp_rank]
+            deepstack_visual_embeds = deepstack_visual_embeds[:, visual_start:visual_end]
+
+        return visual_pos_masks, deepstack_visual_embeds
+
+    def get_inputs_embeds(self, inputs_embeds, **kwargs):
+        input_ids = kwargs["input_ids"]
+        primary = self._primary_embeddings.reshape(-1, self._primary_embeddings.shape[-1])
+        self.payload = make_qwen3_payload_leaf(
+            self._payload,
+            primary_embeddings=primary,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+        prepared = prepare_qwen3_text_inputs(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            payload=self.payload,
+            image_token_id=self._image_token_id,
+            video_token_id=self._video_token_id,
+        )
+
+        visual_pos_masks = prepared.visual_pos_masks
+        if visual_pos_masks is not None:
+            visual_pos_masks = visual_pos_masks.transpose(0, 1)
+
+        deepstack_visual_embeds = None
+        if prepared.deepstack_visual_embeds:
+            deepstack_visual_embeds = torch.stack(tuple(prepared.deepstack_visual_embeds), dim=0)
+
+        visual_pos_masks, deepstack_visual_embeds = self._apply_megatron_visual_slices(
+            visual_pos_masks,
+            deepstack_visual_embeds,
+            kwargs.get("packed_seq_params"),
+        )
+        return {
+            "inputs_embeds": prepared.inputs_embeds,
+            "visual_pos_masks": visual_pos_masks,
+            "deepstack_visual_embeds": deepstack_visual_embeds,
+        }
 
 
 class MegatronBaseTrainer(Trainer):
@@ -452,6 +552,7 @@ class MegatronTextTrainer(MegatronBaseTrainer):
         super().__init__(config, rank, **kwargs)
         self._pending_loss = None
         self._vision_embeddings = None
+        self._qwen3_visual_payload = None
 
     def build_model(self):
         self._build_megatron_model()
@@ -515,12 +616,12 @@ class MegatronTextTrainer(MegatronBaseTrainer):
                         f"[r{self.rank}] Vision embeddings must be a tensor (got {type(vision_embeddings)})."
                     )
                 if qwen3_visual_payload is not None:
-                    raise RuntimeError(
-                        "MegatronTextTrainer does not yet consume separated Qwen3 structured visual payloads. "
-                        "Use the HF/DeepSpeed-style Qwen3 text adapter path or implement the ms-swift deepstack "
-                        "injection path before enabling Megatron Qwen3 text."
+                    vision_embeddings = vision_embeddings.to(
+                        device=self._get_device(),
+                        dtype=vision_embeddings.dtype,
                     )
-                vision_embeddings = vision_embeddings.detach().requires_grad_(True)
+                else:
+                    vision_embeddings = vision_embeddings.detach().requires_grad_(True)
 
         batch = self._dummy_batch
         input_ids = batch["input_ids"]
@@ -570,16 +671,45 @@ class MegatronTextTrainer(MegatronBaseTrainer):
                 loss_mask = loss_mask.view(loss_mask.shape[0], 2 * cp_size, chunk_size)
                 loss_mask = loss_mask.index_select(1, indices)
                 loss_mask = loss_mask.view(loss_mask.shape[0], -1)
-        loss = self.megatron_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            loss_mask=loss_mask,
-        )
+        qwen3_adapter = None
+        original_visual = None
+        self._qwen3_visual_payload = None
+        if qwen3_visual_payload is not None:
+            original_visual = self.megatron_model.visual
+            if original_visual is None:
+                raise RuntimeError("Megatron Qwen3 text model has no visual adapter slot for structured payloads.")
+            visual_model_config = getattr(original_visual, "model_config", None)
+            image_token_id = int(getattr(visual_model_config, "image_token_id", 151655))
+            video_token_id = getattr(visual_model_config, "video_token_id", None)
+            qwen3_adapter = _PrecomputedQwen3VisualAdapter(
+                qwen3_visual_payload,
+                primary_embeddings=vision_embeddings,
+                image_token_id=image_token_id,
+                video_token_id=int(video_token_id) if video_token_id is not None else None,
+            )
+            self.megatron_model.visual = qwen3_adapter
+
+        try:
+            loss = self.megatron_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+        finally:
+            if qwen3_adapter is not None:
+                self.megatron_model.visual = original_visual
+
+        if qwen3_adapter is not None:
+            if qwen3_adapter.payload is None:
+                raise RuntimeError("Megatron Qwen3 visual adapter was not consumed during text forward.")
+            self._qwen3_visual_payload = qwen3_adapter.payload
+            vision_embeddings = self._qwen3_visual_payload.primary_embeddings
+
         if loss.numel() > 1:
             loss = loss.mean()
-        if vision_embeddings is not None:
+        if vision_embeddings is not None and self._qwen3_visual_payload is None:
             loss = loss + (vision_embeddings.sum() * 0.0)
 
         self._pending_loss = loss
@@ -595,17 +725,24 @@ class MegatronTextTrainer(MegatronBaseTrainer):
             raise RuntimeError("No pending loss for backward.")
         self._pending_loss.backward()
         grad_payload = None
-        if self._vision_embeddings is not None:
+        if self._qwen3_visual_payload is not None:
+            grad_payload = collect_qwen3_vision_gradients(self._qwen3_visual_payload)
+        elif self._vision_embeddings is not None:
             if self._vision_embeddings.grad is None:
                 raise RuntimeError("Vision embeddings gradient is None after backward.")
             grad_payload = self._vision_embeddings.grad
 
         self._pending_loss = None
         self._vision_embeddings = None
+        self._qwen3_visual_payload = None
 
         backward_time_ms = 0.0
         if profile_time:
             torch.cuda.synchronize()
             backward_time_ms = (time.perf_counter() - backward_start) * 1000
 
-        return TextBackwardOutputs(grad=grad_payload, meta={"backward_time_ms": backward_time_ms})
+        meta = {"backward_time_ms": backward_time_ms}
+        if isinstance(grad_payload, Qwen3VisionGradients) and self.use_ipc and self.receiver_gpu_ids is not None:
+            meta["qwen3_structured_grad_transport"] = "ray_object_fallback"
+
+        return TextBackwardOutputs(grad=grad_payload, meta=meta)

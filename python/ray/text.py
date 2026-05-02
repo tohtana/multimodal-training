@@ -1013,15 +1013,11 @@ class BaseTextTrainer(Trainer):
             vision_embeddings = vision_embeddings.to(device, non_blocking=True)
 
         self._qwen3_visual_payload = None
+        pending_qwen3_visual_payload = None
+        pending_qwen3_primary_embeddings = None
         if qwen3_visual_payload is not None:
-            vision_embeddings_flat = vision_embeddings.reshape(-1, vision_embeddings.shape[-1])
-            self._qwen3_visual_payload = make_qwen3_payload_leaf(
-                qwen3_visual_payload,
-                primary_embeddings=vision_embeddings_flat,
-                device=device,
-                dtype=inputs_embeds.dtype,
-            )
-            self.vision_embeddings = self._qwen3_visual_payload.primary_embeddings
+            pending_qwen3_visual_payload = qwen3_visual_payload
+            pending_qwen3_primary_embeddings = vision_embeddings.reshape(-1, vision_embeddings.shape[-1])
         else:
             # Handle vision embeddings shape
             if vision_embeddings.dim() == 2:
@@ -1047,6 +1043,15 @@ class BaseTextTrainer(Trainer):
             raise RuntimeError(f"[r{self.rank}] Unable to locate embedding module for text model.")
         inputs_embeds = embed_module(input_ids)
         # Shape: [batch_size, seq_len, hidden_size]
+
+        if pending_qwen3_visual_payload is not None:
+            self._qwen3_visual_payload = make_qwen3_payload_leaf(
+                pending_qwen3_visual_payload,
+                primary_embeddings=pending_qwen3_primary_embeddings,
+                device=device,
+                dtype=inputs_embeds.dtype,
+            )
+            self.vision_embeddings = self._qwen3_visual_payload.primary_embeddings
 
         # Guard 4: Verify labels have -100 at image token positions
         image_token_id = getattr(self.model_config, "image_token_id", 151655)

@@ -18,6 +18,7 @@ from python.ray.qwen3_vision_contract import (
     Qwen3VisionPayload,
 )
 from python.ray.bridge import BridgeProjection
+from python.ray.megatron_trainer import _PrecomputedQwen3VisualAdapter
 from python.ray.payloads import TextBackwardOutputs, normalize_text_backward_outputs
 from python.ray.text import BaseTextTrainer
 
@@ -118,6 +119,66 @@ def test_qwen3_token_count_and_hidden_size_validation():
             image_token_id=7,
             video_token_id=8,
         )
+
+
+def test_qwen3_megatron_adapter_preserves_token_order_deepstack_kwargs_and_gradients():
+    image_token_id = 7
+    video_token_id = 8
+    primary = torch.tensor(
+        [
+            [10.0, 11.0, 12.0, 13.0],
+            [20.0, 21.0, 22.0, 23.0],
+            [30.0, 31.0, 32.0, 33.0],
+        ]
+    )
+    deepstack0 = primary + 100.0
+    deepstack1 = primary + 200.0
+    payload = Qwen3VisionPayload(
+        primary_embeddings=primary,
+        deepstack_visual_embeds=(deepstack0, deepstack1),
+        image_token_counts=(2,),
+        video_token_counts=(1,),
+    )
+    adapter = _PrecomputedQwen3VisualAdapter(
+        payload,
+        primary_embeddings=primary,
+        image_token_id=image_token_id,
+        video_token_id=video_token_id,
+    )
+    input_ids = torch.tensor([[image_token_id, video_token_id, image_token_id, 3]], dtype=torch.long)
+    inputs_embeds = torch.zeros(1, 4, 4)
+
+    result = adapter.get_inputs_embeds(inputs_embeds, input_ids=input_ids)
+
+    expected_inputs = inputs_embeds.clone()
+    expected_inputs[0, 0] = primary[0]
+    expected_inputs[0, 1] = primary[2]
+    expected_inputs[0, 2] = primary[1]
+    torch.testing.assert_close(result["inputs_embeds"], expected_inputs)
+
+    expected_visual_mask = (input_ids == image_token_id) | (input_ids == video_token_id)
+    torch.testing.assert_close(result["visual_pos_masks"], expected_visual_mask.transpose(0, 1))
+    assert result["deepstack_visual_embeds"].shape == (2, 3, 4)
+    torch.testing.assert_close(
+        result["deepstack_visual_embeds"][0],
+        torch.stack((deepstack0[0], deepstack0[2], deepstack0[1]), dim=0),
+    )
+    torch.testing.assert_close(
+        result["deepstack_visual_embeds"][1],
+        torch.stack((deepstack1[0], deepstack1[2], deepstack1[1]), dim=0),
+    )
+
+    hidden_states = result["inputs_embeds"].transpose(0, 1).contiguous()
+    visual_hidden_states = hidden_states[result["visual_pos_masks"], :]
+    loss = visual_hidden_states.square().sum() + result["deepstack_visual_embeds"].square().sum()
+    loss.backward()
+
+    gradients = collect_qwen3_vision_gradients(adapter.payload)
+    assert gradients.primary_grad.shape == primary.shape
+    assert len(gradients.deepstack_grads) == 2
+    assert gradients.primary_grad.abs().sum().item() > 0
+    assert gradients.deepstack_grads[0].abs().sum().item() > 0
+    assert gradients.deepstack_grads[1].abs().sum().item() > 0
 
 
 def test_qwen3_structured_gradients_survive_legacy_backward_payload_normalization():
