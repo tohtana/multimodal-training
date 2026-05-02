@@ -90,6 +90,13 @@ def _resolve_default_trainer(component_type: str, engine: str, model_type: str) 
             return TrainerRegistration(trainer_cls=MegatronTextTrainer)
         return None
 
+    if model_type == "qwen3_vl" and engine == "deepspeed":
+        if component_type == "vision":
+            from .ray.vision import Qwen3VLVisionTrainer
+
+            return TrainerRegistration(trainer_cls=Qwen3VLVisionTrainer)
+        return None
+
     return None
 
 
@@ -125,6 +132,7 @@ def _list_supported_combinations(
         ("text", "megatron", "qwen2_5_vl"),
         ("vision", "megatron", "qwen3_vl"),
         ("text", "megatron", "qwen3_vl"),
+        ("vision", "deepspeed", "qwen3_vl"),
         ("vision", "megatron", "qwen3_moe_vl"),
         ("text", "megatron", "qwen3_moe_vl"),
         ("bridge", "native", "generic"),

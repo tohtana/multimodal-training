@@ -282,7 +282,13 @@ class Trainer(RayActor):
 
     def _get_device(self) -> torch.device:
         """Get the device for this actor (Ray sets CUDA_VISIBLE_DEVICES)."""
-        device = torch.device("cuda:0")
+        import os
+
+        local_rank = os.environ.get("LOCAL_RANK")
+        if local_rank is not None and torch.cuda.device_count() > 1:
+            device = torch.device(f"cuda:{int(local_rank)}")
+        else:
+            device = torch.device("cuda:0")
         torch.cuda.set_device(device)
         return device
 
@@ -812,6 +818,17 @@ class Trainer(RayActor):
         # When autocast is disabled, we use DeepSpeed's native fp16/bf16
         use_torch_autocast = autocast_enabled and torch_dtype != torch.float32
 
+        bf16_config = {
+            "enabled": torch_dtype == torch.bfloat16,
+        }
+        if torch_dtype == torch.bfloat16 and int(zero_stage) > 0:
+            bf16_config.update(
+                {
+                    "bf16_master_weights_and_grads": True,
+                    "bf16_optimizer_states": True,
+                }
+            )
+
         ds_config = {
             "train_batch_size": train_batch_size,
             "train_micro_batch_size_per_gpu": batch_size,
@@ -823,11 +840,7 @@ class Trainer(RayActor):
             "fp16": {
                 "enabled": torch_dtype == torch.float16,
             },
-            "bf16": {
-                "enabled": torch_dtype == torch.bfloat16,
-                "bf16_master_weights_and_grads": True,
-                "bf16_optimizer_states": True,
-            },
+            "bf16": bf16_config,
             "torch_autocast": {
                 "enabled": use_torch_autocast,
                 "dtype": str(torch_dtype),

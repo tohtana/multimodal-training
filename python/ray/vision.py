@@ -157,8 +157,17 @@ class BaseVisionTrainer(Trainer):
                 f"[r{self.rank}] Initializing DeepSpeed sequence parallel:"
                 f" seq={sequence_parallel_size} data={data_parallel_size} world={world_size}"
             )
-            mpu.initialize_sequence_parallel(sequence_parallel_size=sequence_parallel_size)
-            self.sp_group = mpu.get_sequence_parallel_group()
+            try:
+                self.sp_group = mpu.get_sequence_parallel_group()
+                existing_sequence_parallel_size = mpu.get_sequence_parallel_world_size()
+                if existing_sequence_parallel_size != sequence_parallel_size:
+                    raise ValueError(
+                        "Existing DeepSpeed sequence parallel group has size "
+                        f"{existing_sequence_parallel_size}, expected {sequence_parallel_size}"
+                    )
+            except AssertionError:
+                mpu.initialize_sequence_parallel(sequence_parallel_size=sequence_parallel_size)
+                self.sp_group = mpu.get_sequence_parallel_group()
             logger.debug(f"[r{self.rank}] Sequence parallel group initialized: {self.sp_group}")
 
             # Build with DeepSpeed engine to enable gradient reduction and optional ZeRO
@@ -488,6 +497,11 @@ class BaseVisionTrainer(Trainer):
 
         payload_embeddings = vision_outputs
         if self.use_ipc and self.receiver_gpu_ids is not None:
+            if not isinstance(vision_outputs, torch.Tensor):
+                raise ValueError(
+                    "CUDA IPC transfer currently expects a single tensor vision payload. "
+                    "Structured vision outputs should use object-store transfer or add structured IPC support."
+                )
             sender_gpu_id = get_physical_gpu_id()
             transfer_request = prepare_tensor_for_transfer(
                 vision_outputs.detach(),
@@ -790,6 +804,262 @@ class QwenVisionTrainer(BaseVisionTrainer):
 
     def _zero_padded_weights_after_init(self, model, projector):
         """Qwen does not use padded attention heads, so this is a no-op."""
+        pass
+
+
+@ray.remote(enable_tensor_transport=True, num_gpus=1, num_cpus=6)
+class Qwen3VLVisionTrainer(BaseVisionTrainer):
+    """Qwen3-VL dense vision trainer with DeepSpeed sequence parallel support."""
+
+    def _load_model_config(self, model_name):
+        """Load Qwen3-VL config or build a tiny synthetic config for tests/probes."""
+        from transformers import AutoConfig
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+
+        vision_overrides = self.config.get("vision_config_overrides")
+        if model_name == "__tiny_qwen3_vl__":
+            vision_kwargs = dict(vision_overrides or {})
+            vision_config = Qwen3VLVisionConfig(**vision_kwargs)
+            model_config = Qwen3VLConfig(vision_config=vision_config.to_dict())
+        else:
+            model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+            if vision_overrides is not None:
+                for key, value in vision_overrides.items():
+                    setattr(model_config.vision_config, key, value)
+
+        if "deepstack_visual_indexes" in self.config:
+            model_config.vision_config.deepstack_visual_indexes = list(self.config["deepstack_visual_indexes"])
+
+        self._validate_qwen3_vision_config(model_config.vision_config)
+        return model_config
+
+    def _validate_qwen3_vision_config(self, vision_config):
+        if vision_config.__class__.__name__ != "Qwen3VLVisionConfig":
+            raise TypeError(f"Expected Qwen3VLVisionConfig, got {vision_config.__class__.__name__}")
+
+    def _create_model_instance(self, model_config):
+        """Create the dense Qwen3-VL vision model with fused qkv/proj module names."""
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+        self._validate_qwen3_vision_config(model_config.vision_config)
+        model = Qwen3VLVisionModel(model_config.vision_config)
+        return model, None
+
+    def _get_transformer_layers(self, model):
+        return model.blocks
+
+    def _get_projector_or_merger(self, model, projector):
+        return model.merger
+
+    def _get_tensor_parallel_mapping(self):
+        """Get tensor-parallel mapping for Qwen3 dense vision module names."""
+        return {
+            "attn.qkv": ColwiseParallel(),
+            "attn.proj": RowwiseParallel(),
+            "mlp.linear_fc1": ColwiseParallel(),
+            "mlp.linear_fc2": RowwiseParallel(),
+        }
+
+    def _parallelize_projector_or_merger(self, model, projector, tp_mesh):
+        parallelize_module(model.merger.linear_fc1, tp_mesh, ColwiseParallel(), src_data_rank=None)
+        parallelize_module(model.merger.linear_fc2, tp_mesh, RowwiseParallel(), src_data_rank=None)
+
+    def _setup_sequence_parallel(self, model, sp_group):
+        from .qwen3_vision_ulysses import apply_qwen3_vision_ulysses
+
+        replaced = apply_qwen3_vision_ulysses(model, sp_group)
+        logger.debug(f"[r{self.rank}] Wrapped {replaced} Qwen3 vision attention modules for Ulysses SP")
+
+    def _get_vision_config(self, model_name):
+        config = self._load_model_config(model_name)
+        return config.vision_config
+
+    def _extract_pooler_output(self, outputs):
+        pooler_output = getattr(outputs, "pooler_output", None)
+        if pooler_output is None:
+            raise TypeError("Qwen3 vision output must expose pooler_output")
+        return pooler_output
+
+    def _reshape_output_tensor(self, tensor, batch_size):
+        if tensor is None:
+            return None
+        if batch_size is None:
+            return tensor.unsqueeze(0)
+        if tensor.shape[0] % batch_size != 0:
+            raise ValueError(f"Cannot reshape Qwen3 vision output {tuple(tensor.shape)} into batch size {batch_size}")
+        tokens_per_sample = tensor.shape[0] // batch_size
+        return tensor.reshape(batch_size, tokens_per_sample, -1)
+
+    def _reshape_qwen3_outputs(self, outputs, batch_size):
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import BaseModelOutputWithDeepstackFeatures
+
+        deepstack_features = getattr(outputs, "deepstack_features", None) or []
+        return BaseModelOutputWithDeepstackFeatures(
+            last_hidden_state=self._reshape_output_tensor(getattr(outputs, "last_hidden_state", None), batch_size),
+            pooler_output=self._reshape_output_tensor(self._extract_pooler_output(outputs), batch_size),
+            deepstack_features=[self._reshape_output_tensor(feature, batch_size) for feature in deepstack_features],
+        )
+
+    def _get_qwen3_grad_component(self, vision_grad, name, default=None):
+        if isinstance(vision_grad, dict):
+            return vision_grad.get(name, default)
+        return getattr(vision_grad, name, default)
+
+    def _match_qwen3_grad_shape(self, name, grad, output):
+        if grad is None:
+            return None
+        if grad.dim() == 2 and output.dim() == 3:
+            if output.shape[0] == 1:
+                grad = grad.unsqueeze(0)
+            else:
+                raise RuntimeError(
+                    f"[r{self.rank}] Dimension mismatch for {name}: grad is 2D {tuple(grad.shape)} "
+                    f"but output has batch_size={output.shape[0]}"
+                )
+        elif grad.dim() == 3 and output.dim() == 2:
+            if grad.shape[0] == 1:
+                grad = grad.squeeze(0)
+            else:
+                raise RuntimeError(
+                    f"[r{self.rank}] Dimension mismatch for {name}: grad is 3D {tuple(grad.shape)} "
+                    "but output is unbatched"
+                )
+        if grad.shape != output.shape:
+            raise RuntimeError(
+                f"[r{self.rank}] Gradient shape for {name} {tuple(grad.shape)} does not match "
+                f"output shape {tuple(output.shape)}"
+            )
+        return grad.to(device=output.device, dtype=output.dtype)
+
+    def _apply_vision_backward(self, vision_grad):
+        """Backpropagate Qwen3 gradients through pooler_output and deepstack_features."""
+        if not self._pending_outputs:
+            raise RuntimeError(
+                f"[r{self.rank}] No pending vision outputs available for backward pass. "
+                "Ensure forward_step was called before backward."
+            )
+
+        vision_outputs = self._pending_outputs.popleft()
+        pooler_output = getattr(vision_outputs, "pooler_output", None)
+        if pooler_output is None:
+            self._pending_outputs.appendleft(vision_outputs)
+            return super()._apply_vision_backward(vision_grad)
+
+        if vision_grad is None:
+            raise ValueError(f"[r{self.rank}] No gradient provided for backward pass")
+
+        if isinstance(vision_grad, torch.Tensor):
+            pooler_grad = vision_grad
+            deepstack_grads = []
+        else:
+            pooler_grad = self._get_qwen3_grad_component(vision_grad, "pooler_output")
+            deepstack_grads = self._get_qwen3_grad_component(vision_grad, "deepstack_features", []) or []
+
+        if pooler_grad is None:
+            raise ValueError(f"[r{self.rank}] Qwen3 vision backward requires a pooler_output gradient")
+
+        backward_tensors = [pooler_output]
+        backward_grads = [self._match_qwen3_grad_shape("pooler_output", pooler_grad, pooler_output)]
+
+        deepstack_features = getattr(vision_outputs, "deepstack_features", None) or []
+        if deepstack_grads and len(deepstack_grads) != len(deepstack_features):
+            raise ValueError(
+                f"[r{self.rank}] Expected {len(deepstack_features)} deepstack gradients, got {len(deepstack_grads)}"
+            )
+
+        for index, (feature, grad) in enumerate(zip(deepstack_features, deepstack_grads)):
+            if grad is None:
+                continue
+            backward_tensors.append(feature)
+            backward_grads.append(self._match_qwen3_grad_shape(f"deepstack_features[{index}]", grad, feature))
+
+        torch.autograd.backward(backward_tensors, backward_grads, retain_graph=False)
+        return None
+
+    def _forward_model_or_engine(self, pixel_values, image_grid_thw):
+        if self.sp_group is not None:
+            from .qwen3_vision_ulysses import qwen3_vision_sequence_parallel_forward
+
+            model = self.model.module if self.use_deepspeed and hasattr(self.model, "module") else self.model
+            return qwen3_vision_sequence_parallel_forward(
+                model,
+                hidden_states=pixel_values,
+                grid_thw=image_grid_thw,
+                process_group=self.sp_group,
+            )
+        return self.model(hidden_states=pixel_values, grid_thw=image_grid_thw)
+
+    def _model_forward(self, batch):
+        """Forward pass for Qwen3-VL dense vision.
+
+        Qwen3 returns BaseModelOutputWithDeepstackFeatures. This method keeps
+        the pooler output and every selected deepstack feature in global token
+        order, reshaped with the legacy batch dimension for downstream stages.
+        """
+        pixel_values = batch["pixel_values"]
+        image_grid_thw = batch["image_grid_thw"]
+
+        autocast_context = self._get_autocast_context()
+
+        if pixel_values.dim() == 3:
+            batch_size = pixel_values.shape[0]
+            if image_grid_thw.dim() == 1:
+                image_grid_thw = image_grid_thw.unsqueeze(0).expand(batch_size, -1)
+            elif image_grid_thw.dim() == 2 and image_grid_thw.shape[0] != batch_size:
+                raise ValueError(
+                    "image_grid_thw batch dimension "
+                    f"{image_grid_thw.shape[0]} doesn't match pixel_values batch dimension {batch_size}"
+                )
+
+            flat_pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
+            with autocast_context:
+                outputs = self._forward_model_or_engine(flat_pixel_values, image_grid_thw)
+
+            return self._reshape_qwen3_outputs(outputs, batch_size)
+
+        if image_grid_thw.dim() == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
+
+        with autocast_context:
+            outputs = self._forward_model_or_engine(pixel_values, image_grid_thw)
+
+        return self._reshape_qwen3_outputs(outputs, batch_size=None)
+
+    def load_pretrained_weights(self, checkpoint_path: str):
+        """Load Qwen3 vision weights without splitting fused attn.qkv parameters."""
+        import os
+
+        if not os.path.exists(checkpoint_path):
+            logger.warning(f"[r{self.rank}] Pretrained checkpoint not found: {checkpoint_path}")
+            return False
+
+        logger.debug(f"[r{self.rank}] Loading Qwen3 vision weights from {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            state_dict = checkpoint.get("model", checkpoint)
+
+            if self.use_deepspeed and self.deepspeed_engine is not None:
+                missing_keys, unexpected_keys = self.deepspeed_engine.module.load_state_dict(state_dict, strict=False)
+            else:
+                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+
+            if missing_keys:
+                logger.warning(f"[r{self.rank}] Missing keys when loading Qwen3 vision weights: {missing_keys[:10]}")
+            if unexpected_keys:
+                logger.warning(
+                    f"[r{self.rank}] Unexpected keys when loading Qwen3 vision weights: {unexpected_keys[:10]}"
+                )
+            logger.info(f"[r{self.rank}] Successfully loaded Qwen3 vision weights ({len(state_dict)} parameters)")
+            return True
+        except Exception as e:
+            logger.error(f"[r{self.rank}] Failed to load Qwen3 vision weights from {checkpoint_path}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def _zero_padded_weights_after_init(self, model, projector):
+        """Qwen3 dense vision does not use padded attention heads."""
         pass
 
 
